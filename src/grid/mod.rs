@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 //! A specialized 2D grid implementation optimized for use in a terminal.
 
 use std::cmp::{max, min};
@@ -135,6 +137,11 @@ pub struct Grid<T> {
 
     /// Maximum number of lines in history.
     max_scroll_limit: usize,
+
+    /// Lines rotated into history since the grid was created (fbterm patch: lets a host keep
+    /// positions stable while output scrolls).
+    #[cfg_attr(feature = "serde", serde(skip))]
+    scrolled_lines: i64,
 }
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
@@ -147,7 +154,15 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             cursor: Cursor::default(),
             lines,
             columns,
+            scrolled_lines: 0,
         }
+    }
+
+    /// Lines rotated into history since the grid was created (fbterm patch). A line at
+    /// `Line(l)` keeps the same `scrolled_lines() + l` while output scrolls it upward and while
+    /// the screen grows or shrinks. Can be negative (a grow pulled lines back from history).
+    pub fn scrolled_lines(&self) -> i64 {
+        self.scrolled_lines
     }
 
     /// Update the size of the scrollback history.
@@ -287,6 +302,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
             // Rotate the entire line buffer upward.
             self.raw.rotate(-(positions as isize));
+            self.scrolled_lines = self.scrolled_lines.wrapping_add(positions as i64);
 
             // Swap the fixed lines at the bottom back into position.
             let screen_lines = self.screen_lines() as i32;
