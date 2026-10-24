@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 //! Exports the `Term` type which is a high-level API for the Grid.
 
 use std::ops::{Index, IndexMut, Range};
@@ -644,6 +646,12 @@ impl<T> Term<T> {
     /// Access to the raw grid data structure.
     pub fn grid(&self) -> &Grid<Cell> {
         &self.grid
+    }
+
+    /// The grid not shown: the normal screen while the alternate screen is active, and the
+    /// other way around (fbterm patch: tab export).
+    pub fn inactive_grid(&self) -> &Grid<Cell> {
+        &self.inactive_grid
     }
 
     /// Mutable access to the raw grid data structure.
