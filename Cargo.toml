@@ -1,14 +1,19 @@
+# Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 [package]
-name = "alacritty_terminal"
-version = "0.26.0"
+name = "feathercritty"
+# The alacritty_terminal release this fork is based on, plus the fork's own revision as build
+# metadata; see README.md.
+version = "0.26.0+fbterm.1"
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 license = "Apache-2.0"
-description = "Library for writing terminal emulators"
-readme = "../README.md"
-homepage = "https://alacritty.org"
-repository = "https://github.com/alacritty/alacritty"
-edition.workspace = true
-rust-version.workspace = true
+description = "Terminal emulation library for featherbit terminal, forked from alacritty_terminal"
+readme = "README.md"
+homepage = "https://github.com/featherbitplatform/feathercritty"
+repository = "https://github.com/featherbitplatform/feathercritty"
+edition = "2024"
+rust-version = "1.85.0"
+publish = false
 
 [features]
 default = ["serde"]
