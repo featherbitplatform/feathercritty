@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 #![cfg(feature = "serde")]
 use serde::Deserialize;
 use serde_json as json;
@@ -6,13 +8,13 @@ use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 
-use alacritty_terminal::event::{Event, EventListener};
-use alacritty_terminal::grid::{Dimensions, Grid};
-use alacritty_terminal::index::{Column, Line};
-use alacritty_terminal::term::cell::Cell;
-use alacritty_terminal::term::test::TermSize;
-use alacritty_terminal::term::{Config, Term};
-use alacritty_terminal::vte::ansi;
+use feathercritty::event::{Event, EventListener};
+use feathercritty::grid::{Dimensions, Grid};
+use feathercritty::index::{Column, Line};
+use feathercritty::term::cell::Cell;
+use feathercritty::term::test::TermSize;
+use feathercritty::term::{Config, Term};
+use feathercritty::vte::ansi;
 
 macro_rules! ref_tests {
     ($($name:ident)*) => {

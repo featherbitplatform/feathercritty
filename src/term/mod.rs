@@ -2462,7 +2462,7 @@ pub mod test {
     /// # Examples
     ///
     /// ```rust
-    /// use alacritty_terminal::term::test::mock_term;
+    /// use feathercritty::term::test::mock_term;
     ///
     /// // Create a terminal with the following cells:
     /// //
