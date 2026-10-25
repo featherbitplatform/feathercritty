@@ -353,6 +353,10 @@ impl<T> Term<T> {
     /// Find the next regex match.
     ///
     /// This will always return the side of the first match which is farthest from the start point.
+    // feathercritty: upstream takes no `read_past_end`; it is passed through unchanged to
+    // `regex_search_internal`, which decides with it whether a fullwidth skip over `end` stops
+    // the search (`ReadPastEnd`). When merging upstream: keep the parameter and the pass-through
+    // if upstream changes this function (for example its error logging).
     fn regex_search(
         &self,
         start: Point,
