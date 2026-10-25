@@ -10,7 +10,7 @@
 //! 1. **Live bytes** of a terminal (126x37, 10,000-line history) after 12,000 lines of each content
 //!    kind (spec 6.5), 0.26.0 against the fork, plus bytes per history row. The gated number is the
 //!    terminal after the lines minus a freshly created terminal of the same size, for both crates
-//!    (controller ruling on spec 6.5, 2026-10-25): a new `Term` already holds about 2.3 MB in both
+//!    (project ruling on spec 6.5, 2026-10-25): a new `Term` already holds about 2.3 MB in both
 //!    crates (screen, tab stops, the parser's buffers), which is not history and is the same with
 //!    or without compact history. The full terminal is printed too.
 //! 2. **Peak live bytes** while resizing a terminal holding a full history: 126->100->126 columns

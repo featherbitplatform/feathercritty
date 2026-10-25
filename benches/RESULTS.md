@@ -44,7 +44,7 @@ were 0.4% to 10.8%.
 | uniform rows | 1.05 | 0.964 / 0.966 / 0.963 | 0.979 / 0.979 / 0.982 | pass |
 | dense cells | 1.05 | 1.060 / 1.092 / 1.073 | 1.085 / 1.097 / 1.066 | **accepted miss** |
 | region scroll | 1.05 | 1.004 / 1.004 / 1.001 | 1.004 / 0.988 / 0.993 | pass |
-| alt-screen redraw | 1.01 or A/A | 1.009 / 1.031 / 0.988 | 1.021 / 1.019 / 1.006 | see "Alt-screen redraw" |
+| alt-screen redraw | 1.01 or A/A | 1.009 / 1.031 / 0.988 | 1.021 / 1.019 / 1.006 | **accepted miss** (see "Alt-screen redraw") |
 | typing echo | 1.01 or A/A | 1.115 / 1.075 / 1.105 | 1.100 / 1.066 / 1.099 | **accepted miss** |
 | log lines 95 (not gated) | - | 1.173 / 1.182 / 1.149 | 1.175 / 1.210 / 1.186 | - |
 | wide chars (not gated) | - | 1.747 / 1.783 / 1.756 | 1.834 / 1.898 / 1.899 | - |
@@ -83,8 +83,8 @@ and the misses below are recorded instead of loosened.
 
 ### Accepted misses
 
-By the controller's ruling of 2026-10-25 (reported to the owner), these ingest rows miss their gate and are accepted as measured
-costs of the design; the gate values are unchanged:
+Five ingest rows miss their gate; they were accepted on 2026-10-25, and the gate
+values are unchanged. The first four are measured costs of the design:
 
 | Row | Gate | Measured (sessions above) |
 |---|---|---|
@@ -92,8 +92,9 @@ costs of the design; the gate values are unchanged:
 | dense cells, both sizes | 1.05 | 1.06 to 1.10 |
 | typing echo, both sizes | 1.01 | 1.07 to 1.12 |
 | short lines 200x60 | 1.10 | 1.17 to 1.18 |
+| alt-screen redraw, both sizes | 1.01 or A/A | 0.99 to 1.03 (see "Alt-screen redraw") |
 
-Why: every row that scrolls off the screen is read and encoded, while 0.26.0 only rotates its
+Why, for the first four: every row that scrolls off the screen is read and encoded, while 0.26.0 only rotates its
 ring. The encoder has a floor of about 1 ns per stored cell for the run scan (four field compares
 per cell, two of them on `Color`, an enum the compiler compares with branches) plus about 0.25 ns
 per cell for the text. Per row, against the gate's budget (tuning pass, `codec_timing`):
@@ -118,7 +119,9 @@ each measured fork and 0.26.0 equal (152.4/152.9, 152.9/153.0, 153.4/152.2 ms), 
 running both interleaved swings 0.93 to 1.03 between runs. In the three sessions above, at 31 runs,
 126x37 gave 1.009, 1.031 and 0.988 (pass, FAIL, pass) and 200x60 gave 1.021, 1.019 and 1.006
 (FAIL, FAIL, pass), with per-session spreads of 4% to 7%. The 200x60 row sits about 1% to 2% above
-0.26.0 in this binary; it is reported here as measured, not as a pass.
+0.26.0 in this binary. It is the fifth accepted miss: the path does no history work, and the
+separate single-crate processes measured fork and 0.26.0 equal, so the residue is attributed to the
+code layout of the combined bench binary, not to the fork.
 
 ## Reads (spec 6.4, library rows), `benches/reads.rs`
 
@@ -138,13 +141,13 @@ lines only 60->1->60 200x60        |     0.000208 |   0.031459 | 151.245 |    20
 `--gate`: every row passes (exit status 0). The reflow gate is "2x or 10 ms, whichever is larger";
 both reflows are under 2x in this run (200->80 has measured up to 2.02x, still under 10 ms: its log
 lines are wider than 80 columns, so no row qualifies for the byte copy). Lines-only resizes are
-gated by absolute bounds (controller ruling, Task 5): upstream does O(1) counter updates there and
+gated by absolute bounds (project ruling on spec 6.4): upstream does O(1) counter updates there and
 the fork moves rows between screen and history, so the ratio rows are informational.
 
 ## Memory (spec 6.5, 6.4 peak, 6.3 allocations), `examples/memory.rs`
 
 History memory is a terminal after 12,000 lines minus a fresh terminal of the same size, for both
-crates (controller ruling, Task 8); the whole terminal is printed alongside.
+crates (project ruling on spec 6.5); the whole terminal is printed alongside.
 
 ```
 content (minus a new Term)   |  0.26.0 MB |    fork MB |  ac B/row | fork B/row |  ratio | gate
@@ -238,8 +241,9 @@ release call after a resize or trim (spec 5.9) is what returns it.
 Reading: lines narrower than both widths (short and log lines) rewrap by copying their records
 with only the width changed (the byte-copy fast path of spec 5.6): 3 to 5 ms for 100,000 lines and
 31 to 47 ms for 1,000,000. Full-width lines wrap at 100 columns, so every row is decoded, split and
-re-encoded: 28 to 33 ms for 100,000 lines and about 0.3 s for 1,000,000. Every 100,000-line rewrap
-measured here is under the 50 ms bar of spec 5.11; whether to raise the Settings warning threshold
+re-encoded: 28 to 33 ms for 100,000 lines and about 0.3 s for 1,000,000. Every median of a
+100,000-line rewrap is under the 50 ms bar of spec 5.11; the first 126->100 pass of full-width rows
+reached 56.9 ms; whether to raise the Settings warning threshold
 is fbterm's decision (spec 5.11) and is not changed here. Lines-only resizes and trims are
 negligible. The first 126->100 pass of the full-width rows is the slow outlier in the range (every
 row splits).

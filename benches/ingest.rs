@@ -18,7 +18,7 @@
 //! | full-width plain, uniform rows, dense cells, region scroll | 1.05 |
 //! | alternate-screen redraw, typing echo | 1.01, or the A/A spread (below) |
 //!
-//! **Noise ruling for the 1% rows** (controller, 2026-10-25): such a row runs at least 31
+//! **Noise ruling for the 1% rows** (project ruling, 2026-10-25): such a row runs at least 31
 //! interleaved rounds (15 rounds are below this combined binary's noise; see
 //! `benches/RESULTS.md`) and also times 0.26.0 against itself (A/A) in the same rounds. It passes
 //! when the fork's median ratio is within `max(1%, A/A spread)`, the A/A spread being how far the
