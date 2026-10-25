@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::Path;
 
 use feathercritty::event::{Event, EventListener};
-use feathercritty::grid::{Dimensions, Grid};
+use feathercritty::grid::{Dimensions, Grid, RowReader};
 use feathercritty::index::{Column, Line};
 use feathercritty::term::cell::Cell;
 use feathercritty::term::test::TermSize;
@@ -123,10 +123,18 @@ fn ref_test(dir: &Path) {
     term_grid.truncate();
 
     if grid != term_grid {
-        for i in 0..grid.total_lines() {
-            for j in 0..grid.columns() {
-                let cell = &term_grid[Line(i as i32)][Column(j)];
-                let original_cell = &grid[Line(i as i32)][Column(j)];
+        // feathercritty: upstream indexed `grid[Line(i)]` for `i` in `0..total_lines()`, past the
+        // screen into rows its ring happened to hold; rows are read through `RowReader` now, for
+        // every line both grids have.
+        let (mut original_rows, mut term_rows) = (RowReader::new(), RowReader::new());
+        let top = grid.topmost_line().max(term_grid.topmost_line());
+        let bottom = grid.bottommost_line().min(term_grid.bottommost_line());
+        for i in top.0..=bottom.0 {
+            let original_row = original_rows.row(&grid, Line(i));
+            let term_row = term_rows.row(&term_grid, Line(i));
+            for j in 0..grid.columns().min(term_grid.columns()) {
+                let cell = &term_row[Column(j)];
+                let original_cell = &original_row[Column(j)];
                 if original_cell != cell {
                     println!("[{i}][{j}] {original_cell:?} => {cell:?}",);
                 }

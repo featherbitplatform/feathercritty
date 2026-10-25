@@ -1,7 +1,8 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
-//! Differential test (design spec 6.1): identical inputs go to feathercritty and to unmodified
-//! `alacritty_terminal` 0.26.0, and their states and query answers must match after every step
+//! Differential test (design spec 6.1): identical inputs go to feathercritty and to
+//! `alacritty_terminal` 0.26.0 (vendored at `tests/oracle/` with the two patches
+//! `tests/oracle/PATCHES.md` lists), and their states and query answers must match after every step
 //! and after a final synthetic exit from the alternate screen. What is compared, how both crates
 //! are driven, and how to move the oracle to a newer upstream release are documented in
 //! `tests/support/mod.rs`.
@@ -20,6 +21,9 @@
 //!   range, feathercritty's answer is checked on its own instead of compared, even when both are
 //!   equal; `oracle_sees_fork_change_5` covers it. Every feathercritty query runs under a timeout,
 //!   so a search that never returns fails with its seed instead of hanging the run.
+//! - The `Row` `occ` invariant and "no row" reads outside the grid (compact history work) are
+//!   applied to the oracle as patches (`tests/oracle/PATCHES.md`), so they are compared for
+//!   equality like everything else.
 //!
 //! Known gaps, all from 0.26.0 bugs the harness steers around (see the comments at each
 //! workaround; remove them when upstream fixes the bug):
@@ -227,8 +231,10 @@ fn oracle_sees_history_difference() {
     b.apply(&steps[0]);
     assert_eq!(a.snapshot(), b.snapshot());
 
-    // Change one history cell on the feathercritty side only.
-    a.term.grid_mut()[feathercritty::index::Line(-1)][feathercritty::index::Column(0)].c = 'X';
+    // A feathercritty side whose history differs in one cell (feathercritty's grid has no
+    // public history write, so it is fed different bytes).
+    let mut a = support::fc::Side::new(&start);
+    a.apply(&Step::Bytes(b"Xb\r\ncd\r\nef".to_vec()));
     let (sa, sb) = (a.snapshot(), b.snapshot());
     assert_ne!(sa, sb);
     assert!(support::project::diff(&sa, &sb).contains("row -1"));
