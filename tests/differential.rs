@@ -228,6 +228,62 @@ fn oracle_sees_fork_change_5() {
     assert!(equal > off);
 }
 
+/// The check for searches 0.26.0 cannot answer (`Side::check_search`) reads cells as the search
+/// does: it rejects a match across a line break the search sees, and accepts the matches 0.26.0
+/// itself returns across a break hidden by wide characters (a line ending in a wide character's
+/// spacer followed by a line starting with a wide character) and around the buffer's end when the
+/// bottom line wraps (differential soak seeds `realistic_cjk` 1000223 and `random_streams`
+/// 1000017).
+#[test]
+fn search_check_reads_like_the_search() {
+    use support::project::{QAns, SearchQ};
+    use support::{Pt, ac, fc};
+
+    let start = Start { lines: 3, columns: 4, history: 0, kitty: false, query_seed: 0 };
+    // An unbounded rightward search from the start of `origin`'s line, wrapping around the buffer
+    // to the end of the line before it.
+    let check =
+        |bytes: &str, pattern: &str, origin: i32, found: Option<((i32, usize), (i32, usize))>| {
+            let step = Step::Bytes(bytes.as_bytes().to_vec());
+            let (mut a, mut b) = (fc::Side::new(&start), ac::Side::new(&start));
+            a.apply(&step);
+            b.apply(&step);
+            let search = SearchQ {
+                pattern: pattern.to_owned(),
+                origin: Pt::new(origin, 0),
+                right: true,
+                side_right: false,
+                max_lines: None,
+                unmoved: None,
+            };
+            let expected = QAns::Match(found.map(|(s, e)| (Pt::new(s.0, s.1), Pt::new(e.0, e.1))));
+            assert_eq!(b.search(&search, None, true), expected, "0.26.0, {bytes:?} {pattern:?}");
+            assert_eq!(a.search(&search, None, false), expected, "fork, {bytes:?} {pattern:?}");
+            (a, search)
+        };
+
+    // A visible line break: no match across it, and the check rejects one.
+    let (a, search) = check("ab\r\ncd", "b *c", 0, None);
+    let across = QAns::Match(Some((Pt::new(0, 1), Pt::new(1, 0))));
+    assert!(a.check_search(&search, None, &across).is_err());
+
+    // Hidden by wide characters: line 0 ends in の's spacer without wrapping, line 1 starts
+    // with テ, and 0.26.0 reads straight across.
+    let (a, search) = check("abの\r\nテx", "のテ", 0, Some(((0, 2), (1, 1))));
+    let found = QAns::Match(Some((Pt::new(0, 2), Pt::new(1, 1))));
+    a.check_search(&search, None, &found).unwrap();
+
+    // Around the buffer's end: the bottom line wraps (scrolled down there), so the search reads on
+    // from it into the top line, and the match starts after its end in grid order.
+    let (a, search) = check("abcdef\x1b[2T\x1b[1;1Hgh", "cdgh", 1, Some(((2, 2), (0, 1))));
+    let around = QAns::Match(Some((Pt::new(2, 2), Pt::new(0, 1))));
+    a.check_search(&search, None, &around).unwrap();
+
+    // The same text with an unwrapped bottom line: no match, and the check rejects one.
+    let (a, search) = check("\x1b[3;1Habcd\x1b[1;1Hgh", "cdgh", 1, None);
+    assert!(a.check_search(&search, None, &around).is_err());
+}
+
 /// The oracle compares cells in history, not only the screen.
 #[test]
 fn oracle_sees_history_difference() {

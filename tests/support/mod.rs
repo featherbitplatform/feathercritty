@@ -79,11 +79,12 @@
 //!      feathercritty's answer on its own, even when both answers are equal (`Side::check_search`:
 //!      it terminated, and a match lies in the range, allowing the glyph completion at its ends
 //!      (`Side::match_in_range`), and spells a match of the pattern as the search reads cells,
-//!      `Side::text_right`/`text_left`, which follow `skip_fullwidth`); windows that
-//!      `project::search_window` moves for 0.26.0 are also searched as drawn on feathercritty alone
-//!      and checked the same way. Both are counted in [`Stats`]; `oracle_sees_fork_change_5` shows
-//!      both paths are taken. If the new oracle release carries the same fix, drop that modeling
-//!      and require equality again; if feathercritty's change was dropped, drop it too.
+//!      `Side::read`, which follows `skip_fullwidth`, the search's line-break check and its wrap
+//!      around the buffer's end); windows that `project::search_window` moves for 0.26.0 are also
+//!      searched as drawn on feathercritty alone and checked the same way. Both are counted in
+//!      [`Stats`]; `oracle_sees_fork_change_5` shows both paths are taken. If the new oracle
+//!      release carries the same fix, drop that modeling and require equality again; if
+//!      feathercritty's change was dropped, drop it too.
 //!
 //! [`gen`]: mod@r#gen
 
