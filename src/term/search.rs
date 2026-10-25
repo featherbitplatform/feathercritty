@@ -253,6 +253,32 @@ impl<T> Term<T> {
         let match_end = self.regex_search(start, end, &mut regex.right_fdfa)?;
         let match_start = self.regex_search(match_end, start, &mut regex.right_rdfa)?;
 
+        // feathercritty: upstream returns whatever the search found, even past `end`. A search
+        // from `end` to itself (the last search of every rightward `RegexIter`) on a leading
+        // spacer skips onto the next line first and reads on around the buffer, so a rightward
+        // `search_next` limited to a line ending in a leading spacer returned a match from the
+        // next line. We keep upstream's glyph completion: the character at `end` is read whole,
+        // so a match may end on the spacer of a wide char that wrapped after `end`
+        // (`expand_wide`). A match ending further than that is outside the range, and we
+        // return none. When `end` is a stale leading spacer (its next line does not start with a
+        // wide char), that completion lands on an unrelated cell of the next line, so a match
+        // ending there is reported at `end` instead. Both searches run as upstream runs them,
+        // so whether there is a match stays upstream's; only its position changes.
+        // When merging upstream: if upstream bounds its matches by `end` itself, drop this.
+        let to_end = self.search_distance(start, end, Direction::Right);
+        let to_match = self.search_distance(start, match_end, Direction::Right);
+        if to_match > to_end {
+            let glyph_end = self.expand_wide(end, Direction::Right);
+            if to_match > self.search_distance(start, glyph_end, Direction::Right)
+                || self.search_distance(start, match_start, Direction::Right) > to_end
+            {
+                return None;
+            }
+            if self.stale_spacer_end(end) {
+                return Some(match_start..=end);
+            }
+        }
+
         Some(match_start..=match_end)
     }
 
@@ -306,6 +332,20 @@ impl<T> Term<T> {
         // the wide char) never stops. We stop once the skipped cells contain `end`, as in the loop
         // below.
         let mut done = self.skips_over(start, iter.point(), end, regex.direction);
+
+        // feathercritty: upstream has no bound on the number of cells it visits, so any way of
+        // missing `end` (see the fullwidth skip below; a stale leading spacer, one whose next
+        // line does not start with a wide char, skips a real cell) loops forever. Every step
+        // below advances at least one cell, so after as many steps as there are cells from
+        // `start` to `end` the search is on or past `end` and stops there. When `start == end`
+        // and the first fullwidth skip leaves it, upstream reads around the whole buffer back to
+        // `end`, so that case gets one full lap. Where upstream stops without passing `end`, it
+        // stops before this bound, so results there are unchanged.
+        // When merging upstream: keep this bound unless upstream bounds the loop itself.
+        let mut steps_left = match self.search_distance(start, end, regex.direction) {
+            0 => self.total_lines() * self.columns(),
+            distance => distance,
+        };
         let mut last_wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
 
         let mut point = iter.point();
@@ -406,6 +446,10 @@ impl<T> Term<T> {
             // Check for completion before potentially skipping over fullwidth characters.
             done = iter.point() == end;
 
+            // feathercritty: the step bound, see `steps_left` above.
+            steps_left = steps_left.saturating_sub(1);
+            done |= steps_left == 0;
+
             // feathercritty: upstream only checks the cell before the fullwidth skip (above) and
             // the one after it (`point == end` at the top of the loop). Across a wrapped wide
             // char the skip moves two cells: left from its spacer to the leading spacer, right
@@ -473,6 +517,35 @@ impl<T> Term<T> {
         }
 
         false
+    }
+
+    /// Number of cells from `from` to `to`, walking in `direction` and wrapping around the
+    /// buffer like the search does; 0 when they are equal.
+    ///
+    /// feathercritty: not in upstream. Bounds the regex search loop and `RegexIter`.
+    fn search_distance(&self, from: Point, to: Point, direction: Direction) -> usize {
+        let columns = self.columns() as i64;
+        let total = self.total_lines() as i64 * columns;
+        let topmost_line = self.topmost_line().0 as i64;
+        let index =
+            |point: Point| (point.line.0 as i64 - topmost_line) * columns + point.column.0 as i64;
+
+        let distance = match direction {
+            Direction::Right => index(to) - index(from),
+            Direction::Left => index(from) - index(to),
+        };
+
+        distance.rem_euclid(total.max(1)) as usize
+    }
+
+    /// Whether `end` is a stale leading spacer: its next line does not start with a wide char
+    /// (a resize or an erase left it behind).
+    ///
+    /// feathercritty: not in upstream; see `regex_search_right`.
+    fn stale_spacer_end(&self, end: Point) -> bool {
+        self.grid[end].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            && (end.line >= self.bottommost_line()
+                || !self.grid[Point::new(end.line + 1, Column(0))].flags.contains(Flags::WIDE_CHAR))
     }
 
     /// Advance a grid iterator over fullwidth characters.
@@ -667,6 +740,11 @@ pub struct RegexIter<'a, T> {
     regex: &'a mut RegexSearch,
     term: &'a Term<T>,
     done: bool,
+    // feathercritty: the start of the range, and the distance from it to the current origin
+    // and to `end` (`Term::search_distance`), for the progress bound in `next`.
+    start: Point,
+    travelled: usize,
+    end_distance: usize,
 }
 
 impl<'a, T> RegexIter<'a, T> {
@@ -677,7 +755,18 @@ impl<'a, T> RegexIter<'a, T> {
         term: &'a Term<T>,
         regex: &'a mut RegexSearch,
     ) -> Self {
-        Self { point: start, done: false, end, direction, term, regex }
+        let end_distance = term.search_distance(start, end, direction);
+        Self {
+            point: start,
+            done: false,
+            end,
+            direction,
+            term,
+            regex,
+            start,
+            travelled: 0,
+            end_distance,
+        }
     }
 
     /// Skip one cell, advancing the origin point to the next one.
@@ -726,7 +815,28 @@ impl<T> Iterator for RegexIter<'_, T> {
         }
 
         let origin = self.point;
-        let regex_match = self.next_match()?;
+        let mut regex_match = self.next_match()?;
+
+        // feathercritty: going left, the match's right end comes from a second search back to
+        // the origin. When it starts on a stale leading spacer (one whose next line does not
+        // start with a wide char), upstream reads the next cell in its place and steps over the
+        // cell after it. The match then ends past the origin, possibly beyond the start of this
+        // iterator's range. Upstream returned that. We cut such a match at the range's start.
+        // Ranges that cover the whole buffer (unbounded searches) are never cut.
+        // When merging upstream: if upstream checks for stale leading spacers in
+        // `skip_fullwidth`, drop this.
+        // If the match starts after the range's start in grid order (a range that wraps around
+        // the buffer's top), cutting it would turn it around; we stop instead.
+        if self.direction == Direction::Left
+            && self.term.search_distance(self.start, *regex_match.end(), Direction::Left)
+                > self.end_distance
+        {
+            if *regex_match.start() > self.start {
+                self.done = true;
+                return None;
+            }
+            regex_match = *regex_match.start()..=self.start;
+        }
 
         self.point = *regex_match.end();
 
@@ -757,6 +867,23 @@ impl<T> Iterator for RegexIter<'_, T> {
         } else {
             // Move the new search origin past the match.
             self.skip();
+        }
+
+        // feathercritty: upstream does not check that the origin moves forward, so any way of
+        // moving it past `end` (see above; a stale leading spacer, one whose next line does not
+        // start with a wide char, makes a match end behind its origin) cycles forever. Every new
+        // origin must lie further from the start than the last one and not past `end`;
+        // otherwise we stop. Each search then moves at least one cell, which bounds the iterator
+        // by the size of its range. Where upstream's origins stay inside the range they always
+        // move forward, so results there are unchanged.
+        // When merging upstream: keep this bound unless upstream bounds `RegexIter` itself.
+        if !self.done {
+            let travelled = self.term.search_distance(self.start, self.point, self.direction);
+            if travelled <= self.travelled || travelled > self.end_distance {
+                self.done = true;
+            } else {
+                self.travelled = travelled;
+            }
         }
 
         Some(regex_match)
@@ -1502,30 +1629,65 @@ mod tests {
         assert!(result.iter().all(Option::is_none));
     }
 
-    /// Exhaustive search over small grids with wrapped wide characters, checking that every
-    /// search terminates and that `RegexIter` does not cycle.
+    /// Kind of the boundary between two lines in `wrapped_wide_fuzz`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Boundary2 {
+        /// Plain line break.
+        None,
+        /// A wide char wrapped from the upper line to the lower one.
+        Wide,
+        /// The upper line ends in a stale leading spacer: the lower line does not start with a
+        /// wide char (a resize or an erase left the spacer behind).
+        Stale,
+    }
+
+    /// Exhaustive search over small grids with wrapped wide characters and stale leading spacers,
+    /// with and without scrollback, checking that every search terminates and that `RegexIter`
+    /// does not cycle.
     #[test]
     fn wrapped_wide_fuzz() {
         let (tx, rx) = mpsc::channel::<String>();
         thread::spawn(move || {
+            let kinds = [Boundary2::None, Boundary2::Wide, Boundary2::Stale];
             for columns in 2..=4 {
                 for lines in 2..=4 {
-                    for mask in 0u32..(1 << (lines - 1)) {
-                        // Bit `n` wraps a wide character from line `n` to line `n + 1`.
-                        let wrapped: Vec<usize> =
-                            (0..lines - 1).filter(|n| mask & (1 << n) != 0).collect();
+                    for mask in 0..3usize.pow(lines as u32 - 1) {
+                        // Digit `n` (base 3) is the boundary between lines `n` and `n + 1`.
+                        let boundaries: Vec<Boundary2> = (0..lines - 1)
+                            .map(|n| kinds[mask / 3usize.pow(n as u32) % 3])
+                            .collect();
 
-                        // On two columns the wide character fills the line, so its line cannot
+                        // On two columns a wrapped wide char fills its line, so that line cannot
                         // also end in a leading spacer.
-                        if columns == 2 && wrapped.windows(2).any(|w| w[1] == w[0] + 1) {
+                        if columns == 2
+                            && boundaries
+                                .windows(2)
+                                .any(|w| w[0] == Boundary2::Wide && w[1] != Boundary2::None)
+                        {
                             continue;
                         }
 
-                        wrapped_wide_fuzz_grid(&tx, columns, lines, &wrapped, false);
+                        for history in [0, 1] {
+                            wrapped_wide_fuzz_grid(
+                                &tx,
+                                columns,
+                                lines,
+                                history,
+                                &boundaries,
+                                false,
+                            );
 
-                        // Also with a wide char that is not wrapped at the start of line 0.
-                        if columns >= 3 {
-                            wrapped_wide_fuzz_grid(&tx, columns, lines, &wrapped, true);
+                            // Also with a wide char that is not wrapped at the start of line 0.
+                            if columns >= 3 {
+                                wrapped_wide_fuzz_grid(
+                                    &tx,
+                                    columns,
+                                    lines,
+                                    history,
+                                    &boundaries,
+                                    true,
+                                );
+                            }
                         }
                     }
                 }
@@ -1544,55 +1706,66 @@ mod tests {
         }
     }
 
+    /// One grid of `wrapped_wide_fuzz`: `lines` lines in all, the first `history` of them in the
+    /// scrollback.
     fn wrapped_wide_fuzz_grid(
         tx: &mpsc::Sender<String>,
         columns: usize,
         lines: usize,
-        wrapped: &[usize],
+        history: usize,
+        boundaries: &[Boundary2],
         plain_wide: bool,
     ) {
-        let size = TermSize::new(columns, lines);
+        let screen_lines = lines - history;
+        let size = TermSize::new(columns, screen_lines);
         let mut term = Term::new(Config::default(), &size, VoidListener);
-        for line in 0..lines {
+        term.grid.scroll_up(&(Line(0)..Line(screen_lines as i32)), history);
+        assert_eq!(term.total_lines(), lines);
+
+        let line = |n: usize| Line(n as i32 - history as i32);
+        for n in 0..lines {
             for column in 0..columns {
-                let c = if (line + column) % 2 == 0 { 'a' } else { 'b' };
-                term.grid[Line(line as i32)][Column(column)].c = c;
+                let c = if (n + column) % 2 == 0 { 'a' } else { 'b' };
+                term.grid[line(n)][Column(column)] = Cell::default();
+                term.grid[line(n)][Column(column)].c = c;
             }
         }
         if plain_wide {
-            term.grid[Line(0)][Column(0)].c = '字';
-            term.grid[Line(0)][Column(0)].flags.insert(Flags::WIDE_CHAR);
-            term.grid[Line(0)][Column(1)].c = ' ';
-            term.grid[Line(0)][Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+            term.grid[line(0)][Column(0)].c = '字';
+            term.grid[line(0)][Column(0)].flags.insert(Flags::WIDE_CHAR);
+            term.grid[line(0)][Column(1)].c = ' ';
+            term.grid[line(0)][Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
         }
-        for &line in wrapped {
-            let last_column = Column(columns - 1);
-            let cell = &mut term.grid[Line(line as i32)][last_column];
+        for (n, boundary) in boundaries.iter().enumerate() {
+            if *boundary == Boundary2::None {
+                continue;
+            }
+
+            let cell = &mut term.grid[line(n)][Column(columns - 1)];
             cell.c = ' ';
             cell.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
 
-            let next = Line(line as i32 + 1);
-            term.grid[next][Column(0)].c = '字';
-            term.grid[next][Column(0)].flags.insert(Flags::WIDE_CHAR);
-            term.grid[next][Column(1)].c = ' ';
-            term.grid[next][Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+            if *boundary == Boundary2::Wide {
+                term.grid[line(n + 1)][Column(0)].c = '字';
+                term.grid[line(n + 1)][Column(0)].flags.insert(Flags::WIDE_CHAR);
+                term.grid[line(n + 1)][Column(1)].c = ' ';
+                term.grid[line(n + 1)][Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+            }
         }
 
         let points: Vec<Point> = (0..lines)
-            .flat_map(|line| {
-                (0..columns).map(move |column| Point::new(Line(line as i32), Column(column)))
-            })
+            .flat_map(|n| (0..columns).map(move |column| Point::new(line(n), Column(column))))
             .collect();
         let cap = points.len() + 2;
 
-        for pattern in ["字", "a", "字a", "b字", "x", "", "a*", "."] {
+        let grid = format!(
+            "{columns}x{lines} history {history} boundaries {boundaries:?} plain {plain_wide}"
+        );
+        for pattern in ["字", "a", "字a", "b字", " ", "x", "", "a*"] {
             let mut regex = RegexSearch::new(pattern).unwrap();
             for &start in &points {
                 for &end in &points {
-                    let case = format!(
-                        "{columns}x{lines} wrapped {wrapped:?} plain {plain_wide} pattern \
-                         {pattern:?} {start:?} -> {end:?}"
-                    );
+                    let case = format!("{grid} pattern {pattern:?} {start:?} -> {end:?}");
                     let _ = tx.send(case.clone());
 
                     term.regex_search_left(&mut regex, start, end);
@@ -1610,9 +1783,8 @@ mod tests {
                 for max_lines in max_lines {
                     for direction in [Direction::Left, Direction::Right] {
                         let _ = tx.send(format!(
-                            "{columns}x{lines} wrapped {wrapped:?} plain {plain_wide} pattern \
-                             {pattern:?} search_next {start:?} {direction:?} max_lines \
-                             {max_lines:?}"
+                            "{grid} pattern {pattern:?} search_next {start:?} {direction:?} \
+                             max_lines {max_lines:?}"
                         ));
                         for side in [Side::Left, Side::Right] {
                             term.search_next(&mut regex, start, direction, side, max_lines);
@@ -1621,5 +1793,279 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Rows 14 to 20 of an 11 x 21 grid from the differential soak (seed 305, step 164), as
+    /// (cell chars, flag bits). Line 15 ends in a stale leading spacer: line 16 starts with a
+    /// plain space, not a wide char.
+    fn stale_spacer_soak_term() -> Term<VoidListener> {
+        #[rustfmt::skip]
+        let rows: [(&str, [u16; 11]); 7] = [
+            ("v!;🎉 字 L국  ", [256, 256, 256, 288, 320, 288, 320, 256, 288, 320, 1296]),
+            ("ト lス Ωover ", [288, 320, 256, 288, 320, 256, 256, 256, 256, 256, 1296]),
+            ("          🇮", [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 272]),
+            ("d\"42🚀 JWv국 ", [256, 256, 256, 256, 288, 320, 256, 256, 256, 288, 336]),
+            ("pł文 日 ß<국 b", [256, 256, 288, 320, 288, 320, 256, 256, 288, 320, 272]),
+            ("ł`<ar😀 carg", [256, 256, 256, 256, 256, 288, 320, 256, 256, 256, 272]),
+            ("oõS🇮🇹T     ", [256, 256, 256, 256, 256, 256, 0, 0, 0, 0, 0]),
+        ];
+
+        let size = TermSize::new(11, 21);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        for (i, (text, flags)) in rows.iter().enumerate() {
+            let line = Line(14 + i as i32);
+            for (column, c) in text.chars().enumerate() {
+                term.grid[line][Column(column)].c = c;
+                term.grid[line][Column(column)].flags = Flags::from_bits_truncate(flags[column]);
+            }
+        }
+        term
+    }
+
+    #[test]
+    fn stale_leading_spacer_soak() {
+        // The search window runs from (20,10) left to (15,0). Going right from the stale spacer
+        // at (15,10), the fullwidth skip also skips (16,0), so a match there ends behind its
+        // origin and `RegexIter` cycled between (16,0) and (15,10) forever.
+        let result = terminates("search_next over a stale leading spacer", || {
+            let term = stale_spacer_soak_term();
+            let mut regex = RegexSearch::new(" ").unwrap();
+            let origin = Point::new(Line(15), Column(8));
+            term.search_next(&mut regex, origin, Direction::Left, Side::Right, Some(5))
+        });
+
+        let point = Point::new(Line(20), Column(10));
+        assert_eq!(result, Some(point..=point));
+    }
+
+    /// Two columns with one line of scrollback; line -1 ends in a stale leading spacer:
+    ///
+    /// ```text
+    /// -1: a<stale leading spacer>
+    ///  0:  a
+    ///  1: a
+    /// ```
+    fn stale_spacer_history_term() -> Term<VoidListener> {
+        let size = TermSize::new(2, 2);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.grid.scroll_up(&(Line(0)..Line(2)), 1);
+        for (line, text) in [(-1, "a "), (0, " a"), (1, "a ")] {
+            for (column, c) in text.chars().enumerate() {
+                term.grid[Line(line)][Column(column)] = Cell::default();
+                term.grid[Line(line)][Column(column)].c = c;
+            }
+        }
+        term.grid[Line(-1)][Column(1)]
+            .flags
+            .insert(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+        term
+    }
+
+    #[test]
+    fn stale_leading_spacer_history() {
+        // The shape of the second soak failure (seed 500): two columns, scrollback, a stale
+        // leading spacer, and a leftward `search_next` with `max_lines`.
+        let result = terminates("RegexIter over a stale leading spacer", || {
+            let term = stale_spacer_history_term();
+            let mut regex = RegexSearch::new(" ").unwrap();
+            let start = Point::new(Line(0), Column(1));
+            let end = Point::new(Line(-1), Column(0));
+            let matches = RegexIter::new(start, end, Direction::Left, &term, &mut regex)
+                .take(10)
+                .collect::<Vec<_>>();
+
+            let origin = Point::new(Line(0), Column(1));
+            let next = term.search_next(&mut regex, origin, Direction::Left, Side::Right, Some(1));
+
+            (matches, next)
+        });
+
+        assert!(result.0.len() < 10, "RegexIter cycled: {:?}", result.0);
+        assert!(result.1.is_some());
+    }
+
+    /// A grid from rows of (cell chars, cell flags), the first `history` rows in the scrollback.
+    /// Flags: `.` none, `r` `WRAPLINE`, `W` `WIDE_CHAR`, `s` `WIDE_CHAR_SPACER`, `S` a spacer
+    /// with `WRAPLINE`, `L` a leading spacer with `WRAPLINE`.
+    fn term_from_rows(history: usize, rows: &[(&str, &str)]) -> Term<VoidListener> {
+        let columns = rows[0].1.len();
+        let screen_lines = rows.len() - history;
+        let size = TermSize::new(columns, screen_lines);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        term.grid.scroll_up(&(Line(0)..Line(screen_lines as i32)), history);
+
+        for (n, (text, flags)) in rows.iter().enumerate() {
+            let line = Line(n as i32 - history as i32);
+            assert_eq!(text.chars().count(), columns);
+            for (column, (c, flag)) in text.chars().zip(flags.chars()).enumerate() {
+                let cell = &mut term.grid[line][Column(column)];
+                *cell = Cell::default();
+                cell.c = c;
+                cell.flags = match flag {
+                    '.' => Flags::empty(),
+                    'r' => Flags::WRAPLINE,
+                    'W' => Flags::WIDE_CHAR,
+                    's' => Flags::WIDE_CHAR_SPACER,
+                    'S' => Flags::WIDE_CHAR_SPACER | Flags::WRAPLINE,
+                    'L' => Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE,
+                    _ => unreachable!(),
+                };
+            }
+        }
+        term
+    }
+
+    #[test]
+    fn stale_leading_spacer_unbounded() {
+        // Differential soak seed 6, step 6: 80 columns, two lines of scrollback, line 5 ends in a
+        // stale leading spacer. An unbounded leftward search (the find bar's ordinary case) never
+        // returned.
+        let result = terminates("unbounded leftward search over a stale leading spacer", || {
+            #[rustfmt::skip]
+            let term = term_from_rows(2, &[
+            ("ス 2                                                                             ", "Ws.............................................................................."),
+            ("                                                                                ", "................................................................................"),
+            ("                                                 )>ト t=--releasex=1;e ßxé\\E⚡ qui", "...................................................Ws......................Ws..r"),
+            ("ck$✅ ,👨 👩 👧 kEa,b✅ )Püçrñ42src/main.rs文 語 b0x1fÆ-K| |pipe|Lover{Jçト é{8Rテ 文 !C어 ", "...Ws.WsWsWs.....Ws...................WsWs........................Ws....WsWs..WS"),
+            ("S국 |pipe| 🚀 🇮🇹ha.b.cecargoX😀 fn(Æ'single'brown🚀 K ス fxofn(equick本 e🚀 ]}ス P{key: ", ".Ws.......Ws...............Ws.................Ws..Ws............Ws.Ws..Ws......r"),
+            ("v}a42テ Ж<jumpswYQ本 ｡]🇮🇹>oversrc/main.rs!)LÆ😀 Sà[Slazy😀 e<tag><-C:\\dir한 ト 🚀 foxbr", ".....Ws..........Ws........................Ws........Ws..............WsWsWs....r"),
+            ("ownM'국 D'single'                                                   C{e字 語 C:\\dir", ".....Ws...............................................................WsWs.....r"),
+            ("src/main.rs!中 [ok]]ßJe語 L3한 \\🎉 日 X>brown\"N｡--releaseM))日 字 eト L]/4✅ Æ42over>&文  ", "............Ws........Ws..Ws.WsWs......................WsWs.Ws....Ws.........WsL"),
+            ("                                                                                ", "................................................................................"),
+            ]);
+            let mut regex = RegexSearch::new(" ").unwrap();
+            let origin = Point::new(Line(2), Column(1));
+            term.search_next(&mut regex, origin, Direction::Left, Side::Right, None)
+        });
+
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn stale_leading_spacer_large_history() {
+        // Differential soak `large_history_limit` seed 3, step 19: 9 columns, line 11 ends in a
+        // stale leading spacer.
+        let result = terminates("leftward searches over leading spacers", || {
+            #[rustfmt::skip]
+            let term = term_from_rows(0, &[
+                ("l8fox❤!y ", "........L"),
+                ("日 e7Wト e🇮", "Ws...Ws.r"),
+                ("🇹ス QBEa.b", ".Ws.....r"),
+                (".cO      ", "........."),
+                ("         ", "........."),
+                ("g🇮🇹어 👨 👩 ", "...WsWsWS"),
+                ("👧 8lHeXu ", "Ws......L"),
+                ("👨 👩 👧 中 Z", "WsWsWsWsr"),
+                ("BçslC:\\di", "........r"),
+                ("r<buildl<", "........r"),
+                ("çedogW{ut", "........r"),
+                ("rス jumps ", ".Ws.....L"),
+                ("    ?|pip", "........r"),
+                ("e|e한 f🚀 n", "...Ws.Wsr"),
+                ("42ñ<tag>)", "........r"),
+                ("文 z ❤a.b.", "Ws......r"),
+                ("c#õVî字 │ ", ".....Ws.L"),
+                ("한 t~S    ", "Ws......."),
+                ("         ", "........."),
+                ("         ", "........."),
+            ]);
+            let mut regex = RegexSearch::new(" ").unwrap();
+            let unbounded = term.search_next(
+                &mut regex,
+                Point::new(Line(6), Column(5)),
+                Direction::Left,
+                Side::Right,
+                None,
+            );
+            let bounded = term.search_next(
+                &mut regex,
+                Point::new(Line(12), Column(5)),
+                Direction::Left,
+                Side::Left,
+                Some(1),
+            );
+            (unbounded, bounded)
+        });
+
+        assert!(result.0.is_some());
+        assert!(result.1.is_some());
+    }
+
+    #[test]
+    fn range_ending_on_leading_spacer() {
+        // A rightward search limited to line 1, which ends in a leading spacer. Its last search
+        // starts and ends on that spacer; the first fullwidth skip moved past it and the search
+        // read on into line 2, returning the 'c' there, outside the range.
+        let term = wrapped_wide_term();
+        let mut regex = RegexSearch::new("[a-z]+").unwrap();
+        let origin = Point::new(Line(1), Column(1));
+        let result = term.search_next(&mut regex, origin, Direction::Right, Side::Left, Some(0));
+
+        let match_start = Point::new(Line(1), Column(0));
+        let match_end = Point::new(Line(1), Column(1));
+        assert_eq!(result, Some(match_start..=match_end));
+
+        // The search from the leading spacer to itself reads the wrapped wide char only.
+        let mut regex = RegexSearch::new("字").unwrap();
+        let spacer = Point::new(Line(1), Column(2));
+        let wide = term.regex_search_right(&mut regex, spacer, spacer);
+        assert_eq!(wide, Some(spacer..=Point::new(Line(2), Column(1))));
+        let mut regex = RegexSearch::new("[a-z]").unwrap();
+        assert_eq!(term.regex_search_right(&mut regex, spacer, spacer), None);
+    }
+
+    #[test]
+    fn range_ending_on_stale_leading_spacer() {
+        // Differential soak seed 543: a rightward search limited to line 1, which ends in a stale
+        // leading spacer. Reading on as if a wide char wrapped there returned a match ending on
+        // line 2's second cell. The search still reads the cell after the spacer (line 2's first
+        // cell) in its place as upstream does, but a match ending there is reported at the
+        // spacer, and one that lies entirely on line 2 is not returned.
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("abc", "..."),
+            ("ab ", "..L"),
+            ("  d", "..."),
+            ("abc", "..."),
+        ]);
+        let origin = Point::new(Line(1), Column(0));
+
+        let mut regex = RegexSearch::new("b +").unwrap();
+        let result = term.search_next(&mut regex, origin, Direction::Right, Side::Left, Some(0));
+        let match_start = Point::new(Line(1), Column(1));
+        let match_end = Point::new(Line(1), Column(2));
+        assert_eq!(result, Some(match_start..=match_end));
+
+        let mut regex = RegexSearch::new(" ").unwrap();
+        let result = term.search_next(&mut regex, origin, Direction::Right, Side::Left, Some(0));
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn stale_spacer_at_range_start() {
+        // Differential soak seed 791: a leftward search whose range starts next to a stale
+        // leading spacer in the middle of a line. The second search, back from the match start
+        // to the origin, reads past the spacer onto the next line, and the match ended outside
+        // the range.
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("abcd", "...."),
+            ("ab  ", "..L."),
+            ("字 cd", "Ws.."),
+        ]);
+        let mut regex = RegexSearch::new(" ").unwrap();
+        let start = Point::new(Line(1), Column(3));
+        let end = Point::new(Line(1), Column(0));
+        let matches = RegexIter::new(start, end, Direction::Left, &term, &mut regex)
+            .take(10)
+            .collect::<Vec<_>>();
+        assert!(!matches.is_empty());
+        for m in &matches {
+            assert_eq!((m.start().line, m.end().line), (Line(1), Line(1)), "{matches:?}");
+        }
+
+        let result = term.search_next(&mut regex, start, Direction::Left, Side::Right, Some(0));
+        let result = result.unwrap();
+        assert_eq!((result.start().line, result.end().line), (Line(1), Line(1)));
     }
 }
