@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{cell_at, k, new_term, row_at};
+use super::{ORACLE, cell_at, k, new_term, row_at};
 use k::event::VoidListener;
 use k::grid::{Dimensions, Scroll};
 use k::index::{Boundary, Column, Direction, Line, Point, Side as KSide};
@@ -154,6 +154,14 @@ fn search_bounds(
 /// feathercritty fixed the cycle (fork change 5, `+fbterm.3`), so on its side this returns `true`
 /// (anything else fails the run through `check_search`); keep it while the oracle runs 0.26.0
 /// and remove it once the oracle release fixes the cycle too.
+///
+/// A single search inside the iterator can also run forever in 0.26.0, and that cannot be bounded
+/// from outside. On the oracle side this therefore also answers `false`, without searching, when
+/// the iterator's searches can jump over its end (`first_search_misses_end`), even though 0.26.0
+/// still terminates there when it finds its match first. feathercritty's answer is then checked on
+/// its own (fork change 5). `project::search_window` moves the windows of leftward searches
+/// with `max_lines` off such ends instead; this catches the remaining ones (unbounded leftward
+/// searches and rightward searches).
 fn search_terminates(
     term: &Term<VoidListener>,
     regex: &mut RegexSearch,
@@ -163,6 +171,9 @@ fn search_terminates(
     max_lines: Option<usize>,
 ) -> bool {
     let (origin, start, end, _) = search_bounds(term, origin, direction, max_lines);
+    if ORACLE && first_search_misses_end(term, end, direction) {
+        return false;
+    }
 
     let limit = term.total_lines() * term.columns() + 2;
     let mut matches = RegexIter::new(start, end, direction, term, regex);
@@ -189,6 +200,40 @@ fn search_terminates(
         }
     }
     false
+}
+
+/// Whether 0.26.0's searches towards `end` (the first search of every `RegexIter` step) can step
+/// over it and never stop there: `regex_search_internal` checks for `end` only on the cells it
+/// stands on before and after `skip_fullwidth`, and a skip moves past `end` without standing on
+/// it when
+/// - going right, the cell before `end` is a `LEADING_WIDE_CHAR_SPACER` (wrapped or stale, also in
+///   the middle of a line): the skip reads `end` in its place and lands on the cell after it;
+/// - going left, `end` is a wide character between a leading spacer and its spacer: the skip goes
+///   from the spacer to the leading spacer.
+///
+/// The search then reads around the buffer and past `end` again on every lap, so it stops only if
+/// it finds a match first (differential soak seed `random_streams` 2001598: a rightward search
+/// on a 2-column grid whose `end` follows a stale spacer in column 0 ran forever). Skips do not
+/// cross the grid's edges, so `end` next to them is never stepped over.
+fn first_search_misses_end(term: &Term<VoidListener>, end: Point, direction: Direction) -> bool {
+    let grid = term.grid();
+    let first = Point::new(grid.topmost_line(), Column(0));
+    let last = Point::new(grid.bottommost_line(), grid.last_column());
+    let flags = |p: Point| cell_at(grid, p).flags;
+    match direction {
+        Direction::Right => {
+            end > first
+                && end < last
+                && flags(end.sub(grid, Boundary::Grid, 1)).contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        },
+        Direction::Left => {
+            end > first
+                && end < last
+                && flags(end).contains(Flags::WIDE_CHAR)
+                && flags(end.add(grid, Boundary::Grid, 1)).contains(Flags::WIDE_CHAR_SPACER)
+                && flags(end.sub(grid, Boundary::Grid, 1)).contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        },
+    }
 }
 
 /// Run one query, answering [`QAns::Panicked`] if it panics.

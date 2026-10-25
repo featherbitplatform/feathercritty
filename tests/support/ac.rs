@@ -12,6 +12,9 @@ mod imp;
 
 pub use imp::*;
 
+/// This side is 0.26.0, whose searches `term_impl::search_terminates` must steer around.
+pub const ORACLE: bool = true;
+
 /// Grid reads written differently per crate (0.26.0 indexes `Grid` directly); `term_impl.rs` reads
 /// cells and rows through these.
 pub fn cell_at(

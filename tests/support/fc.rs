@@ -11,6 +11,9 @@ mod imp;
 
 pub use imp::*;
 
+/// This side is feathercritty, whose searches always terminate (fork change 5).
+pub const ORACLE: bool = false;
+
 /// Grid reads written differently per crate (feathercritty does not index `Grid` (screen rows are
 /// behind `Grid::screen`, history rows are read through `RowReader` and `Grid::cell`));
 /// `term_impl.rs` reads cells and rows through these.

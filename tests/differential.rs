@@ -35,10 +35,11 @@
 //!   kept short and every run ends by leaving the alternate screen, but a difference that appears
 //!   in the hidden history and is undone before the exit goes unseen.
 //! - Leftward searches whose window would end on a wrapped wide character get a window one or more
-//!   lines larger for the comparison, and searches whose 0.26.0 match iterator cycles are answered
-//!   "does not terminate" there (0.26.0 would hang). feathercritty also searches the original
-//!   window, but its answers there and in the cycling cases are only checked on their own: a match
-//!   must be real and inside the range; a "no match" answer is not verified.
+//!   lines larger for the comparison, and searches whose 0.26.0 match iterator cycles, or whose
+//!   searches towards the range end could step over it (`first_search_misses_end`), are answered
+//!   "does not terminate" there (0.26.0 would hang, or might). feathercritty also searches the
+//!   original window, but its answers there and in the cycling cases are only checked on their own:
+//!   a match must be real and inside the range; a "no match" answer is not verified.
 //! - Empty search patterns are never drawn (0.26.0 hangs on them; feathercritty's fix is covered by
 //!   its own `empty_pattern_terminates` unit test).
 //! - Wide characters never meet a one-column grid.
@@ -282,6 +283,24 @@ fn search_check_reads_like_the_search() {
     // The same text with an unwrapped bottom line: no match, and the check rejects one.
     let (a, search) = check("\x1b[3;1Habcd\x1b[1;1Hgh", "cdgh", 1, None);
     assert!(a.check_search(&search, None, &around).is_err());
+}
+
+/// The oracle does not run 0.26.0 searches that step over their end (`first_search_misses_end` in
+/// `tests/support/term_impl.rs`): soak seed 2001598 reaches a rightward search on a 2-column grid
+/// whose end follows a stale leading spacer, which 0.26.0 never finishes. The run happens on
+/// another thread, so a regression fails here instead of hanging the test.
+#[test]
+fn oracle_skips_searches_that_miss_their_end() {
+    let case = r#gen::random_case(2_001_598, DEFAULT_STEPS);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(support::run(&case.start, &case.steps).map(|stats| stats.no_termination));
+    });
+    let result = rx
+        .recv_timeout(std::time::Duration::from_secs(120))
+        .expect("an oracle search did not return");
+    let no_termination = result.unwrap_or_else(|divergence| panic!("{divergence}"));
+    assert!(no_termination > 0);
 }
 
 /// The oracle compares cells in history, not only the screen.
