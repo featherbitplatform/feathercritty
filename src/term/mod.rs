@@ -1713,6 +1713,16 @@ impl<T: EventListener> Handler for Term<T> {
         for cell in &mut row[left..right] {
             *cell = bg.into();
         }
+        // feathercritty: upstream left `occ` at `right` (the range write raises it). When the
+        // erase reaches the end of the line every cell from `left` on is now `bg.into()`, so
+        // `occ` drops to `left`: a row erased with a background color (`CSI 41 m CSI 2 K`) then
+        // scrolls into history without the encoder comparing every cell (see
+        // `Row::set_equal_from`). Nothing visible changes. When merging upstream: if this loop
+        // changes, keep the call only where every cell from `left` to the end gets the same reset
+        // cell.
+        if right.0 == row.len() {
+            row.set_equal_from(left.0);
+        }
 
         let range = self.grid.cursor.point.line..=self.grid.cursor.point.line;
         self.selection = self.selection.take().filter(|s| !s.intersects_range(range));

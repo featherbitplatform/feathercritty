@@ -199,6 +199,27 @@ impl<T> Row<T> {
         self.inner.iter().all(GridCell::is_empty)
     }
 
+    /// Record that every cell from `column` to the end of the row is equal (the caller just
+    /// wrote them all with the same value), lowering `occ` to `column`.
+    ///
+    /// feathercritty addition (no upstream counterpart). The written value must be one that
+    /// `Row::reset` would leave in place, a reset cell (`GridCell::reset` of the template), as
+    /// `Term::clear_line`'s `bg.into()` is: `reset` skips the cells from `occ` on when the
+    /// template's discriminant matches. A low `occ` keeps the history encoder's scan for the
+    /// row's stored cells short (`HistoryCell::encode` starts at `occ`); without it a row erased
+    /// with a background color (`CSI 2 K`) scans every cell when it scrolls into history.
+    #[inline]
+    pub(crate) fn set_equal_from(&mut self, column: usize)
+    where
+        T: PartialEq,
+    {
+        debug_assert!(
+            self.inner.get(column..).is_some_and(|cells| cells.windows(2).all(|p| p[0] == p[1])),
+            "set_equal_from: cells from {column} on are not all equal"
+        );
+        self.occ = column;
+    }
+
     #[inline]
     pub fn front_split_off(&mut self, at: usize) -> Vec<T> {
         self.occ = self.occ.saturating_sub(at);
@@ -409,6 +430,48 @@ mod tests {
         row[Column(3)] = text('x');
         let _ = row.front_split_off(2);
         assert_occ_invariant(&row);
+    }
+
+    #[test]
+    fn set_equal_from_lowers_occ() {
+        // A line with text, erased from column 2 on with a red background (`CSI 41 m CSI K`).
+        let mut row = Row::new(6);
+        row[Column(0)] = text('a');
+        row[Column(4)] = text('b');
+        for cell in &mut row[Column(2)..Column(6)] {
+            *cell = red();
+        }
+        assert_eq!(row.occ, 6);
+        row.set_equal_from(2);
+        assert_eq!(row.occ, 2);
+        assert_occ_invariant(&row);
+
+        // A reset with the same background still clears the text; one with another background
+        // clears everything.
+        let mut same = row.clone();
+        same.reset(&red());
+        assert!(same.inner.iter().all(|cell| *cell == red()));
+        row.reset(&Cell::default());
+        assert!(row.inner.iter().all(|cell| *cell == Cell::default()));
+
+        // The whole row: `occ` 0.
+        let mut row = Row::new(4);
+        row[Column(1)] = text('x');
+        for cell in &mut row[..] {
+            *cell = red();
+        }
+        row.set_equal_from(0);
+        assert_eq!(row.occ, 0);
+        assert_occ_invariant(&row);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "not all equal")]
+    fn set_equal_from_checks_cells() {
+        let mut row = red_row(4);
+        row[Column(3)] = text('x');
+        row.set_equal_from(1);
     }
 
     #[test]

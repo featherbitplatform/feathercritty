@@ -151,6 +151,10 @@ The sites classified as history-capable in 0.26.0: `Term::line_to_string`, `Term
 - `src/grid/compact.rs`: `HistoryCell::decode` returns the bytes consumed; `decode_cell` reads one cell.
 - `Cargo.toml`: `test-hooks` feature and the self dev-dependency.
 
+**Phase 4 (unreleased, on `feature/compact-history`): tuning.** Targeted fast paths for the design gates; behavior is unchanged (the differential test proves it). Files changed, and what to watch when merging:
+- `src/term/mod.rs`: `clear_line` lowers the row's `occ` after an erase that reaches the end of the line (`Row::set_equal_from`), so the encoder does not scan a background-colored blank line. If upstream changes that loop, keep the call only where every cell from `left` to the end gets the same reset cell.
+- `src/grid/row.rs`: new `Row::set_equal_from` (no upstream counterpart).
+
 **Benchmarks.** `cargo bench` (`benches/`, `benches/BASELINE.md`) compares against the oracle. The spec gate for resizing the screen by lines only is absolute, not a ratio: at most 50 microseconds per step of up to 10 lines and 1 ms per 37 to 1 to 37 pair, with a full 10,000-line history. Upstream does O(1) counter updates there; the fork moves the rows between the two containers (about 0.08 microseconds per small step), so the old ratio row (about 1.9) is informational only.
 
 ## Development
