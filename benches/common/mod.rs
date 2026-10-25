@@ -420,6 +420,34 @@ pub fn compare_ms<A, B>(
     (Stats::from_samples(sa), Stats::from_samples(sb))
 }
 
+/// One timed run: fresh state from `setup` (not timed), then `run`, in milliseconds.
+pub fn timed_ms<S>(setup: &mut impl FnMut() -> S, run: &mut impl FnMut(S) -> S) -> f64 {
+    let state = setup();
+    let start = Instant::now();
+    let state = run(state);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    drop(state);
+    elapsed
+}
+
+/// Median timings of several subjects, each a closure doing one timed run (see [`timed_ms`]),
+/// run interleaved: one untimed warm-up each, then `runs` rounds, the order rotating every
+/// round, so that drift and background load hit all alike.
+pub fn interleaved_ms(runs: usize, subjects: &mut [&mut dyn FnMut() -> f64]) -> Vec<Stats> {
+    for subject in subjects.iter_mut() {
+        subject();
+    }
+    let n = subjects.len();
+    let mut samples = vec![Vec::with_capacity(runs); n];
+    for round in 0..runs {
+        for slot in 0..n {
+            let k = (round + slot) % n;
+            samples[k].push(subjects[k]());
+        }
+    }
+    samples.into_iter().map(Stats::from_samples).collect()
+}
+
 /// Number of benchmark runs per row (spec: at least 5), `BENCH_RUNS` overrides.
 pub fn runs() -> usize {
     std::env::var("BENCH_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(7)

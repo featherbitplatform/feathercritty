@@ -16,7 +16,13 @@
 //! |---|---|
 //! | short lines | 1.10 |
 //! | full-width plain, uniform rows, dense cells, region scroll | 1.05 |
-//! | alternate-screen redraw, typing echo | 1.01 |
+//! | alternate-screen redraw, typing echo | 1.01, or the A/A spread (below) |
+//!
+//! **Noise ruling for the 1% rows** (controller, 2026-10-25): such a row runs at least 15
+//! interleaved rounds and also times 0.26.0 against itself (A/A) in the same rounds. It passes
+//! when the fork's median ratio is within `max(1%, A/A spread)`, the A/A spread being how far the
+//! two 0.26.0 medians differ (`|A'/A - 1|`): a difference the same binary shows against itself
+//! is noise, not a cost of the fork.
 //!
 //! Log lines and wide characters are measured but not gated (spec 6.3 lists no threshold).
 //! `BENCH_ONLY=<substring>` limits the rows, for quick runs.
@@ -27,8 +33,8 @@
 mod common;
 
 use common::{
-    BUFFER_BYTES, HISTORY, SIZES, Workload, ac, compare_ms, fc, gate_requested, prefill_buffer,
-    runs, selected, table_header, table_row, workload_for,
+    BUFFER_BYTES, HISTORY, SIZES, Workload, ac, compare_ms, fc, gate_requested, interleaved_ms,
+    prefill_buffer, runs, selected, table_header, table_row, timed_ms, workload_for,
 };
 
 /// Spec 6.3 thresholds (maximum fork/0.26.0 ratio), `None` where the spec sets none.
@@ -68,33 +74,54 @@ fn main() {
             }
             let buffer = workload_for(kind, BUFFER_BYTES, 42, columns, lines);
             let chunk = kind.chunk();
-            // The 1% rows need more samples to tell a real difference from noise.
-            let runs =
-                if threshold(kind).is_some_and(|t| t <= 1.01) { runs().max(15) } else { runs() };
-            let (ac_stats, fc_stats) = compare_ms(
-                runs,
-                || {
-                    let mut sim = ac::Sim::new(columns, lines, HISTORY);
-                    sim.feed(&prefill, 64 * 1024);
-                    assert_eq!(sim.history_size(), HISTORY);
-                    sim
-                },
-                |mut sim| {
-                    sim.feed(&buffer, chunk);
-                    sim
-                },
-                || {
-                    let mut sim = fc::Sim::new(columns, lines, HISTORY);
-                    sim.feed(&prefill, 64 * 1024);
-                    assert_eq!(sim.history_size(), HISTORY);
-                    sim
-                },
-                |mut sim| {
-                    sim.feed(&buffer, chunk);
-                    sim
-                },
-            );
-            if !table_row(&label, ac_stats, fc_stats, threshold(kind), None) {
+            let mut setup_ac = || {
+                let mut sim = ac::Sim::new(columns, lines, HISTORY);
+                sim.feed(&prefill, 64 * 1024);
+                assert_eq!(sim.history_size(), HISTORY);
+                sim
+            };
+            let mut setup_fc = || {
+                let mut sim = fc::Sim::new(columns, lines, HISTORY);
+                sim.feed(&prefill, 64 * 1024);
+                assert_eq!(sim.history_size(), HISTORY);
+                sim
+            };
+            let mut run_ac = |mut sim: ac::Sim| {
+                sim.feed(&buffer, chunk);
+                sim
+            };
+            let mut run_fc = |mut sim: fc::Sim| {
+                sim.feed(&buffer, chunk);
+                sim
+            };
+
+            let ok = if threshold(kind).is_some_and(|t| t <= 1.01) {
+                // The 1% rows: at least 15 rounds, with an A/A comparison (see the module docs).
+                let mut setup_ac2 = setup_ac;
+                let mut run_ac2 = run_ac;
+                let stats = interleaved_ms(runs().max(15), &mut [
+                    &mut || timed_ms(&mut setup_ac, &mut run_ac),
+                    &mut || timed_ms(&mut setup_fc, &mut run_fc),
+                    &mut || timed_ms(&mut setup_ac2, &mut run_ac2),
+                ]);
+                let aa = (stats[2].median / stats[0].median - 1.0).abs();
+                let allowed = 1.0 + aa.max(0.01);
+                let ok = table_row(&label, stats[0], stats[1], Some(allowed), None);
+                println!(
+                    "{:<34} | {:>12.3} | {:>10} | {:>6.3} | {:>7.1}% | A/A spread {:.2}%",
+                    format!("  A/A {label}"),
+                    stats[2].median,
+                    "",
+                    stats[2].median / stats[0].median,
+                    stats[2].spread_pct(),
+                    aa * 100.0
+                );
+                ok
+            } else {
+                let (ac_stats, fc_stats) = compare_ms(runs(), setup_ac, run_ac, setup_fc, run_fc);
+                table_row(&label, ac_stats, fc_stats, threshold(kind), None)
+            };
+            if !ok {
                 failed += 1;
             }
         }
