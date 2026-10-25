@@ -12,9 +12,10 @@ against the differential test's oracle and `large_history_invariants_at_1m`). Th
 Settings warning threshold of spec 5.11 (default 100,000 lines, raised only if 100,000 lines rewrap
 in under about 50 ms).
 
-- Date: 2026-10-25
+- Date: 2026-10-25 (re-measured after the phase 4 tuning; the first measurement, at 50c48aa, had
+  100,000-line rewraps of 44 to 69 ms and 1,000,000-line rewraps of 437 to 679 ms)
 - Machine: Apple M5 Max, macOS (Darwin 27.0.0), rustc 1.99.1 (58cf8f9c3 2026-10-13), release profile
-- Commit: 50c48aa plus the test commit; terminal 126 columns by 37 lines
+- Commit: d946bd3 (phase 4: reflow byte copy and codec tuning); terminal 126 columns by 37 lines
 - Method: each row is a fresh child process. Live bytes come from a counting `#[global_allocator]`
   (calling thread only); RSS is the process's resident set from `ps`, whose empty baseline was
   3.0 MB. Times are medians of 5 with the range in parentheses (the resizes alternate
@@ -30,12 +31,12 @@ in under about 50 ms).
 
 | content | history lines | live MB | bytes per row | dense MB | RSS MB after fill | RSS MB after 10 resizes | live MB after trim to 10,000 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| short lines (0-20 chars) | 100000 | 8.4 | 84 | 302.4 | 11.1 | 18.4 | 3.1 |
-| log lines (95 chars, 4 colors) | 100000 | 20.6 | 205 | 302.4 | 22.0 | 27.8 | 4.3 |
-| full-width lines (126 chars) | 100000 | 20.0 | 199 | 302.4 | 21.1 | 27.3 | 4.3 |
-| short lines (0-20 chars) | 1000000 | 58.6 | 58 | 3024.0 | 60.2 | 223.4 | 3.1 |
-| log lines (95 chars, 4 colors) | 1000000 | 180.3 | 180 | 3024.0 | 181.9 | 345.3 | 4.5 |
-| full-width lines (126 chars) | 1000000 | 174.6 | 174 | 3024.0 | 175.9 | 315.7 | 4.3 |
+| short lines (0-20 chars) | 100000 | 7.9 | 79 | 302.4 | 10.4 | 12.1 | 3.1 |
+| log lines (95 chars, 4 colors) | 100000 | 20.1 | 200 | 302.4 | 22.0 | 24.5 | 4.3 |
+| full-width lines (126 chars) | 100000 | 19.5 | 194 | 302.4 | 21.1 | 25.2 | 4.3 |
+| short lines (0-20 chars) | 1000000 | 57.8 | 57 | 3024.0 | 60.1 | 222.9 | 3.1 |
+| log lines (95 chars, 4 colors) | 1000000 | 179.5 | 179 | 3024.0 | 182.0 | 344.9 | 4.5 |
+| full-width lines (126 chars) | 1000000 | 173.8 | 173 | 3024.0 | 175.9 | 312.2 | 4.3 |
 
 The resident set after the resizes is the allocator keeping freed blocks (live bytes stay within 6%
 of their value after the fill), not memory the terminal still uses; fbterm's release call
@@ -45,16 +46,18 @@ after a resize or trim (spec 5.9) is what returns it.
 
 | content | history lines | fill | 126->100 columns | 100->126 columns | 37->30 lines | 30->37 lines | trim to 10,000 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| short lines (0-20 chars) | 100000 | 21 | 51.746 (51.557-52.171) | 50.560 (50.441-50.785) | 0.002 (0.002-0.008) | 0.001 (0.001-0.006) | 0.263 (0.262-0.269) |
-| log lines (95 chars, 4 colors) | 100000 | 102 | 68.595 (68.296-68.789) | 68.189 (68.065-68.775) | 0.002 (0.002-0.004) | 0.002 (0.002-0.005) | 0.286 (0.277-0.488) |
-| full-width lines (126 chars) | 100000 | 81 | 43.850 (43.541-88.719) | 51.769 (51.640-52.294) | 0.002 (0.002-0.002) | 0.002 (0.002-0.006) | 0.281 (0.128-0.282) |
-| short lines (0-20 chars) | 1000000 | 183 | 516.682 (515.762-520.571) | 505.811 (504.227-506.254) | 0.002 (0.002-0.002) | 0.001 (0.001-0.002) | 2.906 (2.864-2.939) |
-| log lines (95 chars, 4 colors) | 1000000 | 994 | 679.286 (677.539-681.112) | 679.147 (678.907-681.683) | 0.002 (0.002-0.002) | 0.002 (0.002-0.003) | 3.083 (3.038-3.185) |
-| full-width lines (126 chars) | 1000000 | 794 | 437.340 (436.838-879.477) | 514.834 (513.542-517.065) | 0.002 (0.002-0.003) | 0.002 (0.002-0.005) | 4.660 (2.255-4.826) |
+| short lines (0-20 chars) | 100000 | 18 | 4.236 (4.163-4.472) | 4.607 (4.526-4.703) | 0.002 (0.002-0.003) | 0.001 (0.001-0.002) | 0.262 (0.260-0.266) |
+| log lines (95 chars, 4 colors) | 100000 | 96 | 2.987 (2.953-3.190) | 3.470 (3.452-3.498) | 0.002 (0.002-0.003) | 0.001 (0.001-0.003) | 0.280 (0.274-0.290) |
+| full-width lines (126 chars) | 100000 | 71 | 27.742 (27.613-55.785) | 32.795 (32.611-32.993) | 0.002 (0.002-0.002) | 0.001 (0.001-0.004) | 0.276 (0.150-0.480) |
+| short lines (0-20 chars) | 1000000 | 164 | 42.852 (42.652-44.478) | 46.418 (46.282-47.485) | 0.002 (0.002-0.003) | 0.001 (0.001-0.003) | 3.979 (3.927-4.271) |
+| log lines (95 chars, 4 colors) | 1000000 | 965 | 30.974 (30.820-31.466) | 35.200 (35.048-35.833) | 0.002 (0.002-0.003) | 0.001 (0.001-0.003) | 3.134 (2.902-3.175) |
+| full-width lines (126 chars) | 1000000 | 721 | 278.772 (277.781-558.257) | 325.239 (324.356-327.320) | 0.002 (0.002-0.002) | 0.001 (0.001-0.005) | 3.118 (2.168-4.033) |
 
-Reading: a 100,000-line rewrap takes 44 to 69 ms, above the 50 ms bar of spec 5.11, so the warning
-threshold stays at 100,000 lines. Resizing 1,000,000 lines takes about half a second. Lines-only
-resizes and trims are negligible. In the same differential run, 0.26.0's dense store rewrapped
-100,000 lines in about 25 ms (columns, 126->100) and about 18 ms (100->126), against the fork's
-71 and 62 ms (mixed content with wide characters, hyperlinks and underline colors; one run each).
-The first 126->100 pass of the full-width rows is the slow outlier in the range (every row splits).
+Reading: lines narrower than both widths (short and log lines) now rewrap by copying their records
+with only the width changed (the byte-copy fast path of spec 5.6): 3 to 5 ms for 100,000 lines and
+31 to 46 ms for 1,000,000. Full-width lines wrap at 100 columns, so every row is decoded, split and
+re-encoded: 28 to 33 ms for 100,000 lines and about 0.3 s for 1,000,000. Every 100,000-line rewrap
+measured here is now under the 50 ms bar of spec 5.11; whether to raise the Settings warning
+threshold is fbterm's decision (spec 5.11) and is not changed here. Lines-only resizes and trims are
+negligible. The first 126->100 pass of the full-width rows is the slow outlier in the range (every
+row splits).
