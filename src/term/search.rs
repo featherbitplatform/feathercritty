@@ -304,9 +304,12 @@ impl<T> Term<T> {
         // Upstream never returns here.
         if regex_iter.bound_fired() {
             if let Some(cycle) = regex_iter.cycle {
+                // The rerun runs on a copy of the regex, whose cache may give up where this pass
+                // did not (it gives up on its fourth clear); then this pass's answer stands.
                 let regex = regex_iter.regex.clone();
                 return self
-                    .last_in_range_before_repeat(regex, start, end, direction, cycle, in_range);
+                    .last_in_range_before_repeat(regex, start, end, direction, cycle, in_range)
+                    .unwrap_or(last_in_range);
             }
             return last_in_range;
         }
@@ -321,7 +324,8 @@ impl<T> Term<T> {
     ///
     /// feathercritty: not in upstream; see `final_match`. The second half of Brent's cycle
     /// search: one iteration runs `cycle` steps ahead of another, and the first origin they share
-    /// is where the repeating part starts.
+    /// is where the repeating part starts. `None` if a search of the rerun ended early (its cache
+    /// gave up); `Some(None)` if no match before the repeat lies in the range.
     fn last_in_range_before_repeat(
         &self,
         mut regex: RegexSearch,
@@ -330,7 +334,7 @@ impl<T> Term<T> {
         direction: Direction,
         cycle: usize,
         in_range: impl Fn(&Match) -> bool,
-    ) -> Option<Match> {
+    ) -> Option<Option<Match>> {
         let mut ahead_regex = regex.clone();
         let mut iter = RegexIter::new(start, end, direction, self, &mut regex);
         let mut ahead = RegexIter::new(start, end, direction, self, &mut ahead_regex);
@@ -351,7 +355,7 @@ impl<T> Term<T> {
         for _ in 0..cycle {
             keep(iter.next()?);
         }
-        last_in_range
+        Some(last_in_range)
     }
 
     /// Get the side of a match.
@@ -477,8 +481,26 @@ impl<T> Term<T> {
         // unchanged. When it fires, the search answers `None` and records it
         // (`LazyDfa::bound_fired`), so `search_next` can treat the iteration as one upstream never
         // finishes.
+        //
+        // Why it always fires (termination): the state recorded at a wrap is finite as long as
+        // the DFA cache's clear count is bounded, and it is: this loop never reports progress to
+        // the cache (`Cache::search_start`/`search_update`), so regex-automata (0.4.11) counts
+        // every search as inefficient and gives up on a cache's fourth clear
+        // (`minimum_cache_clear_count(3)` with `minimum_bytes_per_state(10)` in
+        // `RegexSearch::new`): the search then errors and answers no match, as upstream does.
+        // `cache_give_up_ends_a_search` pins this.
+        //
+        // Cost: it fires only after the recorded state has gone round once, about twice the
+        // state's period in laps, and that period follows the pattern. A counted pattern over
+        // long wrapped lines keeps the DFA alive with a counter (up to about 1,000 states before
+        // the cache gives up): `(?:[ab中]{997})*b` over a 20,000-line buffer of wrapped 100-column
+        // lines ran 37 s before the check fired, about 2,000 laps. Upstream never finishes there.
+        //
         // When merging upstream: keep the check at the wrap below and `LoopState` in step with
-        // what the loop reads; drop it only if upstream bounds this loop itself.
+        // what the loop reads; drop it only if upstream bounds this loop itself. Re-check the
+        // termination argument (run `cache_give_up_ends_a_search`) if upstream starts reporting
+        // progress to the cache, if `RegexSearch::new` changes the cache config, or on a
+        // regex-automata update that changes when the cache gives up.
         let mut saved: Option<LoopState> = None;
         let (mut power, mut laps) = (1usize, 0usize);
 
@@ -953,7 +975,11 @@ impl<T> Term<T> {
 ///
 /// feathercritty: not in upstream; the loop check in `regex_search_internal`. `consumed_bytes`
 /// is only compared with 0, 1 and 2, so it is kept up to 3. The cache's clear count is part of it
-/// because the DFA's state ids are only stable between two cache clears.
+/// because the DFA's state ids are only stable between two cache clears. The check depends on
+/// that count staying small: the search never reports progress to the cache, so regex-automata
+/// gives up on the fourth clear of a `LazyDfa`'s cache (see `regex_search_internal`); with
+/// progress reporting or another give-up rule the count could grow without bound, the state would
+/// never repeat, and a search upstream never finishes would never finish here either.
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct LoopState {
     point: Point,
@@ -2645,6 +2671,68 @@ mod tests {
         let result = next_match(term, "[^ ]+ ?", origin, Direction::Left, Side::Right, Some(0));
         let point = Point::new(Line(1), Column(0));
         assert_eq!(result, Some(point..=point));
+    }
+
+    /// 100 columns by `lines` lines, every line wrapped (the last one too, so the search reads on
+    /// from the bottom line into the top one), all `a` but for a wide char wrapped
+    /// from the end of line 0 to the start of line 1 (its leading spacer at (0,99)) and a `b` in
+    /// the last cell. A rightward search from (1,0) to the last cell finds the `b`; its second
+    /// search, back left to (1,0), steps over that wide char and, like 0.26.0, reads on around
+    /// the buffer for as long as the pattern keeps it alive (search fix 3, re-review 2).
+    fn counting_term(lines: usize) -> Term<VoidListener> {
+        let mut rows = vec![(format!("{} ", "a".repeat(99)), format!("{}L", "r".repeat(99)))];
+        for line in 1..lines {
+            let mut text = "a".repeat(100);
+            let mut flags = format!("{}r", ".".repeat(99));
+            if line == 1 {
+                text.replace_range(0..2, "中 ");
+                flags.replace_range(0..2, "Ws");
+            }
+            if line + 1 == lines {
+                text.replace_range(99..100, "b");
+            }
+            rows.push((text, flags));
+        }
+        let rows: Vec<(&str, &str)> = rows.iter().map(|(t, f)| (t.as_str(), f.as_str())).collect();
+        term_from_rows(0, &rows)
+    }
+
+    #[test]
+    fn counted_pattern_hits_the_cycle_check() {
+        // The second search counts the cells it reads modulo 97 and never finds the end of a
+        // match, so 0.26.0 never returns. Its state at each wrap around the buffer repeats with
+        // the counter, and the loop check in `regex_search_internal` ends it: no match.
+        let found = terminates("a counted pattern over a stepped-over origin", || {
+            let term = counting_term(20);
+            let mut regex = RegexSearch::new("(?:[ab中]{97})*b").unwrap();
+            let start = Point::new(Line(1), Column(0));
+            let end = Point::new(Line(19), Column(99));
+            let found = term.regex_search_right(&mut regex, start, end);
+            (found, regex.take_bound_fired())
+        });
+        assert_eq!(found, (None, true));
+    }
+
+    #[test]
+    fn cache_give_up_ends_a_search() {
+        // As above with a counter too large for the lazy DFA's cache: the cache is cleared again
+        // and again, so the loop check, whose state includes the clear count, never sees a repeat.
+        // The search ends only because regex-automata gives up on the cache's fourth clear: this
+        // search never reports progress to the cache (`Cache::search_update`), so it always
+        // counts as inefficient (`minimum_cache_clear_count(3)`, `minimum_bytes_per_state(10)` in
+        // `RegexSearch::new`), as in 0.26.0, which logs "Regex exceeded complexity limit" and
+        // returns no match. If a regex-automata update or an upstream change makes the cache keep
+        // clearing, this search runs forever and the test fails on its timeout.
+        let found = terminates("a counted pattern too large for the DFA cache", || {
+            let term = counting_term(21);
+            let mut regex = RegexSearch::new("(?:[ab中]{4999})*b").unwrap();
+            let start = Point::new(Line(1), Column(0));
+            let end = Point::new(Line(20), Column(99));
+            let found = term.regex_search_right(&mut regex, start, end);
+            (found, regex.take_bound_fired(), regex.right_rdfa.cache.clear_count())
+        });
+        // Ended by the cache giving up after its third clear, not by the loop check.
+        assert_eq!(found, (None, false, 3));
     }
 
     #[test]
