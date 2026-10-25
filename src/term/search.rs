@@ -158,7 +158,18 @@ impl<T> Term<T> {
         side: Side,
         mut max_lines: Option<usize>,
     ) -> Option<Match> {
-        origin = self.expand_wide(origin, direction);
+        // feathercritty: upstream uses `expand_wide` alone. Going right from a leading spacer it
+        // moves to column 1 of the next line, and on the bottommost line (a stale spacer, left in
+        // the middle of the line by a resize or an erase) there is no next line: upstream then
+        // panics reading below the grid, and with this fork's "no row" reads the search started
+        // there and returned the first match of the buffer instead of the next one. We use the
+        // cell the search lands on after reading the spacer (`glyph_end`) instead, which stays on
+        // the line. Upstream has no answer there, so no result it gives changes.
+        // When merging upstream: if `expand_wide` stays inside the grid, drop this; re-run
+        // `search_origin_on_bottom_line_stale_spacer`.
+        let expanded = self.expand_wide(origin, direction);
+        origin =
+            if expanded.line > self.bottommost_line() { self.glyph_end(origin) } else { expanded };
 
         max_lines = max_lines.filter(|max_lines| max_lines + 1 < self.total_lines());
 
@@ -2486,6 +2497,31 @@ mod tests {
         let match_start = Point::new(Line(0), Column(7));
         let match_end = Point::new(Line(1), Column(2));
         assert_eq!(result, Some(match_start..=match_end));
+    }
+
+    #[test]
+    fn search_origin_on_bottom_line_stale_spacer() {
+        // Differential soak seeds 2008270, 2032022 and five more (`random_streams`): a rightward
+        // `search_next` from a stale leading spacer in the middle of the bottommost line.
+        // `expand_wide` moves right from a leading spacer to column 1 of the next line, which
+        // does not exist there, so the origin left the grid: 0.26.0 panics, and the search
+        // started below the grid, found no match after that origin and returned the first match
+        // of the buffer, before the origin.
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("  a    ", "...L..."),
+        ]);
+        let origin = Point::new(Line(0), Column(3));
+
+        // The search reads the spacer with the cell after it in its place (as from any other
+        // origin), so the next match is the blank pair after that.
+        for side in [Side::Left, Side::Right] {
+            let mut regex = RegexSearch::new("  ").unwrap();
+            let result = term.search_next(&mut regex, origin, Direction::Right, side, None);
+            let match_start = Point::new(Line(0), Column(5));
+            let match_end = Point::new(Line(0), Column(6));
+            assert_eq!(result, Some(match_start..=match_end), "{side:?}");
+        }
     }
 
     #[test]
