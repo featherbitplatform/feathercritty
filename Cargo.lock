@@ -111,6 +111,7 @@ dependencies = [
  "alacritty_terminal",
  "base64",
  "bitflags",
+ "feathercritty",
  "home",
  "libc",
  "log",

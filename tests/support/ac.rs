@@ -21,6 +21,14 @@ pub fn cell_at(
     grid[point].clone()
 }
 
+/// A new terminal (`DIFF_TINY` concerns feathercritty's history blocks only).
+pub fn new_term(
+    config: k::term::Config,
+    size: &k::term::test::TermSize,
+) -> k::term::Term<k::event::VoidListener> {
+    k::term::Term::new(config, size, k::event::VoidListener)
+}
+
 /// See `cell_at`.
 pub fn row_at(
     grid: &k::grid::Grid<k::term::cell::Cell>,

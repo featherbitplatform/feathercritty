@@ -111,6 +111,7 @@
 //!   `is_empty`); stored records keep the old answer until they are evicted.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::Arc;
 
 use crate::grid::{GridCell, Row};
@@ -123,8 +124,9 @@ use crate::vte::ansi::{Color, NamedColor, Rgb};
 /// formats for `usize` and `char` that share the header layout (see `write_header`).
 pub trait HistoryCell: GridCell + Clone + Default + PartialEq {
     /// Shared data cells point to, kept outside the byte record (for `Cell`, its
-    /// `Arc<CellExtra>`). The history keeps the extras of all its rows in one queue.
-    type Extra;
+    /// `Arc<CellExtra>`). The history keeps the extras of all its rows in one queue; it clones
+    /// one only when it hands a row's extras to `decode` as a copy (see `History`).
+    type Extra: Clone + fmt::Debug;
 
     /// Whether `row` continues on the next line: its last cell has `Flags::WRAPLINE`.
     ///
@@ -140,9 +142,21 @@ pub trait HistoryCell: GridCell + Clone + Default + PartialEq {
     fn encode(row: &Row<Self>, out: &mut Vec<u8>, extras: &mut VecDeque<Self::Extra>) -> RowHeader;
 
     /// Decode the record at the start of `bytes` (bytes after it are ignored) into `into`,
-    /// which is resized only when its width differs. `extras` is the row's own slice of the
-    /// queue `encode` pushed to. The decoded row's `occ` is its width.
-    fn decode(bytes: &[u8], extras: &[Self::Extra], into: &mut Row<Self>);
+    /// which is resized only when its width differs, and return the record's length in bytes.
+    /// `extras` is the row's own slice of the queue `encode` pushed to. The decoded row's `occ`
+    /// is its width.
+    fn decode(bytes: &[u8], extras: &[Self::Extra], into: &mut Row<Self>) -> usize;
+
+    /// The cell at `column` of the record at the start of `bytes`, without decoding the rest of
+    /// the row (`Grid::cell`). Panics when `column` is not inside the row, as indexing a `Row`
+    /// does.
+    ///
+    /// The default decodes the whole row into a new one; `Cell` reads only what it needs.
+    fn decode_cell(bytes: &[u8], extras: &[Self::Extra], column: usize) -> Self {
+        let mut row = Row::default();
+        Self::decode(bytes, extras, &mut row);
+        row[..][column].clone()
+    }
 }
 
 /// What a record's header says about its row, readable without decoding the row.
@@ -232,7 +246,6 @@ pub(crate) fn write_header(out: &mut Vec<u8>, header: &RowHeader, runs: usize, m
 }
 
 /// Read the header of the record at the start of `bytes` without decoding the row.
-#[cfg_attr(not(test), expect(dead_code, reason = "the block store (next change) reads headers"))]
 pub(crate) fn read_header(bytes: &[u8]) -> RowHeader {
     read_layout(bytes).header
 }
@@ -308,6 +321,24 @@ impl<'a> RecordReader<'a> {
             .expect("history record: invalid UTF-8");
         self.pos += len;
         text.chars().next().expect("history record: empty character")
+    }
+
+    /// Step over one UTF-8 encoded character.
+    #[inline]
+    fn skip_char(&mut self) {
+        self.pos += match self.bytes[self.pos] {
+            0xf0.. => 4,
+            0xe0.. => 3,
+            0xc0.. => 2,
+            _ => 1,
+        };
+    }
+
+    /// Step over a color, flags and extra reference (see `style`).
+    #[inline]
+    fn skip_style(&mut self) {
+        self.pos += 10;
+        self.varint();
     }
 
     /// The header (`W`, `P`, `R`, `M`, `E`, bits).
@@ -581,6 +612,53 @@ fn decode_cell_row(bytes: &[u8], extras: &[Arc<CellExtra>], into: &mut Row<Cell>
     reader.position()
 }
 
+/// The cell at `column` of a `Cell` record, reading only the parts that describe it: the text
+/// up to it, then its run, mark and the tail are found by skipping the others.
+fn decode_one_cell(bytes: &[u8], extras: &[Arc<CellExtra>], column: usize) -> Cell {
+    let mut reader = RecordReader::new(bytes);
+    let Layout { header, runs, marks } = reader.layout();
+    debug_assert_eq!(extras.len(), header.extras as usize, "extras slice does not match row");
+    let width = header.width as usize;
+    let stored = header.len as usize;
+    assert!(column < width, "column {column} outside the row (width {width})");
+
+    let mut cell = Cell::default();
+    for col in 0..stored {
+        if col == column {
+            cell.c = reader.char();
+        } else {
+            reader.skip_char();
+        }
+    }
+
+    let mut col = 0;
+    for _ in 0..runs {
+        let len = reader.varint();
+        if (col..col + len).contains(&column) {
+            reader.style(extras).apply(&mut cell);
+        } else {
+            reader.skip_style();
+        }
+        col += len;
+    }
+
+    let mut col = 0;
+    for _ in 0..marks {
+        col += reader.varint();
+        let bits = reader.byte();
+        if col == column {
+            cell.flags.insert(mark_flags(bits));
+        }
+    }
+
+    if column >= stored {
+        cell.c = reader.char();
+        reader.style(extras).apply(&mut cell);
+    }
+
+    cell
+}
+
 impl HistoryCell for Cell {
     type Extra = Arc<CellExtra>;
 
@@ -656,8 +734,12 @@ impl HistoryCell for Cell {
         header
     }
 
-    fn decode(bytes: &[u8], extras: &[Self::Extra], into: &mut Row<Self>) {
-        decode_cell_row(bytes, extras, into);
+    fn decode(bytes: &[u8], extras: &[Self::Extra], into: &mut Row<Self>) -> usize {
+        decode_cell_row(bytes, extras, into)
+    }
+
+    fn decode_cell(bytes: &[u8], extras: &[Self::Extra], column: usize) -> Self {
+        decode_one_cell(bytes, extras, column)
     }
 }
 
@@ -742,8 +824,14 @@ mod tests {
 
         // The trait entry point decodes the same.
         let mut again = Row::default();
-        Cell::decode(&bytes, &row_extras, &mut again);
+        assert_eq!(Cell::decode(&bytes, &row_extras, &mut again), bytes.len());
         assert_rows_equal(row, &again);
+
+        // And so does reading one cell at a time.
+        for col in 0..row.len() {
+            let cell = Cell::decode_cell(&bytes, &row_extras, col);
+            assert_eq!(cell, row[Column(col)], "decode_cell, column {col}");
+        }
 
         Encoded { bytes, header, extras: row_extras }
     }
@@ -1086,6 +1174,13 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "outside the row")]
+    fn decode_cell_past_the_row_panics() {
+        let encoded = roundtrip(&Row::new(4));
+        Cell::decode_cell(&encoded.bytes, &[], 4);
+    }
+
+    #[test]
     fn roundtrip_random_rows() {
         let mut rng = ChaCha8Rng::seed_from_u64(0x0fe4_7e2c);
 
@@ -1137,6 +1232,8 @@ mod tests {
             assert_eq!(into.occ, width, "row {n}");
             for col in 0..width {
                 assert_eq!(into[Column(col)], row[Column(col)], "row {n}, column {col}");
+                let cell = Cell::decode_cell(&out[start..], &row_extras, col);
+                assert_eq!(cell, row[Column(col)], "decode_cell: row {n}, column {col}");
             }
 
             // Keep the buffers small; what matters is that records start anywhere.

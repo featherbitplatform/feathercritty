@@ -100,9 +100,9 @@ The trigger is a leading spacer.
   - `RowReader<T>`: `RowReader::new()` and `reader.row(&grid, line) -> &Row<T>` for a whole row of screen or history. Keep one reader and reuse it; a later release decodes history rows into its scratch row.
   - `Grid::cell(point) -> T` (an owned cell), `Grid::wraps(line) -> bool` and `Grid::is_clear(line) -> bool`, for single reads that work for screen and history lines.
 - `GridIterator` yields `Indexed<T>` by value (it used to borrow `&T` from the grid). `GridIterator::cell(&self) -> &T` borrows the current cell without cloning; `advance`/`retreat` (`pub(crate)`) step without producing an item.
-- `History<T>` (`src/grid/history.rs`, new) owns the scrollback: `new`, `len`, `is_empty`, `limit`, `set_limit`, `push_newest(&Row)`, `pop_newest`, `pop_oldest`, `read`, `update`, `wraps`, `is_clear`, `clear`. Cells stored in it implement `HistoryCell` (implemented for `Cell` in `src/term/cell.rs`).
+- `History<T>` (`src/grid/history.rs`, new) owns the scrollback: `new`, `len`, `is_empty`, `limit`, `set_limit`, `push_newest(&Row)`, `pop_newest`, `pop_oldest`, `read`, `update`, `wraps`, `is_clear`, `clear`. Cells stored in it implement `HistoryCell` (since phase 2 in `src/grid/compact.rs`, with the row codec).
 - The only write to history outside scrolling and resizing is the one in `Term::input` (`Grid::update_history_row`).
-- Temporary: `History::push_newest_recycle` (`pub(crate)`) swaps the departing screen row for a recycled one in `scroll_up`, as upstream's ring rotation did. A later release replaces it with `push_newest` plus an in-place reset.
+- (Phase 1 only: `History::push_newest_recycle` swapped the departing screen row for a recycled one in `scroll_up`. Phase 2, below, replaced it with `push_newest` plus the in-place reset upstream does.)
 - serde form is unchanged: the same fields as upstream (`raw.inner` from the bottom line up, `zero` 0, `len`, `visible_lines`, the scroll limit), through private proxy structs. Deserialization splits at the grid's `lines`, because old reference files carry a stale `visible_lines`. `tests/ref/` data is unchanged.
 
 **Merging a new upstream release.** Upstream code that indexes the grid (`self.grid[point]`, `grid[line]`, `grid.raw`-style access) will not compile after a merge. Classify each site:
@@ -121,7 +121,7 @@ The sites classified as history-capable in 0.26.0: `Term::line_to_string`, `Term
    - Iterators and readers. Before: undefined (see above). After: `Grid::cell` and `GridIterator::cell` return a default cell, `Grid::wraps` returns false, `Grid::is_clear` returns true. `RowReader::row` and the `History` methods keep a `debug_assert!` (a caller bug) and in release return default cells of the grid's width, a no-op, false and true.
 
 **Other changes**
-- `Storage::initialize` grows by exactly the rows needed (upstream added at least 1000 at a time, a history cache); it keeps upstream's hidden rows beyond `len`, which `scroll_up` recycles, and adds a small spare-row pool.
+- `Storage::initialize` grows by exactly the rows needed (upstream added at least 1000 at a time, a history cache); it keeps upstream's hidden rows beyond `len`, which `scroll_up` recycles. (Phase 1 also had a small spare-row pool there; phase 2 removed it, the history's block pool does that job.)
 - `Grid` equality compares content, including history.
 - `Grid::scroll_up` moves the departing rows into history, then rotates and resets as upstream did.
 - `resize.rs`: `grow_lines` moves popped history rows onto the new top rows and removes only the rows `scroll_up` pushed; it clamps the display offset unconditionally (upstream's `decrease_scroll_limit` always clamped). Column reflow collects screen and history into one `Vec` and splits it back. Every container call that differs from upstream carries a `// feathercritty:` comment, so the algorithm text can be diffed against upstream.
@@ -143,6 +143,13 @@ The sites classified as history-capable in 0.26.0: `Term::line_to_string`, `Term
 - `storage.rs`: `grow_after_zero` to `grow_after_zero_adds_exact_rows`; `grow_before_zero` to `grow_before_zero_adds_exact_rows`; `initialize` to `initialize_adds_exact_rows`. The other storage tests are upstream's; only their struct literals gained `spare`.
 - `grid/tests.rs`: `scroll_down_with_history` pushes with `history.push_newest` instead of the removed `increase_scroll_limit`; `test_iter` uses owned items.
 - New tests cover the split (`scroll_up_*`, `grow_lines_*`, `shrink_lines_*`, `row_reader_and_cell_read_screen_and_history`, `reads_outside_the_grid_are_no_row`, `iterator_*`, `serde_keeps_upstream_format`, and others) and the `occ` fix (`grow_raises_occ_to_old_len`, `append_keeps_occ_invariant`).
+
+**Phase 2 (unreleased, on `feature/compact-history`): compact rows in pooled blocks.** History rows are stored as compact byte records (`src/grid/compact.rs`) in pooled byte blocks (`src/grid/history.rs`; the module docs describe the layout, invariants, eviction and the pool). The `History` API is unchanged; `RowReader` and `GridIterator` decode a history row into their own scratch row once per row (screen rows are still lent in place), `Grid::cell` decodes only the cell asked for (`HistoryCell::decode_cell`). `Grid<T>` now requires `T: HistoryCell`. The `test-hooks` cargo feature (off by default; the crate's own tests enable it through a self dev-dependency) exposes `Grid::new_with_block_size`, which `tests/alloc.rs` (steady scrolling allocates nothing) and the differential test's `DIFF_TINY=1` (256-byte blocks) use. Files changed by phase 2, and what to watch when merging:
+- `src/grid/mod.rs`: `scroll_up` encodes the departing rows (`push_newest`) and resets the recycled rows in place, as upstream; `Grid` impls gained `T: HistoryCell`; `GridIterator` keeps a scratch row; equality and serde decode history. Re-check a changed `scroll_up` rotation against the pushes.
+- `src/grid/resize.rs`: `grow_lines` decodes popped history rows straight into the screen rows; the column reflow still decodes the whole history (a streaming reflow is the next change).
+- `src/grid/storage.rs`: the phase-1 spare-row pool is gone (closer to upstream again).
+- `src/grid/compact.rs`: `HistoryCell::decode` returns the bytes consumed; `decode_cell` reads one cell.
+- `Cargo.toml`: `test-hooks` feature and the self dev-dependency.
 
 **Benchmarks.** `cargo bench` (`benches/`, `benches/BASELINE.md`) compares against the oracle. The spec gate for resizing the screen by lines only is absolute, not a ratio: at most 50 microseconds per step of up to 10 lines and 1 ms per 37 to 1 to 37 pair, with a full 10,000-line history. Upstream does O(1) counter updates there; the fork moves the rows between the two containers (about 0.08 microseconds per small step), so the old ratio row (about 1.9) is informational only.
 

@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{cell_at, k, row_at};
+use super::{cell_at, k, new_term, row_at};
 use k::event::VoidListener;
 use k::grid::{Dimensions, Scroll};
 use k::index::{Boundary, Column, Direction, Line, Point, Side as KSide};
@@ -210,11 +210,7 @@ impl Side {
             ..Config::default()
         };
         let size = TermSize::new(start.columns, start.lines);
-        Self {
-            term: Term::new(config, &size, VoidListener),
-            parser: Processor::new(),
-            kitty: start.kitty,
-        }
+        Self { term: new_term(config, &size), parser: Processor::new(), kitty: start.kitty }
     }
 
     /// Clamp a step or query point into the grid.

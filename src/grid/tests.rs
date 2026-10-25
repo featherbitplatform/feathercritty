@@ -14,7 +14,7 @@ use crate::grid::compact::{self, RowHeader};
 use crate::term::cell::Cell;
 
 /// Line `line` of `grid`, screen or history, as an owned row.
-fn row<T: Clone + Default>(grid: &Grid<T>, line: i32) -> Row<T> {
+fn row<T: HistoryCell>(grid: &Grid<T>, line: i32) -> Row<T> {
     RowReader::new().row(grid, Line(line)).clone()
 }
 
@@ -56,12 +56,13 @@ impl HistoryCell for usize {
         header
     }
 
-    fn decode(bytes: &[u8], _extras: &[()], into: &mut Row<Self>) {
+    fn decode(bytes: &[u8], _extras: &[()], into: &mut Row<Self>) -> usize {
         let mut reader = compact::RecordReader::new(bytes);
         let width = reader.layout().header.width as usize;
         for cell in compact::prepare_row(into, width) {
             *cell = reader.varint();
         }
+        reader.position()
     }
 }
 

@@ -484,6 +484,16 @@ fn env_u64(name: &str) -> Option<u64> {
     Some(value.trim().parse().unwrap_or_else(|_| panic!("{name} must be an integer: {value:?}")))
 }
 
+/// `DIFF_TINY`: when set (to anything but `0`), every feathercritty grid's history uses
+/// [`TINY_BLOCK_BYTES`]-byte blocks, so block boundaries, spares and oversized rows are crossed
+/// all the time.
+pub fn tiny_blocks() -> bool {
+    std::env::var("DIFF_TINY").is_ok_and(|value| value.trim() != "0")
+}
+
+/// History block size under `DIFF_TINY`.
+pub const TINY_BLOCK_BYTES: usize = 256;
+
 /// `DIFF_SEEDS`, or `default`.
 pub fn seed_count(default: u64) -> u64 {
     env_u64("DIFF_SEEDS").unwrap_or(default)
@@ -544,7 +554,10 @@ where
         return total;
     };
     let start = case.start;
-    let steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
+    let mut steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
+    if tiny_blocks() {
+        steps += " DIFF_TINY=1";
+    }
     if divergence.hang {
         // Minimizing would rerun the hanging query many times, leaving a spinning thread each
         // time; report the seed and the query instead.

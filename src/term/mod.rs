@@ -586,7 +586,7 @@ impl<T> Term<T> {
     /// Convert a single line in the grid to a String.
     ///
     /// feathercritty: upstream indexed `self.grid[line]`; the line can be a history line, so the
-    /// row is read through `reader` (a copy for history rows, the row itself on the screen).
+    /// row is read through `reader` (decoded for history rows, the row itself on the screen).
     /// The caller keeps one reader across lines so the copies reuse one allocation. If upstream
     /// adds a grid read here, read it from `grid_line` or `self.grid.cell`.
     fn line_to_string(

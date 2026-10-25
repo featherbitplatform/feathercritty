@@ -6,8 +6,8 @@
 //! `MAX_CACHE_SIZE`), and `Grid::scroll_up` rotates them in as recycled rows exactly as upstream's
 //! cache rows were (the `Row` `occ` invariant makes the reset that follows complete). Changed:
 //! `initialize` grows by exactly the rows asked for instead of at least `MAX_CACHE_SIZE` (that
-//! batch was a cache for the history), and a small pool of `spare` rows lets the grid recycle rows
-//! that leave the screen for history or come back from it without allocating.
+//! batch was a cache for the history; the history's block pool avoids allocations now, see
+//! `history.rs`).
 
 use std::mem;
 use std::mem::MaybeUninit;
@@ -60,12 +60,6 @@ pub struct Storage<T> {
     /// As long as `len` is bigger than `inner`, it is also possible to grow the scrollback buffer
     /// without any additional insertions.
     len: usize,
-
-    /// Rows `Grid` handed back for reuse, all as wide as the screen, stale content included
-    /// (feathercritty; see the module docs). Not part of the content: never compared or
-    /// serialized.
-    #[cfg_attr(feature = "serde", serde(skip))]
-    spare: Vec<Row<T>>,
 }
 
 impl<T: PartialEq> PartialEq for Storage<T> {
@@ -88,7 +82,7 @@ impl<T> Storage<T> {
         let mut inner = Vec::with_capacity(visible_lines);
         inner.resize_with(visible_lines, || Row::new(columns));
 
-        Storage { inner, zero: 0, visible_lines, len: visible_lines, spare: Vec::new() }
+        Storage { inner, zero: 0, visible_lines, len: visible_lines }
     }
 
     /// A ring of exactly `rows`, all visible, bottom line first (feathercritty: used when
@@ -96,28 +90,7 @@ impl<T> Storage<T> {
     #[cfg(feature = "serde")]
     pub fn from_rows(rows: Vec<Row<T>>) -> Storage<T> {
         let len = rows.len();
-        Storage { inner: rows, zero: 0, visible_lines: len, len, spare: Vec::new() }
-    }
-
-    /// A spare row `columns` wide, stale content included, or a new one (feathercritty). The
-    /// caller resets or overwrites it.
-    #[inline]
-    pub fn take_spare(&mut self, columns: usize) -> Row<T>
-    where
-        T: Default,
-    {
-        match self.spare.pop() {
-            Some(row) if row.len() == columns => row,
-            _ => Row::new(columns),
-        }
-    }
-
-    /// Keep `row` as a spare, up to `MAX_CACHE_SIZE` of them (feathercritty).
-    #[inline]
-    pub fn give_spare(&mut self, row: Row<T>) {
-        if self.spare.len() < MAX_CACHE_SIZE {
-            self.spare.push(row);
-        }
+        Storage { inner: rows, zero: 0, visible_lines: len, len }
     }
 
     /// Increase the number of lines in the buffer.
@@ -176,12 +149,9 @@ impl<T> Storage<T> {
             self.rezero();
 
             // feathercritty: upstream grew by at least `MAX_CACHE_SIZE` rows, a cache for the
-            // history; the screen ring grows by exactly the rows it needs, spares first.
+            // history; the screen ring grows by exactly the rows it needs.
             let realloc_size = self.len + additional_rows;
-            while self.inner.len() < realloc_size {
-                let row = self.take_spare(columns);
-                self.inner.push(row);
-            }
+            self.inner.resize_with(realloc_size, || Row::new(columns));
         }
 
         self.len += additional_rows;
@@ -250,8 +220,6 @@ impl<T> Storage<T> {
         self.len = vec.len();
         self.inner = vec;
         self.zero = 0;
-        // feathercritty: spares have the old width.
-        self.spare.clear();
     }
 
     /// Remove all rows from storage.
@@ -317,7 +285,7 @@ impl<T> IndexMut<Line> for Storage<T> {
 
 // feathercritty: `grow_after_zero`, `grow_before_zero` and `initialize` expected upstream's
 // `MAX_CACHE_SIZE` batch; they are replaced by `*_adds_exact_rows` tests. The others are
-// upstream's (struct literals gained the `spare` field).
+// upstream's.
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -367,12 +335,13 @@ mod tests {
             header
         }
 
-        fn decode(bytes: &[u8], _extras: &[()], into: &mut Row<Self>) {
+        fn decode(bytes: &[u8], _extras: &[()], into: &mut Row<Self>) -> usize {
             let mut reader = compact::RecordReader::new(bytes);
             let width = reader.layout().header.width as usize;
             for cell in compact::prepare_row(into, width) {
                 *cell = reader.char();
             }
+            reader.position()
         }
     }
 
@@ -459,7 +428,6 @@ mod tests {
             zero: 0,
             visible_lines: 3,
             len: 3,
-            spare: Vec::new(),
         };
 
         // Grow buffer.
@@ -471,7 +439,6 @@ mod tests {
             zero: 0,
             visible_lines: 4,
             len: 4,
-            spare: Vec::new(),
         };
         expected.inner.push(filled_row('\0'));
 
@@ -500,7 +467,6 @@ mod tests {
             zero: 1,
             visible_lines: 3,
             len: 3,
-            spare: Vec::new(),
         };
 
         // Grow buffer.
@@ -512,7 +478,6 @@ mod tests {
             zero: 0,
             visible_lines: 4,
             len: 4,
-            spare: Vec::new(),
         };
         expected.inner.push(filled_row('\0'));
 
@@ -540,7 +505,6 @@ mod tests {
             zero: 1,
             visible_lines: 3,
             len: 3,
-            spare: Vec::new(),
         };
 
         // Shrink buffer.
@@ -552,7 +516,6 @@ mod tests {
             zero: 1,
             visible_lines: 2,
             len: 2,
-            spare: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -578,7 +541,6 @@ mod tests {
             zero: 0,
             visible_lines: 3,
             len: 3,
-            spare: Vec::new(),
         };
 
         // Shrink buffer.
@@ -590,7 +552,6 @@ mod tests {
             zero: 0,
             visible_lines: 2,
             len: 2,
-            spare: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -629,7 +590,6 @@ mod tests {
             zero: 2,
             visible_lines: 6,
             len: 6,
-            spare: Vec::new(),
         };
 
         // Shrink buffer.
@@ -648,7 +608,6 @@ mod tests {
             zero: 2,
             visible_lines: 2,
             len: 2,
-            spare: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -683,7 +642,6 @@ mod tests {
             zero: 2,
             visible_lines: 1,
             len: 2,
-            spare: Vec::new(),
         };
 
         // Truncate buffer.
@@ -695,7 +653,6 @@ mod tests {
             zero: 0,
             visible_lines: 1,
             len: 2,
-            spare: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -720,7 +677,6 @@ mod tests {
             zero: 2,
             visible_lines: 1,
             len: 2,
-            spare: Vec::new(),
         };
 
         // Truncate buffer.
@@ -732,7 +688,6 @@ mod tests {
             zero: 0,
             visible_lines: 1,
             len: 2,
-            spare: Vec::new(),
         };
         assert_eq!(storage.visible_lines, expected.visible_lines);
         assert_eq!(storage.inner, expected.inner);
@@ -779,7 +734,6 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 6,
-            spare: Vec::new(),
         };
 
         // Shrink buffer.
@@ -798,7 +752,6 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 3,
-            spare: Vec::new(),
         };
         assert_eq!(storage.inner, shrinking_expected.inner);
         assert_eq!(storage.zero, shrinking_expected.zero);
@@ -820,7 +773,6 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 4,
-            spare: Vec::new(),
         };
 
         assert_eq!(storage.inner, growing_expected.inner);
@@ -843,7 +795,6 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 6,
-            spare: Vec::new(),
         };
 
         // Initialize additional lines.
@@ -860,8 +811,7 @@ mod tests {
             filled_row('5'),
         ];
         expected_inner.append(&mut vec![filled_row('\0'); init_size]);
-        let expected_storage =
-            Storage { inner: expected_inner, zero: 0, visible_lines: 0, len: 9, spare: Vec::new() };
+        let expected_storage = Storage { inner: expected_inner, zero: 0, visible_lines: 0, len: 9 };
 
         assert_eq!(storage.len, expected_storage.len);
         assert_eq!(storage.zero, expected_storage.zero);
@@ -875,7 +825,6 @@ mod tests {
             zero: 2,
             visible_lines: 0,
             len: 3,
-            spare: Vec::new(),
         };
 
         storage.rotate(2);

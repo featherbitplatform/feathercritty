@@ -21,6 +21,28 @@ pub fn cell_at(
     grid.cell(point)
 }
 
+/// A new terminal; under `DIFF_TINY` its grid's history uses tiny blocks (see
+/// `support::tiny_blocks`). The grid is replaced right after `Term::new`, before anything is
+/// written, by one built with the same size and history limit.
+pub fn new_term(
+    config: k::term::Config,
+    size: &k::term::test::TermSize,
+) -> k::term::Term<k::event::VoidListener> {
+    use k::grid::Dimensions;
+
+    let history = config.scrolling_history;
+    let mut term = k::term::Term::new(config, size, k::event::VoidListener);
+    if super::tiny_blocks() {
+        *term.grid_mut() = k::grid::Grid::new_with_block_size(
+            size.screen_lines(),
+            size.columns(),
+            history,
+            super::TINY_BLOCK_BYTES,
+        );
+    }
+    term
+}
+
 /// See `cell_at`.
 pub fn row_at(
     grid: &k::grid::Grid<k::term::cell::Cell>,

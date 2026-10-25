@@ -5,9 +5,10 @@
 //! feathercritty: the algorithms are upstream's, line for line; only the containers differ
 //! since the grid holds its screen and its history apart (`Grid` in `mod.rs`). Every container
 //! call that differs from upstream is marked `// feathercritty:` so this file can be diffed
-//! against upstream's when merging; port upstream changes onto these containers. Phase 1 of the
-//! compact history work: the column reflow still collects every row into one dense `Vec`
-//! (`take_all_rows`) and splits the result back (`replace_all_rows`).
+//! against upstream's when merging; port upstream changes onto these containers. For now the
+//! column reflow still decodes every history row into one dense `Vec` with the screen rows
+//! (`take_all_rows`) and encodes the result back (`replace_all_rows`); a streaming version that
+//! never holds the whole history dense replaces them (design spec 5.6).
 
 use std::cmp::{Ordering, max, min};
 use std::mem;
@@ -16,9 +17,9 @@ use crate::index::{Boundary, Column, Line};
 use crate::term::cell::{Flags, ResetDiscriminant};
 
 use crate::grid::row::Row;
-use crate::grid::{Dimensions, Grid, GridCell};
+use crate::grid::{Dimensions, Grid, HistoryCell};
 
-impl<T> Grid<T> {
+impl<T: HistoryCell> Grid<T> {
     /// Remove every row, screen and history, in upstream's `Storage::take_all` order: the
     /// bottom screen line first, up to line 0, then the history from the newest row to the
     /// oldest (feathercritty).
@@ -39,15 +40,17 @@ impl<T> Grid<T> {
     fn replace_all_rows(&mut self, mut rows: Vec<Row<T>>) {
         debug_assert!(rows.len() >= self.lines);
         let history = rows.split_off(self.lines);
-        for row in history.into_iter().rev() {
-            self.history.push_newest_owned(row);
+        for row in history.iter().rev() {
+            self.history.push_newest(row);
         }
         self.screen.raw.replace_inner(rows);
         debug_assert_eq!(self.screen.raw.len(), self.lines);
     }
 }
 
-impl<T: GridCell + Default + PartialEq> Grid<T> {
+// feathercritty: upstream's bound was `T: GridCell + Default + PartialEq`, which `HistoryCell`
+// includes.
+impl<T: HistoryCell> Grid<T> {
     /// Resize the grid's width and/or height.
     pub fn resize<D>(&mut self, reflow: bool, lines: usize, columns: usize)
     where
@@ -95,18 +98,15 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // feathercritty: upstream grew its ring by `lines_added` rows at the oldest end, which
         // moved the `from_history` newest history rows onto the screen's new top lines and left
         // blank rows above them (on the screen when history ran short, in history otherwise).
-        // The screen ring grows by `lines_added` top rows (its hidden rows or spares, stale
-        // content included, as upstream's cache rows were) and the newest history rows replace
-        // the lowest of them, giving the same screen; the replaced rows become spares. The stale
-        // rows left above only ever reach history through `scroll_up` below and are removed
-        // again, as upstream's were.
+        // The screen ring grows by `lines_added` top rows (its hidden rows or new ones, stale
+        // content included, as upstream's cache rows were) and the newest history rows are
+        // decoded into the lowest of them, giving the same screen. The stale rows left above
+        // only ever reach history through `scroll_up` below and are removed again, as
+        // upstream's were.
         self.screen.raw.grow_visible_lines(target);
         self.lines = target;
-        let mut row = Row::default();
         for line in (lines_added - from_history..lines_added).rev().map(|line| Line(line as i32)) {
-            self.history.pop_newest(&mut row);
-            let spare = mem::replace(&mut self.screen[line], mem::take(&mut row));
-            self.screen.raw.give_spare(spare);
+            self.history.pop_newest(&mut self.screen[line]);
         }
 
         // Move existing lines up for every line that couldn't be pulled from history.
