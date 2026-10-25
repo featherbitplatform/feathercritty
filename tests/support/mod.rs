@@ -506,11 +506,13 @@ pub fn step_count(default: usize) -> usize {
     env_u64("DIFF_STEPS").map_or(default, |n| n as usize)
 }
 
-/// The seeds to run: `DIFF_SEED` alone when set, otherwise `0..count`.
+/// The seeds to run: `DIFF_SEED` alone when set, otherwise `start..start + count` with `start`
+/// from `DIFF_SEED_START` (default 0), so long soak runs can cover fresh seed ranges in chunks.
 pub fn seeds(count: u64) -> Vec<u64> {
+    let start = env_u64("DIFF_SEED_START").unwrap_or(0);
     match env_u64("DIFF_SEED") {
         Some(seed) => vec![seed],
-        None => (0..count).collect(),
+        None => (start..start + count).collect(),
     }
 }
 

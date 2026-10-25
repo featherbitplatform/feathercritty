@@ -18,14 +18,16 @@
 //! | full-width plain, uniform rows, dense cells, region scroll | 1.05 |
 //! | alternate-screen redraw, typing echo | 1.01, or the A/A spread (below) |
 //!
-//! **Noise ruling for the 1% rows** (controller, 2026-10-25): such a row runs at least 15
-//! interleaved rounds and also times 0.26.0 against itself (A/A) in the same rounds. It passes
+//! **Noise ruling for the 1% rows** (controller, 2026-10-25): such a row runs at least 31
+//! interleaved rounds (15 rounds are below this combined binary's noise; see
+//! `benches/RESULTS.md`) and also times 0.26.0 against itself (A/A) in the same rounds. It passes
 //! when the fork's median ratio is within `max(1%, A/A spread)`, the A/A spread being how far the
 //! two 0.26.0 medians differ (`|A'/A - 1|`): a difference the same binary shows against itself
 //! is noise, not a cost of the fork.
 //!
 //! Log lines and wide characters are measured but not gated (spec 6.3 lists no threshold).
-//! `BENCH_ONLY=<substring>` limits the rows, for quick runs.
+//! `BENCH_ONLY=<substring>` limits the rows, for quick runs; `--gate` refuses it (and any filter
+//! argument) and refuses `BENCH_RUNS` below 5, with an error and exit status 2.
 //!
 //! Run with `cargo bench --bench ingest [-- --gate]`. To move the comparison to a new upstream
 //! release see `common/mod.rs`.
@@ -33,8 +35,8 @@
 mod common;
 
 use common::{
-    BUFFER_BYTES, HISTORY, SIZES, Workload, ac, compare_ms, fc, gate_requested, interleaved_ms,
-    prefill_buffer, runs, selected, table_header, table_row, timed_ms, workload_for,
+    BUFFER_BYTES, HISTORY, SIZES, Workload, ac, compare_ms, fc, interleaved_ms, prefill_buffer,
+    runs, selected, table_header, table_row, timed_gate_requested, timed_ms, workload_for,
 };
 
 /// Spec 6.3 thresholds (maximum fork/0.26.0 ratio), `None` where the spec sets none.
@@ -51,7 +53,7 @@ fn threshold(kind: Workload) -> Option<f64> {
 }
 
 fn main() {
-    let gate = gate_requested();
+    let gate = timed_gate_requested();
     let kinds = [
         Workload::ShortLines,
         Workload::FullWidthPlain,
@@ -96,10 +98,10 @@ fn main() {
             };
 
             let ok = if threshold(kind).is_some_and(|t| t <= 1.01) {
-                // The 1% rows: at least 15 rounds, with an A/A comparison (see the module docs).
+                // The 1% rows: at least 31 rounds, with an A/A comparison (see the module docs).
                 let mut setup_ac2 = setup_ac;
                 let mut run_ac2 = run_ac;
-                let stats = interleaved_ms(runs().max(15), &mut [
+                let stats = interleaved_ms(runs().max(31), &mut [
                     &mut || timed_ms(&mut setup_ac, &mut run_ac),
                     &mut || timed_ms(&mut setup_fc, &mut run_fc),
                     &mut || timed_ms(&mut setup_ac2, &mut run_ac2),

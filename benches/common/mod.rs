@@ -29,7 +29,7 @@
 //!    `Term::search_next`. If upstream changes one of these, change the macro (one place).
 //! 3. Re-check the workloads against any new escape-sequence behavior (the scroll-region and
 //!    alternate-screen workloads rely on DECSTBM, `CSI ? 1049 h` and `CSI 2 K` with a background).
-//! 4. Re-run all three binaries and refresh `benches/BASELINE.md`.
+//! 4. Re-run all three binaries and refresh `benches/RESULTS.md`.
 
 // Each benchmark binary uses a different part of this module.
 #![allow(dead_code)]
@@ -453,9 +453,39 @@ pub fn runs() -> usize {
     std::env::var("BENCH_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(7)
 }
 
-/// Whether the command line asks for threshold checking.
+/// Whether the command line asks for threshold checking. A gate run must measure every row, so
+/// `--gate` together with a row filter (`BENCH_ONLY`, or a positional filter argument) is refused
+/// with an error and exit status 2.
 pub fn gate_requested() -> bool {
-    std::env::args().any(|a| a == "--gate")
+    let gate = std::env::args().any(|a| a == "--gate");
+    if gate {
+        let only = std::env::var_os("BENCH_ONLY").is_some();
+        // `cargo bench` passes `--bench`; anything not starting with `-` is a filter.
+        let filters: Vec<String> =
+            std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
+        if only || !filters.is_empty() {
+            refuse_gate(&format!(
+                "--gate runs every row; unset BENCH_ONLY and drop the filter arguments ({})",
+                if only { "BENCH_ONLY is set".to_owned() } else { filters.join(" ") }
+            ));
+        }
+    }
+    gate
+}
+
+/// [`gate_requested`] for the timed benches: also refuses `--gate` with `BENCH_RUNS` below 5,
+/// the spec's minimum number of runs per row.
+pub fn timed_gate_requested() -> bool {
+    let gate = gate_requested();
+    if gate && runs() < 5 {
+        refuse_gate(&format!("--gate needs BENCH_RUNS >= 5 (got {})", runs()));
+    }
+    gate
+}
+
+fn refuse_gate(why: &str) -> ! {
+    eprintln!("error: {why}");
+    std::process::exit(2);
 }
 
 /// Row filter from `BENCH_ONLY` (substring of the row label), for quick runs.

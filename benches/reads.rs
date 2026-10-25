@@ -36,8 +36,8 @@
 mod common;
 
 use common::{
-    HISTORY, Stats, Workload, ac, compare_ms, fc, gate_requested, runs, selected, table_header,
-    table_row, table_row_abs, workload_lines,
+    HISTORY, Stats, Workload, ac, compare_ms, fc, runs, selected, table_header, table_row,
+    table_row_abs, timed_gate_requested, workload_lines,
 };
 
 /// Repetitions of the lines-only resize inside one timed run (one pair takes microseconds).
@@ -62,7 +62,7 @@ macro_rules! sims {
 }
 
 fn main() {
-    let gate = gate_requested();
+    let gate = timed_gate_requested();
     let mut failed = 0;
     let mut row =
         |label: &str, (a, f): (common::Stats, common::Stats), max: f64, floor: Option<f64>| {

@@ -8,12 +8,13 @@
 //! `tests/support/mod.rs`.
 //!
 //! Knobs: `DIFF_SEEDS` (seeds per pass, default 300), `DIFF_STEPS` (steps per random seed,
-//! default 400), `DIFF_SEED` (replay one seed), `DIFF_TINY` (feathercritty's history uses
-//! 256-byte blocks instead of 64 KiB ones, so block boundaries, spare blocks and oversized rows
-//! are crossed constantly, and its column reflow keeps a window of one dense row instead of
-//! `2 * lines + 2`). A failure prints the seed, the `DIFF_STEPS` (and `DIFF_TINY`) value
-//! the pass used and a minimized step list. Each pass prints coverage statistics (see them with
-//! `--nocapture`).
+//! default 400), `DIFF_SEED` (replay one seed), `DIFF_SEED_START` (first seed of every random
+//! pass, default 0; `ref_recordings` ignores it, its seeds name recordings), `DIFF_TINY`
+//! (feathercritty's history uses 256-byte blocks instead of 64 KiB ones, so block boundaries, spare
+//! blocks and oversized rows are crossed constantly, and its column reflow keeps a window of one
+//! dense row instead of `2 * lines + 2`). A failure prints the seed, the `DIFF_STEPS` (and
+//! `DIFF_TINY`) value the pass used and a minimized step list. Each pass prints coverage statistics
+//! (see them with `--nocapture`).
 //!
 //! Intended behavioral differences (README change list), modeled as described in
 //! `tests/support/mod.rs`:
@@ -127,7 +128,11 @@ fn realistic_full_screen() {
 fn ref_recordings() {
     let names = r#gen::recordings();
     let count = names.len() as u64 * 2;
-    let seeds = support::seeds(count);
+    // Every recording twice, whatever `DIFF_SEED_START` says (`DIFF_SEED` still replays one).
+    let seeds: Vec<u64> = match std::env::var("DIFF_SEED") {
+        Ok(_) => support::seeds(count),
+        Err(_) => (0..count).collect(),
+    };
     support::run_pass("ref_recordings", &seeds, None, |seed| {
         let name = &names[(seed % names.len() as u64) as usize];
         r#gen::recording_case(name, seed, seed >= names.len() as u64)

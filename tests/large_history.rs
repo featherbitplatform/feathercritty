@@ -534,6 +534,9 @@ fn compare(phase: &str, a: &mut fc::Side, b: &mut ac::Side, plan: &QueryPlan) {
         }
     }
     let matches = qa.iter().filter(|(_, a)| matches!(a, QAns::Match(Some(_)))).count();
+    // The plan's matching searches must find something, or the equal answers above would only
+    // show that both crates agree on "no match".
+    assert!(matches > 0, "{phase}: no search found a match");
     println!(
         "  {phase}: {rows} rows and {} answers equal ({matches} searches found a match, \
          {oracle_off} checked alone), {:.1} s",
@@ -809,6 +812,7 @@ struct Cell1 {
     rss_base: Option<u64>,
     rss_fill: Option<u64>,
     rss_resized: Option<u64>,
+    live_resized: usize,
     live_trimmed: usize,
     fill_ms: f64,
     /// "median;min;max" of each timing.
@@ -848,6 +852,7 @@ fn run_cell(content: Content, history: usize) -> Cell1 {
         rss_base: kib(f[4]),
         rss_fill: kib(f[5]),
         rss_resized: kib(f[6]),
+        live_resized: f[7].parse().unwrap(),
         live_trimmed: f[8].parse().unwrap(),
         fill_ms: f[10].parse().unwrap(),
         times: [11, 12, 13, 14, 15].map(|i| f[i].to_owned()),
@@ -889,12 +894,12 @@ fn large_history_cost_table() {
     );
     println!(
         "| content | history lines | live MB | bytes per row | dense MB | RSS MB after fill | RSS \
-         MB after 10 resizes | live MB after trim to 10,000 |"
+         MB after 10 resizes | live MB after 10 resizes | live MB after trim to 10,000 |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|---:|");
     for c in &cells {
         println!(
-            "| {} | {} | {} | {} | {} | {} | {} | {} |",
+            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
             c.content.label(),
             c.history,
             mb(c.live),
@@ -902,6 +907,7 @@ fn large_history_cost_table() {
             mb(c.history * dense_row),
             mb_kib(c.rss_fill),
             mb_kib(c.rss_resized),
+            mb(c.live_resized),
             mb(c.live_trimmed),
         );
     }
