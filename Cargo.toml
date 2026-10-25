@@ -51,3 +51,8 @@ windows-sys = { version = "0.59.0", features = [
 
 [dev-dependencies]
 serde_json = "1.0.0"
+# The unmodified upstream release, the oracle of tests/differential.rs.
+alacritty_terminal = "=0.26.0"
+# ChaCha keeps generated test cases identical on every platform.
+rand = "0.8"
+rand_chacha = "0.3"
