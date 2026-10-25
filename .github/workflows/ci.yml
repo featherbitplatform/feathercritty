@@ -1,3 +1,5 @@
+# Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 name: CI
 
 on:
@@ -26,6 +28,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      # Differential test against alacritty_terminal 0.26.0 (tests/differential.rs), run in
+      # debug by the `cargo test` steps below: seeds per pass and steps per random seed.
+      DIFF_SEEDS: 300
+      DIFF_STEPS: 400
     steps:
       - uses: actions/checkout@v4
       - run: rustup update stable && rustup default stable && rustup component add clippy
