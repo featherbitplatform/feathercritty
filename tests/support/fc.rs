@@ -11,6 +11,15 @@ mod imp;
 
 pub use imp::*;
 
+/// Write one screen cell (`term_impl::Side::from_rows`).
+pub fn set_cell(
+    term: &mut k::term::Term<k::event::VoidListener>,
+    point: k::index::Point,
+    cell: k::term::cell::Cell,
+) {
+    term.grid_mut().screen_mut()[point] = cell;
+}
+
 /// This side is feathercritty, whose searches always terminate (fork change 5).
 pub const ORACLE: bool = false;
 

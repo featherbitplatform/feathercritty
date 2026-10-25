@@ -12,6 +12,15 @@ mod imp;
 
 pub use imp::*;
 
+/// Write one screen cell (`term_impl::Side::from_rows`).
+pub fn set_cell(
+    term: &mut k::term::Term<k::event::VoidListener>,
+    point: k::index::Point,
+    cell: k::term::cell::Cell,
+) {
+    term.grid_mut()[point] = cell;
+}
+
 /// This side is 0.26.0, whose searches `term_impl::search_terminates` must steer around.
 pub const ORACLE: bool = true;
 

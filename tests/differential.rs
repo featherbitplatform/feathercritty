@@ -311,13 +311,16 @@ fn search_soak_regressions() {
     let random = [
         1_000_017, // a match around the buffer's end (start after end) is real
         5_000_017, // 0.26.0's match ending in a stale spacer's completion is kept
-        2_001_369, // a leftward match's second search reads past a stale spacer's origin
+        2_001_369, // a leftward match's second search reads past its origin, as 0.26.0's
         2_008_270, // a rightward origin on a bottom-line stale spacer stays in the grid
         2_013_725, // 0.26.0's match running around the buffer is outside the range
         2_024_013, // the harness's range uses feathercritty's origin for that spacer
         814,       // 0.26.0 answers from below the grid for that origin: not compared
-        2_003_541, // a leftward match past a wrapping range's start is cut (DIFF_TINY=1)
-        3_001_698, // after a cut, the iterator stops where 0.26.0's does
+        2_003_541, // a match through lines outside a wrapping range (DIFF_TINY=1)
+        3_001_698, // the iterator stops where 0.26.0's does
+        5_104_388, // a match is never rewritten into text the pattern does not match
+        7_000_448, // the same, for a match running around the buffer
+        7_025_823, // 0.26.0 goes on from inside the range's far end; so does the iteration
     ];
     for seed in random {
         let case = r#gen::random_case(seed, DEFAULT_STEPS);
@@ -330,6 +333,103 @@ fn search_soak_regressions() {
     if let Err(divergence) = support::run(&case.start, &case.steps) {
         panic!("realistic_cjk seed 1000223: {divergence}");
     }
+}
+
+/// Hand-built small grids with wide characters, wide characters without their spacer, and
+/// leading spacers (wrapped and stale), written straight into both crates, and searched with
+/// `search_next` from random origins. As in `run`: where 0.26.0 cannot answer (it does not
+/// terminate, or its answer lies outside the range) feathercritty's answer is checked on its own;
+/// everywhere else the answers must be equal. Byte streams reach these grid shapes only rarely
+/// (the search fix's re-review found its parity breaks this way first); this finds them in
+/// seconds. The oracle runs on a thread with a timeout, so a 0.26.0 search that never returns is
+/// classified, not waited for.
+#[test]
+fn search_grid_probe() {
+    use rand::{Rng, SeedableRng};
+    use support::project::{QAns, SearchQ};
+    use support::{Pt, ac, fc};
+
+    let grids = support::seed_count(300) * 5;
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x5ea2c4);
+    let patterns = ["[^ ]+ ?", "[^ ]+", " ", "  ", "a", "中", "a ?中", "b|符"];
+    let (mut equal, mut off, mut hangs) = (0, 0, 0);
+    for grid in 0..grids {
+        let columns = rng.gen_range(2..=3usize);
+        let lines = rng.gen_range(3..=10usize);
+        let mut rows = Vec::new();
+        for _ in 0..lines {
+            let (mut text, mut flags) = (String::new(), String::new());
+            let mut column = 0;
+            while column < columns {
+                let kind = rng.gen_range(0..10);
+                if kind < 2 && column + 1 < columns {
+                    text.push_str("中 ");
+                    flags.push_str("Ws");
+                    column += 2;
+                } else if kind == 2 && column + 1 < columns {
+                    // A wide character without its spacer.
+                    text.push_str(if rng.gen_bool(0.5) { "符 " } else { "符a" });
+                    flags.push_str("W.");
+                    column += 2;
+                } else if kind == 3 && column + 1 == columns {
+                    text.push(' ');
+                    flags.push(if rng.gen_bool(0.7) { 'L' } else { 'l' });
+                    column += 1;
+                } else {
+                    text.push(['a', 'b', ' ', 'x'][rng.gen_range(0..4)]);
+                    flags.push('.');
+                    column += 1;
+                }
+            }
+            if rng.gen_bool(0.5) {
+                let last = flags.pop().unwrap();
+                flags.push(match last {
+                    '.' => 'r',
+                    's' => 'S',
+                    other => other,
+                });
+            }
+            rows.push((text, flags));
+        }
+        let (a, b) = (fc::Side::from_rows(&rows), ac::Side::from_rows(&rows));
+
+        for _ in 0..6 {
+            let max_lines = match rng.gen_range(0..=lines) {
+                0 => None,
+                n => Some(n - 1),
+            };
+            let search = SearchQ {
+                pattern: patterns[rng.gen_range(0..patterns.len())].to_owned(),
+                origin: Pt::new(rng.gen_range(0..lines) as i32, rng.gen_range(0..columns)),
+                right: rng.gen_bool(0.5),
+                side_right: rng.gen_bool(0.5),
+                max_lines,
+                unmoved: None,
+            };
+            let timeout = std::time::Duration::from_secs(5);
+            let fork = a
+                .search_detached(&search, max_lines, std::time::Duration::from_secs(30))
+                .unwrap_or_else(|| panic!("feathercritty did not return: {rows:?} {search:?}"));
+            let oracle = b.search_timed(&search, max_lines, true, timeout);
+            let oracle = oracle.unwrap_or_else(|| {
+                hangs += 1;
+                QAns::NoTermination
+            });
+            if b.oracle_search_is_off(&search, &oracle) {
+                if let Err(why) = a.check_search(&search, max_lines, &fork) {
+                    panic!(
+                        "grid {grid} {rows:?}: {search:?}: {why}; fork {fork:?}, 0.26.0 {oracle:?}"
+                    );
+                }
+                off += 1;
+            } else {
+                assert_eq!(fork, oracle, "grid {grid} {rows:?}: {search:?}");
+                equal += 1;
+            }
+        }
+    }
+    println!("search_grid_probe: {equal} equal, {off} checked alone ({hangs} oracle timeouts)");
+    assert!(equal > off && off > 0);
 }
 
 /// The oracle compares cells in history, not only the screen.

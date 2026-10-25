@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{ORACLE, cell_at, k, new_term, row_at};
+use super::{ORACLE, cell_at, k, new_term, row_at, set_cell};
 use k::event::VoidListener;
 use k::grid::{Dimensions, Scroll};
 use k::index::{Boundary, Column, Direction, Line, Point, Side as KSide};
@@ -172,9 +172,9 @@ fn origin_leaves_grid(term: &Term<VoidListener>, origin: Point, direction: Direc
 /// (`RegexIter`) can cycle between two matches forever (next to a `LEADING_WIDE_CHAR_SPACER`,
 /// wrapped or stale). This walks the same iterator `search_next` walks, with the same start, end
 /// and stop condition (`search_bounds`), but gives up after more matches than the grid has cells.
-/// feathercritty fixed the cycle (fork change 5, `+fbterm.3`), so on its side this returns `true`
-/// (anything else fails the run through `check_search`); keep it while the oracle runs 0.26.0
-/// and remove it once the oracle release fixes the cycle too.
+/// feathercritty ends such iterations (fork change 5), so on its side this returns `true` without
+/// walking; keep it while the oracle runs 0.26.0 and remove it once the oracle release fixes the
+/// cycle too.
 ///
 /// A single search inside the iterator can also run forever in 0.26.0, and that cannot be bounded
 /// from outside. On the oracle side this therefore also answers `false`, without searching, when
@@ -191,6 +191,14 @@ fn search_terminates(
     side: KSide,
     max_lines: Option<usize>,
 ) -> bool {
+    // feathercritty's searches always return (fork change 5: its iteration ends where 0.26.0's
+    // would repeat forever), and `check_search` checks its answers, so its side does not walk the
+    // iterator here. Its `RegexIter` yields 0.26.0's matches, repeats included, until its cycle
+    // check notices the repeat, which can take more than the limit below.
+    if !ORACLE {
+        return true;
+    }
+
     // On the oracle side, searches 0.26.0 cannot run sensibly are answered "does not terminate"
     // without running them: an origin that leaves the grid (`origin_leaves_grid`; walking the
     // iterator here from feathercritty's origin can take very long on a large history, and
@@ -277,6 +285,35 @@ fn guarded(query: impl FnOnce() -> QAns) -> QAns {
 }
 
 impl Side {
+    /// A terminal with no history whose screen holds `rows`, each a line of characters and a
+    /// line of flag codes, one per cell: `.` none, `r` `WRAPLINE`, `W` `WIDE_CHAR`, `s`
+    /// `WIDE_CHAR_SPACER`, `S` `WIDE_CHAR_SPACER | WRAPLINE`, `L`
+    /// `LEADING_WIDE_CHAR_SPACER | WRAPLINE`, `l`
+    /// `LEADING_WIDE_CHAR_SPACER`. Used by `search_grid_probe` to write the same grid into both
+    /// crates without a byte stream.
+    pub fn from_rows(rows: &[(String, String)]) -> Self {
+        let columns = rows[0].1.chars().count();
+        let start = Start { lines: rows.len(), columns, history: 0, kitty: false, query_seed: 0 };
+        let mut side = Self::new(&start);
+        for (line, (text, flags)) in rows.iter().enumerate() {
+            for (column, (c, code)) in text.chars().zip(flags.chars()).enumerate() {
+                let flags = match code {
+                    '.' => Flags::empty(),
+                    'r' => Flags::WRAPLINE,
+                    'W' => Flags::WIDE_CHAR,
+                    's' => Flags::WIDE_CHAR_SPACER,
+                    'L' => Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE,
+                    'l' => Flags::LEADING_WIDE_CHAR_SPACER,
+                    'S' => Flags::WIDE_CHAR_SPACER | Flags::WRAPLINE,
+                    other => panic!("unknown flag code {other:?}"),
+                };
+                let cell = Cell { c, flags, ..Cell::default() };
+                set_cell(&mut side.term, Point::new(Line(line as i32), Column(column)), cell);
+            }
+        }
+        side
+    }
+
     pub fn new(start: &Start) -> Self {
         let config = Config {
             scrolling_history: start.history,
@@ -414,6 +451,20 @@ impl Side {
         max_lines: Option<usize>,
         timeout: Duration,
     ) -> Option<QAns> {
+        self.search_timed(search, max_lines, false, timeout)
+    }
+
+    /// `search` with `probe` on another thread, as `search_detached` runs it: `None` if it has not
+    /// returned after `timeout`. `search_grid_probe` runs the oracle side this way, so a 0.26.0
+    /// search that never returns (one the probe does not foresee) is classified instead of
+    /// hanging the test.
+    pub fn search_timed(
+        &self,
+        search: &SearchQ,
+        max_lines: Option<usize>,
+        probe: bool,
+        timeout: Duration,
+    ) -> Option<QAns> {
         let grid = self.term.grid().clone();
         let size = TermSize::new(grid.columns(), grid.screen_lines());
         let mut term = Term::new(Config::default(), &size, VoidListener);
@@ -422,7 +473,7 @@ impl Side {
         let search = search.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(side.search(&search, max_lines, false));
+            let _ = tx.send(side.search(&search, max_lines, probe));
         });
         rx.recv_timeout(timeout).ok()
     }
