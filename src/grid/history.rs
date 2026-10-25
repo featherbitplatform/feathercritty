@@ -27,7 +27,6 @@
 //! [`History::update`].
 
 use std::collections::VecDeque;
-use std::marker::PhantomData;
 
 use crate::grid::{Dimensions, Grid, GridCell, Row};
 use crate::index::Line;
@@ -168,36 +167,42 @@ impl<T> History<T> {
 
     /// Copy row `i` (0 is the newest) into `into`, reusing `into`'s allocation.
     ///
-    /// Panics when `i >= len()`.
+    /// Callers check `i < len()` (a `debug_assert!`). Past the end is "no row": `into` keeps its
+    /// width and every cell becomes `T::default()`.
     pub fn read(&self, i: usize, into: &mut Row<T>)
     where
-        T: Clone,
+        T: Clone + Default,
     {
-        into.clone_from(self.row(i));
+        match self.index(i) {
+            Some(index) => into.clone_from(&self.rows[index]),
+            None => into[..].iter_mut().for_each(|cell| *cell = T::default()),
+        }
     }
 
     /// Change row `i` (0 is the newest) in place.
     ///
-    /// Panics when `i >= len()`.
+    /// Callers check `i < len()` (a `debug_assert!`); past the end there is no row to change.
     pub fn update(&mut self, i: usize, f: impl FnOnce(&mut Row<T>)) {
-        let index = self.index(i);
-        f(&mut self.rows[index]);
+        if let Some(index) = self.index(i) {
+            f(&mut self.rows[index]);
+        }
     }
 
-    /// Whether row `i` (0 is the newest) continues on the next line.
+    /// Whether row `i` (0 is the newest) continues on the next line; "no row" past the end
+    /// does not.
     pub fn wraps(&self, i: usize) -> bool
     where
         T: HistoryCell,
     {
-        T::row_wraps(self.row(i))
+        self.index(i).is_some_and(|index| T::row_wraps(&self.rows[index]))
     }
 
-    /// Whether every cell of row `i` (0 is the newest) is empty.
+    /// Whether every cell of row `i` (0 is the newest) is empty; "no row" past the end is.
     pub fn is_clear(&self, i: usize) -> bool
     where
         T: GridCell,
     {
-        self.row(i).is_clear()
+        self.index(i).is_none_or(|index| self.rows[index].is_clear())
     }
 
     /// Remove every row; the limit stays.
@@ -209,17 +214,22 @@ impl<T> History<T> {
     /// serialization. The encoded store of a later phase has no row to lend; those callers then
     /// decode with [`History::read`].
     ///
-    /// Panics when `i >= len()`.
+    /// Panics when `i >= len()`: every caller in the crate checks the range first.
     #[inline]
     pub(crate) fn row(&self, i: usize) -> &Row<T> {
-        &self.rows[self.index(i)]
+        &self.rows[self.rows.len() - 1 - i]
     }
 
-    /// Position of row `i` (0 is the newest) in `rows`.
+    /// Position of row `i` (0 is the newest) in `rows`, `None` past the end ("no row"; a
+    /// caller bug, so debug builds stop there).
     #[inline]
-    fn index(&self, i: usize) -> usize {
-        assert!(i < self.rows.len(), "history row {i} out of range (len {})", self.rows.len());
-        self.rows.len() - 1 - i
+    fn index(&self, i: usize) -> Option<usize> {
+        debug_assert!(
+            i < self.rows.len(),
+            "history row {i} out of range (len {})",
+            self.rows.len()
+        );
+        (i < self.rows.len()).then(|| self.rows.len() - 1 - i)
     }
 
     fn evict_over_limit(&mut self) {
@@ -238,8 +248,9 @@ impl<T> History<T> {
 /// a loop over many lines.
 #[derive(Debug)]
 pub struct RowReader<T> {
-    /// Dense phase: nothing to keep (the encoded store keeps its scratch row here).
-    marker: PhantomData<Row<T>>,
+    /// A row of default cells, the grid's width, returned for "no row" (made on first use).
+    /// Dense phase: nothing else to keep (the encoded store keeps its scratch row here too).
+    blank: Row<T>,
 }
 
 impl<T> Default for RowReader<T> {
@@ -251,26 +262,32 @@ impl<T> Default for RowReader<T> {
 impl<T> RowReader<T> {
     /// A reader; it allocates nothing until it has to copy a row.
     pub fn new() -> Self {
-        Self { marker: PhantomData }
+        Self { blank: Row::default() }
     }
 
     /// Row `line` of `grid`, for any line from `grid.topmost_line()` to
-    /// `grid.bottommost_line()`. Callers clamp; a line outside that range panics (in debug
-    /// builds with this message, like upstream's indexing). No library path calls it with such
-    /// a line: reads outside the grid are "no row" (`Grid::cell`).
+    /// `grid.bottommost_line()`. Callers clamp: a line outside that range fails a
+    /// `debug_assert!` (a caller bug, as upstream's indexing treated it) and in release builds
+    /// reads as "no row", a row of default cells (see `Grid::cell`).
     pub fn row<'a>(&'a mut self, grid: &'a Grid<T>, line: Line) -> &'a Row<T>
     where
-        T: Clone,
+        T: Clone + Default,
     {
+        let inside = line >= grid.topmost_line() && line <= grid.bottommost_line();
         debug_assert!(
-            line >= grid.topmost_line() && line <= grid.bottommost_line(),
+            inside,
             "RowReader: line {} outside the grid ({}..={}); callers must clamp",
             line.0,
             grid.topmost_line().0,
             grid.bottommost_line().0,
         );
 
-        if line.0 >= 0 {
+        if !inside {
+            if self.blank.len() != grid.columns() {
+                self.blank = Row::new(grid.columns());
+            }
+            &self.blank
+        } else if line.0 >= 0 {
             &grid.screen()[line]
         } else {
             // Dense phase: lend the stored row (the encoded store decodes it into a scratch row).

@@ -1,6 +1,7 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
-//! The unmodified `alacritty_terminal` 0.26.0 side of the differential tests (the oracle).
+//! The `alacritty_terminal` 0.26.0 side of the differential tests (the oracle): the published
+//! source vendored at `tests/oracle/` with the two patches `tests/oracle/PATCHES.md` lists.
 
 pub use alacritty_terminal as k;
 
