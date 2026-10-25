@@ -126,6 +126,13 @@ impl<T: HistoryCell> RowSource<'_, T> {
     ///   the cut row). History rows are never the cursor's line, the one other case the loop treats
     ///   apart.
     ///
+    /// These conditions are a correct superset of the text of design spec 5.6, each refinement
+    /// taken from upstream's loop: shrinking accepts any empty tail (`GridCell::is_empty`, for
+    /// example a `'\t'` tail or a space with `BOLD`, exactly what `Row::shrink` drops), not only
+    /// the default one; shrinking without reflow (`!reflow`, the `_` arm that pushes the cut row
+    /// either way) copies too; and growing uses upstream's whole `should_reflow` (`reflow`,
+    /// `len < columns` and a wrapping last cell), not only "the previous row does not wrap".
+    ///
     /// The result is exactly upstream's: such a row's record with `W` changed is the record of
     /// the row the loop would have pushed (`byte_copy_matches_decode_and_encode`), and the
     /// differential test runs it with a reflow window of 1. When merging upstream: if the loop
@@ -260,11 +267,27 @@ impl<T: HistoryCell> ReflowSink<T> {
     /// Whether upstream's `grow_columns` would move cells of the next row into the newest row
     /// (its `should_reflow` on `last_mut()`), read from the header when the newest row is
     /// already encoded.
+    ///
+    /// The header branch reads the width the row was stored with, which is the grown width
+    /// (`store` grows rows to `grow_to` first), not the length upstream's `last_mut()` would see.
+    /// That is only correct because the window is empty inside the loop solely right after
+    /// `push_moved`, so the encoded newest row is a byte-copied row: its tail is the default cell,
+    /// so it never wraps and the answer is `false` whatever its width. The `debug_assert!` holds
+    /// that invariant; if a change empties the window inside the loop with a decoded row at the
+    /// newest position (for example a `truncate_newest` inside the loop after an upstream merge),
+    /// decode that row back (`pull_back`) instead of reading its header.
     fn newest_takes_cells(&self, reflow: bool, columns: usize) -> bool {
         let (len, wraps) = match self.dense.back() {
             Some(row) => (row.len(), T::row_wraps(row)),
             None => match self.history.newest_header() {
-                Some(header) => (header.width as usize, header.wraps),
+                Some(header) => {
+                    debug_assert!(
+                        !header.wraps,
+                        "the encoded newest row of a reflow sink is a byte-copied row, which \
+                         never wraps"
+                    );
+                    (header.width as usize, header.wraps)
+                },
                 None => return false,
             },
         };

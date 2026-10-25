@@ -16,6 +16,13 @@
 //! Nothing in upstream alacritty_terminal corresponds to this file: upstream keeps every
 //! history row as a dense `Row<Cell>` in the grid's ring.
 //!
+//! # Credit
+//!
+//! The idea of keeping the visible screen dense while storing history rows in a compact form,
+//! with pooled buffers and an explicit history read API, comes from Adam Mikołajczyk (Razuer),
+//! who proposed it in alacritty/alacritty#9049. feathercritty's implementation is independent and
+//! was written from the idea only.
+//!
 //! # Record format
 //!
 //! A record is self-contained and self-delimiting. Integers are unsigned LEB128 varints (one
@@ -175,6 +182,10 @@ pub trait HistoryCell: GridCell + Clone + Default + PartialEq {
     /// its width changed instead of decoding and re-encoding the row (the byte-copy fast path of
     /// design spec 5.6, `RowSource::next_reflow` in `resize.rs`). `None` (the default) when the
     /// format has no such fast path: every row is decoded.
+    ///
+    /// Only this crate's `Cell` format provides it: [`ReflowInfo`] has crate-private fields and no
+    /// constructor, deliberately, because the conditions it feeds are tied to the reflow loop's
+    /// internals. A `HistoryCell` implemented outside the crate keeps this default.
     fn reflow_info(_bytes: &[u8]) -> Option<ReflowInfo> {
         None
     }
@@ -215,6 +226,10 @@ pub struct RowHeader {
 /// What `HistoryCell::reflow_info` reports about a record: enough to decide whether a reflow
 /// leaves the row's cells untouched, so that the record can be copied with only its width
 /// changed (see `RowSource::next_reflow` in `resize.rs` for the exact conditions).
+///
+/// Public only because it appears in the public `HistoryCell` trait; it cannot be constructed
+/// outside this crate (crate-private fields, no constructor), so only the crate's own `Cell`
+/// format opts into the byte-copy fast path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReflowInfo {
     /// Cells in the row (`W`).

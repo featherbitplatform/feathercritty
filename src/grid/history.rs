@@ -16,6 +16,13 @@
 //! - [`HistoryCell`] (in `compact.rs`, with the row codec) is what a cell type needs to be stored
 //!   here: a row encoder and decoder and the type of its shared extras.
 //!
+//! # Credit
+//!
+//! The idea of keeping the visible screen dense while storing history rows in a compact form,
+//! with pooled buffers and an explicit history read API, comes from Adam Mikołajczyk (Razuer),
+//! who proposed it in alacritty/alacritty#9049. feathercritty's implementation is independent and
+//! was written from the idea only.
+//!
 //! # Layout (design spec 5.3)
 //!
 //! A row is encoded once, when it scrolls off the screen (`compact.rs` defines the record), and
@@ -33,8 +40,10 @@
 //!   near a block's end, into a reused scratch buffer and copied from there to wherever it fits.
 //! - **Index.** One 16-byte [`Entry`] per row, oldest first, in a `VecDeque`: the block's sequence
 //!   number, the record's offset and length in it, and the position of the row's first extra. It
-//!   grows by doubling but never past the limit, so a full history's index is exactly `limit`
-//!   entries.
+//!   grows by doubling but never past the limit, so a full history's index holds at most `limit`
+//!   entries. After a column reflow it can hold up to `limit + lines`: the reflow builds the new
+//!   history with a limit of `limit + lines` (upstream's final trim) and lowers the limit at the
+//!   end without shrinking the index (`trim_to_limit`), about 16 bytes per screen line.
 //! - **Extras.** The `T::Extra` values (for `Cell`, its `Arc<CellExtra>`) a row's record refers to
 //!   sit in one `VecDeque` shared by the whole history, in index order; positions are wrapping
 //!   `u32` counters (`extras_base` is the position of the queue's front). Row `k`'s extras are
