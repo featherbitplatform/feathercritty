@@ -199,6 +199,20 @@ impl<T> Row<T> {
         self.inner.iter().all(GridCell::is_empty)
     }
 
+    /// Make the row `columns` cells wide for a decoder that overwrites every cell, reusing the
+    /// row's allocation when it is large enough (feathercritty addition, no upstream
+    /// counterpart). Cells kept or added hold unspecified content until overwritten; `occ` is
+    /// the width.
+    #[inline]
+    pub(crate) fn set_width_for_overwrite(&mut self, columns: usize)
+    where
+        T: Default,
+    {
+        self.inner.truncate(columns);
+        self.inner.resize_with(columns, T::default);
+        self.occ = columns;
+    }
+
     /// Record that every cell from `column` to the end of the row is equal (the caller just
     /// wrote them all with the same value), lowering `occ` to `column`.
     ///

@@ -760,26 +760,117 @@ fn reflow_window_one_matches_default() {
         let mut one = Term::new(config, &size, VoidListener);
         *one.grid_mut() = default.grid().clone();
         one.grid_mut().set_reflow_window(1);
-        let (mut parser_default, mut parser_one): (Processor, Processor) =
-            (Processor::new(), Processor::new());
+        // And without the byte-copy fast path: every history row decoded and re-encoded.
+        let config = Config { scrolling_history: history, ..Config::default() };
+        let mut decoded = Term::new(config, &size, VoidListener);
+        *decoded.grid_mut() = default.grid().clone();
+        decoded.grid_mut().set_reflow_byte_copy(false);
+        let (mut parser_default, mut parser_one, mut parser_decoded): (
+            Processor,
+            Processor,
+            Processor,
+        ) = (Processor::new(), Processor::new(), Processor::new());
 
         for _ in 0..25 {
             random_output(&mut rng, &mut bytes);
             parser_default.advance(&mut default, &bytes);
             parser_one.advance(&mut one, &bytes);
+            parser_decoded.advance(&mut decoded, &bytes);
 
             let size = TermSize::new(rng.gen_range(2..30), rng.gen_range(1..14));
             one.resize(TermSize::new(size.columns, size.screen_lines));
+            decoded.resize(TermSize::new(size.columns, size.screen_lines));
             default.resize(size);
             resizes += 1;
 
-            let (a, b) = (default.grid(), one.grid());
-            assert_eq!(a, b, "grids differ after resize {resizes}");
-            assert_eq!(a.cursor.point, b.cursor.point, "cursor differs after resize {resizes}");
-            assert_eq!(a.cursor.input_needs_wrap, b.cursor.input_needs_wrap);
-            assert_eq!(a.saved_cursor.point, b.saved_cursor.point);
+            for other in [&one, &decoded] {
+                let (a, b) = (default.grid(), other.grid());
+                assert_eq!(a, b, "grids differ after resize {resizes}");
+                assert_eq!(a.cursor.point, b.cursor.point, "cursor differs, resize {resizes}");
+                assert_eq!(a.cursor.input_needs_wrap, b.cursor.input_needs_wrap);
+                assert_eq!(a.saved_cursor.point, b.saved_cursor.point);
+                assert_eq!(a.display_offset(), b.display_offset());
+            }
         }
     }
+}
+
+/// Whenever `Pass::byte_copy_width` lets the reflow copy a history row's record, that copy is
+/// byte for byte the record of the row the reflow loop would have pushed: grown with default
+/// cells (`grow_columns`), or cut by `Row::shrink` with nothing to carry to the next line
+/// (`shrink_columns`). Random `Cell` rows, widths and passes, near every boundary.
+#[test]
+fn byte_copy_width_only_when_the_loop_keeps_the_row() {
+    use std::collections::VecDeque;
+
+    use rand::{Rng, SeedableRng};
+
+    use super::compact::copy_with_width;
+    use super::resize::Pass;
+    use crate::term::cell::Cell;
+    use crate::vte::ansi::Color;
+
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0xc0b1);
+    let cell = |rng: &mut rand_chacha::ChaCha8Rng| {
+        let mut cell = Cell::default();
+        match rng.gen_range(0..6) {
+            0 => cell.c = 'x',
+            1 => cell.bg = Color::Indexed(1),
+            2 => cell.flags = Flags::WRAPLINE,
+            3 => cell.c = '\t',
+            4 => cell.push_zerowidth('\u{301}'),
+            _ => (),
+        }
+        cell
+    };
+    let encode = |row: &Row<Cell>| {
+        let mut out = Vec::new();
+        Cell::encode(row, &mut out, &mut VecDeque::new());
+        out
+    };
+
+    let mut copies = 0;
+    for n in 0..50_000 {
+        let width = rng.gen_range(1..12);
+        let mut cells: Vec<Cell> = (0..width).map(|_| cell(&mut rng)).collect();
+        let stored = rng.gen_range(0..width);
+        let tail = cells[width - 1].clone();
+        cells[stored..].fill(tail);
+        let row = Row::from_vec(cells, width);
+        let record = encode(&row);
+        let info = Cell::reflow_info(&record).unwrap();
+
+        let columns = rng.gen_range(1..14);
+        let reflow = rng.gen_bool(0.8);
+        let takes_cells = rng.gen_bool(0.3);
+        let pass = if columns > width {
+            Pass::Grow { columns, reflow }
+        } else {
+            Pass::Shrink { columns, reflow, carried: rng.gen_bool(0.2) }
+        };
+        let Some(new_width) = pass.byte_copy_width(&info, |_, _| takes_cells) else {
+            continue;
+        };
+
+        // What the loop pushes, and what the sink then stores.
+        let mut pushed = row.clone();
+        match pass {
+            Pass::Grow { columns, .. } => {
+                assert!(!takes_cells, "row {n}: copied a row the previous one takes cells from");
+                pushed.grow(columns);
+            },
+            Pass::Shrink { columns, reflow, carried } => {
+                assert!(!carried, "row {n}: copied a row cells are carried into");
+                let wrapped = pushed.shrink(columns);
+                assert!(wrapped.is_none() || !reflow, "row {n}: copied a row that wraps cells");
+            },
+        }
+        let mut copied = Vec::new();
+        copy_with_width(&record, new_width, &mut copied);
+        assert_eq!(copied, encode(&pushed), "row {n}: {pass:?}, P {stored}, W {width}");
+        copies += 1;
+    }
+    assert!(copies > 5_000, "{copies} copies");
 }
 
 /// The reflow pops the old history's rows one at a time, oldest first, so its blocks are freed

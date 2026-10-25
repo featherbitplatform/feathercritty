@@ -93,8 +93,8 @@
 use std::collections::VecDeque;
 use std::{fmt, mem};
 
-use crate::grid::compact::{self, PlainText, read_header};
-use crate::grid::{Dimensions, Grid, HistoryCell, Row};
+use crate::grid::compact::{self, PlainText, RowHeader, read_header};
+use crate::grid::{Dimensions, Grid, HistoryCell, ReflowInfo, Row};
 use crate::index::{Column, Line};
 use crate::term::cell::Cell;
 
@@ -424,6 +424,90 @@ impl<T: HistoryCell> History<T> {
 
         self.index[pos] = self.store(entry.first_extra);
         self.updated = row;
+    }
+
+    /// [`HistoryCell::reflow_info`] of the oldest row, `None` when the history is empty or the
+    /// format has no reflow fast path.
+    pub(crate) fn oldest_reflow_info(&self) -> Option<ReflowInfo> {
+        self.index.front().and_then(|&entry| T::reflow_info(self.record(entry)))
+    }
+
+    /// The header of the newest row, `None` when the history is empty.
+    pub(crate) fn newest_header(&self) -> Option<RowHeader> {
+        self.index.back().map(|&entry| read_header(self.record(entry)))
+    }
+
+    /// Move the oldest row to `to` as its newest row without decoding it: its record is copied
+    /// with the width changed to `width` (`compact::copy_with_width`), its extras move along.
+    /// The caller guarantees that the row with its width changed is exactly the record with `W`
+    /// changed (see `HistoryCell::reflow_info`). `to` evicts its oldest row at its limit, as
+    /// `push_newest` does.
+    pub(crate) fn move_oldest_to(&mut self, to: &mut History<T>, width: usize) {
+        let Some(entry) = self.index.pop_front() else {
+            return;
+        };
+
+        to.encoded.clear();
+        compact::copy_with_width(self.record(entry), width, &mut to.encoded);
+        self.release(entry);
+
+        // The oldest row's extras are at the front of the queue (`remove_oldest` drains the ones
+        // before the oldest row's first).
+        debug_assert_eq!(entry.first_extra, self.extras_base);
+        let end = self.index.front().map_or_else(|| self.extras_end(), |next| next.first_extra);
+        let count = end.wrapping_sub(entry.first_extra) as usize;
+        self.extras_base = end;
+        to.push_encoded(self.extras.drain(..count));
+    }
+
+    /// Append the record in `encoded`, whose extras are `extras`, as the newest row (evicting the
+    /// oldest at the limit, storing nothing at a limit of 0).
+    fn push_encoded(&mut self, extras: impl Iterator<Item = T::Extra>) {
+        if self.limit == 0 {
+            return;
+        }
+        if self.index.len() >= self.limit {
+            self.remove_oldest(self.index.len() + 1 - self.limit);
+        }
+
+        let first_extra = self.extras_end();
+        self.extras.extend(extras);
+        let entry = self.store(first_extra);
+        self.reserve_index();
+        self.index.push_back(entry);
+    }
+
+    /// Remove the newest row without decoding it (a reflow dropping rows it truncates). Returns
+    /// `false` when the history is empty.
+    pub(crate) fn remove_newest(&mut self) -> bool {
+        let Some(entry) = self.index.pop_back() else {
+            return false;
+        };
+
+        self.release(entry);
+        self.extras.truncate(entry.first_extra.wrapping_sub(self.extras_base) as usize);
+        true
+    }
+
+    /// Take `other`'s spare blocks while this history has room for them and they are its block
+    /// size: a reflow hands the blocks its old history frees to the new one instead of returning
+    /// them to the allocator and allocating again.
+    pub(crate) fn take_spares(&mut self, other: &mut History<T>) {
+        while self.spares.len() < MAX_SPARES && other.block_bytes == self.block_bytes {
+            let Some(spare) = other.spares.pop() else {
+                break;
+            };
+            self.recycle(spare);
+        }
+    }
+
+    /// Lower the limit to `limit` and evict the rows above it, keeping the index and extras
+    /// capacity (a reflow's history, built with a limit `lines` above the grid's, gets the
+    /// grid's limit at the end; shrinking the index there would only make it grow again).
+    pub(crate) fn trim_to_limit(&mut self, limit: usize) {
+        debug_assert!(limit <= self.limit);
+        self.limit = limit;
+        self.remove_oldest(self.index.len().saturating_sub(limit));
     }
 
     /// Whether row `i` (0 is the newest) continues on the next line (the record header's

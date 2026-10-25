@@ -20,6 +20,13 @@
 //!   result never depends on the window size (`reflow_window_one_matches_default` runs with a
 //!   window of 1).
 //!
+//! - **Byte copy** (design spec 5.6, phase 4): a history row the loop would push unchanged but for
+//!   its width never reaches the loop; [`RowSource::next_reflow`] (which stands for upstream's
+//!   `drain(..).enumerate().rev()`) moves its record to the sink with only `W` changed, under the
+//!   exact conditions of [`Pass::byte_copy_width`]. Rows the source decodes go into a row the sink
+//!   has finished encoding, and blocks the old history frees go to the new one, so a long pass
+//!   allocates little.
+//!
 //! Peak memory is the old compact store plus the new one plus the window; nothing dense of
 //! history size is allocated, and nothing of the pass stays resident after it.
 //!
@@ -38,7 +45,7 @@ use crate::term::cell::{Flags, ResetDiscriminant};
 use crate::grid::history::History;
 use crate::grid::row::Row;
 use crate::grid::storage::Storage;
-use crate::grid::{Dimensions, Grid, HistoryCell};
+use crate::grid::{Dimensions, Grid, HistoryCell, ReflowInfo};
 
 /// The rows of a grid taken for a reflow, standing for the `Vec` upstream's `Storage::take_all`
 /// returned (feathercritty).
@@ -60,6 +67,102 @@ impl<'a, T: HistoryCell> RowSource<'a, T> {
     /// `Storage::take_all` returns it).
     pub(crate) fn new(history: &'a mut History<T>, screen: Vec<Row<T>>) -> Self {
         Self { history, screen: screen.into_iter() }
+    }
+}
+
+/// What the reflow loop does with a row, as far as the byte-copy fast path needs to know
+/// (feathercritty, see [`RowSource::next_reflow`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Pass {
+    /// `grow_columns` to `columns` columns.
+    Grow { columns: usize, reflow: bool },
+
+    /// `shrink_columns` to `columns` columns; `carried` when cells wrapped off the previous row
+    /// wait to be prepended to the next one (upstream's `buffered`).
+    Shrink { columns: usize, reflow: bool, carried: bool },
+}
+
+impl Pass {
+    /// The width a history row described by `info` gets when the reflow loop would push it
+    /// unchanged but for its width, so its record can be copied with only `W` changed; `None`
+    /// when the loop may change it otherwise (see `RowSource::next_reflow` for the conditions).
+    /// `newest_takes_cells(reflow, columns)` is upstream's `should_reflow` on the row before.
+    pub(crate) fn byte_copy_width(
+        self,
+        info: &ReflowInfo,
+        newest_takes_cells: impl FnOnce(bool, usize) -> bool,
+    ) -> Option<usize> {
+        match self {
+            Pass::Grow { columns, reflow } => (info.tail_default
+                && !newest_takes_cells(reflow, columns))
+            .then_some(max(info.width, columns)),
+            Pass::Shrink { carried: true, .. } => None,
+            Pass::Shrink { columns, .. } if info.width <= columns => Some(info.width),
+            Pass::Shrink { columns, reflow, carried: false } => {
+                (info.stored < columns && (info.tail_empty || !reflow)).then_some(columns)
+            },
+        }
+    }
+}
+
+impl<T: HistoryCell> RowSource<'_, T> {
+    /// The next row for the reflow loop with its index, as upstream's
+    /// `rows.drain(..).enumerate().rev()` yields it (feathercritty).
+    ///
+    /// Before that, history rows the loop would leave untouched go straight to `sink` as bytes
+    /// (the byte-copy fast path of design spec 5.6): their record is copied with only the width
+    /// changed (`History::move_oldest_to`), never decoded or re-encoded, and the loop never sees
+    /// them. The index of the row returned stays upstream's (the rows left after it), so the
+    /// rows passed over are accounted for. A history row is passed over when
+    /// (`HistoryCell::reflow_info`):
+    ///
+    /// - **growing**: its tail is the default cell (growing appends default cells, so only `W`
+    ///   changes, and the row cannot wrap into the next one), and the row before it would not take
+    ///   cells from it (upstream's `should_reflow` on the sink's newest row is false), so the loop
+    ///   would push it unchanged;
+    /// - **shrinking**: no cells are carried over from the previous row, and either the row is not
+    ///   wider than `columns` (it is pushed as is) or every cell it loses is a tail cell (`P <
+    ///   columns`) and, when reflowing, empty (so `Row::shrink` returns nothing and the loop pushes
+    ///   the cut row). History rows are never the cursor's line, the one other case the loop treats
+    ///   apart.
+    ///
+    /// The result is exactly upstream's: such a row's record with `W` changed is the record of
+    /// the row the loop would have pushed (`byte_copy_matches_decode_and_encode`), and the
+    /// differential test runs it with a reflow window of 1. When merging upstream: if the loop
+    /// starts doing anything else to a row it pushes unchanged, narrow these conditions.
+    pub(crate) fn next_reflow(
+        &mut self,
+        sink: &mut ReflowSink<T>,
+        pass: Pass,
+    ) -> Option<(usize, Row<T>)> {
+        while sink.byte_copy {
+            let Some(info) = self.history.oldest_reflow_info() else {
+                break;
+            };
+            let takes_cells = |reflow, columns| sink.newest_takes_cells(reflow, columns);
+            let Some(width) = pass.byte_copy_width(&info, takes_cells) else {
+                break;
+            };
+
+            sink.push_moved(self.history, width);
+            if self.history.is_empty() {
+                self.history.clear();
+            }
+        }
+
+        // The oldest row left, as `next_back`, but decoded into a row the sink is done with.
+        let row = if self.history.is_empty() {
+            self.screen.next_back()?
+        } else {
+            let mut row = sink.spare_row.take().unwrap_or_default();
+            self.history.pop_oldest(&mut row);
+            if self.history.is_empty() {
+                self.history.clear();
+            }
+            sink.history.take_spares(self.history);
+            row
+        };
+        Some((self.len(), row))
     }
 }
 
@@ -129,6 +232,13 @@ pub(crate) struct ReflowSink<T: HistoryCell> {
 
     /// Whether the history evicted a row (checked against `truncate_newest`, see above).
     evicted: bool,
+
+    /// Whether `RowSource::next_reflow` may copy records instead of decoding them (always,
+    /// unless a test turns it off to compare, `Grid::set_reflow_byte_copy`).
+    pub(crate) byte_copy: bool,
+    /// A row encoded into the history and no longer needed, for `RowSource::next_reflow` to
+    /// decode the next history row into (saves an allocation per row).
+    spare_row: Option<Row<T>>,
 }
 
 impl<T: HistoryCell> ReflowSink<T> {
@@ -142,7 +252,35 @@ impl<T: HistoryCell> ReflowSink<T> {
             window,
             grow_to,
             evicted: false,
+            byte_copy: true,
+            spare_row: None,
         }
+    }
+
+    /// Whether upstream's `grow_columns` would move cells of the next row into the newest row
+    /// (its `should_reflow` on `last_mut()`), read from the header when the newest row is
+    /// already encoded.
+    fn newest_takes_cells(&self, reflow: bool, columns: usize) -> bool {
+        let (len, wraps) = match self.dense.back() {
+            Some(row) => (row.len(), T::row_wraps(row)),
+            None => match self.history.newest_header() {
+                Some(header) => (header.width as usize, header.wraps),
+                None => return false,
+            },
+        };
+        reflow && len > 0 && len < columns && wraps
+    }
+
+    /// Append `source`'s oldest row as the newest row without decoding it, with its width changed
+    /// to `width` (see `RowSource::next_reflow`). The dense rows are encoded first, so the rows
+    /// stay in order.
+    fn push_moved(&mut self, source: &mut History<T>, width: usize) {
+        while let Some(row) = self.dense.pop_front() {
+            self.store(row);
+        }
+        self.evicted |= self.history.len() >= self.history.limit();
+        source.move_oldest_to(&mut self.history, width);
+        self.history.take_spares(source);
     }
 
     /// Append `row` as the newest row (upstream `Vec::push`).
@@ -171,10 +309,9 @@ impl<T: HistoryCell> ReflowSink<T> {
     /// Keep the oldest `len` rows, dropping the newest ones (upstream `Vec::truncate`).
     pub(crate) fn truncate_newest(&mut self, len: usize) {
         debug_assert!(!self.evicted || self.len() <= len, "truncating after an eviction");
-        let mut dropped: Row<T> = Row::default();
         while self.len() > len {
             if self.dense.pop_back().is_none() {
-                self.history.pop_newest(&mut dropped);
+                self.history.remove_newest();
             }
         }
     }
@@ -210,7 +347,7 @@ impl<T: HistoryCell> ReflowSink<T> {
         for row in dense.drain(..dense.len().saturating_sub(lines)) {
             self.store(row);
         }
-        self.history.set_limit(max_scroll_limit);
+        self.history.trim_to_limit(max_scroll_limit);
 
         let screen = dense.into_iter().rev().map(|row| self.grown(row)).collect();
         (Storage::from_rows(screen), self.history)
@@ -221,6 +358,7 @@ impl<T: HistoryCell> ReflowSink<T> {
         self.evicted |= self.history.len() >= self.history.limit();
         let row = self.grown(row);
         self.history.push_newest(&row);
+        self.spare_row = Some(row);
     }
 
     /// `row`, grown to `grow_to` columns when it is narrower.
@@ -262,11 +400,17 @@ impl<T: HistoryCell> Grid<T> {
         let window = self.reflow_window.unwrap_or(window);
 
         let limit = self.history.limit() + self.lines;
-        ReflowSink::new(
+        #[allow(unused_mut)]
+        let mut sink = ReflowSink::new(
             window,
             grow_to,
             History::with_block_size(limit, self.history.block_bytes()),
-        )
+        );
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            sink.byte_copy = self.reflow_byte_copy;
+        }
+        sink
     }
 
     /// Store a reflow's rows as the new screen and history (feathercritty: upstream
@@ -421,11 +565,15 @@ impl<T: HistoryCell> Grid<T> {
             self.cursor.point.column += 1;
         }
 
-        // feathercritty: upstream `self.raw.take_all()` and `rows.drain(..)`; see `RowSource`.
+        // feathercritty: upstream `self.raw.take_all()`, then `for (i, mut row) in
+        // rows.drain(..).enumerate().rev()`; see `RowSource::next_reflow`, which also passes
+        // rows this loop would push unchanged straight to `reversed` as bytes.
         let mut history = self.take_history();
-        let rows = RowSource::new(&mut history, self.screen.raw.take_all());
+        let mut rows = RowSource::new(&mut history, self.screen.raw.take_all());
 
-        for (i, mut row) in rows.enumerate().rev() {
+        while let Some((i, mut row)) =
+            rows.next_reflow(&mut reversed, Pass::Grow { columns, reflow })
+        {
             // Check if reflowing should be performed.
             let last_row = match reversed.last_mut() {
                 Some(last_row) if should_reflow(last_row) => last_row,
@@ -562,10 +710,16 @@ impl<T: HistoryCell> Grid<T> {
         let mut new_raw = self.reflow_sink(None);
         let mut buffered: Option<Vec<T>> = None;
 
-        // feathercritty: upstream `self.raw.take_all()` and `rows.drain(..)`; see `RowSource`.
+        // feathercritty: upstream `self.raw.take_all()`, then `for (i, mut row) in
+        // rows.drain(..).enumerate().rev()`; see `RowSource::next_reflow`, which also passes
+        // rows this loop would push unchanged straight to `new_raw` as bytes.
         let mut history = self.take_history();
-        let rows = RowSource::new(&mut history, self.screen.raw.take_all());
-        for (i, mut row) in rows.enumerate().rev() {
+        let mut rows = RowSource::new(&mut history, self.screen.raw.take_all());
+        while let Some((i, mut row)) = rows.next_reflow(&mut new_raw, Pass::Shrink {
+            columns,
+            reflow,
+            carried: buffered.is_some(),
+        }) {
             // Append lines left over from the previous row.
             if let Some(buffered) = buffered.take() {
                 // Add a column for every cell added before the cursor, if it goes beyond the new

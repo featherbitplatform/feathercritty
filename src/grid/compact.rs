@@ -171,6 +171,14 @@ pub trait HistoryCell: GridCell + Clone + Default + PartialEq {
         None
     }
 
+    /// What a column reflow needs to know to copy the record at the start of `bytes` with only
+    /// its width changed instead of decoding and re-encoding the row (the byte-copy fast path of
+    /// design spec 5.6, `RowSource::next_reflow` in `resize.rs`). `None` (the default) when the
+    /// format has no such fast path: every row is decoded.
+    fn reflow_info(_bytes: &[u8]) -> Option<ReflowInfo> {
+        None
+    }
+
     /// Decode the record at the start of `bytes` (bytes after it are ignored) into `into`,
     /// which is resized only when its width differs, and return the record's length in bytes.
     /// `extras` is the row's own slice of the queue `encode` pushed to. The decoded row's `occ`
@@ -202,6 +210,33 @@ pub struct RowHeader {
     pub(crate) extras: u32,
     /// Cells stored explicitly (`P`); the cells from `len` on all equal the last one.
     pub(crate) len: u32,
+}
+
+/// What `HistoryCell::reflow_info` reports about a record: enough to decide whether a reflow
+/// leaves the row's cells untouched, so that the record can be copied with only its width
+/// changed (see `RowSource::next_reflow` in `resize.rs` for the exact conditions).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReflowInfo {
+    /// Cells in the row (`W`).
+    pub(crate) width: usize,
+    /// Cells stored explicitly (`P`); every cell from `P` on equals the tail.
+    pub(crate) stored: usize,
+    /// The tail is the default cell, so growing the row (which appends default cells) adds cells
+    /// equal to the tail: the grown row's record is this one with `W` changed.
+    pub(crate) tail_default: bool,
+    /// The tail is empty (`GridCell::is_empty`), so cutting cells off the tail drops nothing a
+    /// reflow would carry to the next line. Conservatively `false` when the tail has an extra.
+    pub(crate) tail_empty: bool,
+}
+
+/// Append the record `bytes` (exactly one record) to `out` with its width (`W`, the header's
+/// first varint, shared by every record format) changed to `width`; everything else is copied as
+/// is.
+pub(crate) fn copy_with_width(bytes: &[u8], width: usize, out: &mut Vec<u8>) {
+    let mut reader = RecordReader::new(bytes);
+    reader.varint();
+    write_varint(out, width);
+    out.extend_from_slice(&bytes[reader.position()..]);
 }
 
 /// A record's header fields, including the two only the `Cell` format uses.
@@ -466,7 +501,7 @@ impl Style {
 /// cells for the decoder to overwrite. The row's `occ` becomes `width`.
 pub(crate) fn prepare_row<T: Default>(into: &mut Row<T>, width: usize) -> &mut [T] {
     if into.len() != width {
-        *into = if width == 0 { Row::default() } else { Row::new(width) };
+        into.set_width_for_overwrite(width);
     }
     &mut into[..]
 }
@@ -822,6 +857,44 @@ pub(crate) fn plain_text(bytes: &[u8]) -> Option<PlainText<'_>> {
     Some(PlainText { text, tail, width, wraps: flags.contains(Flags::WRAPLINE) })
 }
 
+/// `HistoryCell::reflow_info` of a `Cell` record: the header, then the tail, found by skipping
+/// the text, runs and marks.
+fn cell_reflow_info(bytes: &[u8]) -> ReflowInfo {
+    let mut reader = RecordReader::new(bytes);
+    let Layout { header, runs, marks } = reader.layout();
+    let width = header.width as usize;
+    let stored = header.len as usize;
+    if width == 0 {
+        return ReflowInfo { width, stored, tail_default: false, tail_empty: false };
+    }
+
+    match bytes.get(reader.pos..reader.pos + stored) {
+        Some(text) if text.is_ascii() => reader.pos += stored,
+        _ => (0..stored).for_each(|_| reader.skip_char()),
+    }
+    for _ in 0..runs {
+        reader.varint();
+        reader.skip_style();
+    }
+    for _ in 0..marks {
+        reader.varint();
+        reader.byte();
+    }
+
+    let c = reader.char();
+    let fg = unpack_color(reader.array());
+    let bg = unpack_color(reader.array());
+    let flags = Flags::from_bits_retain(u16::from_le_bytes(reader.array()));
+    let tail = Cell { c, fg, bg, flags, extra: None };
+    let no_extra = reader.varint() == 0;
+    ReflowInfo {
+        width,
+        stored,
+        tail_default: no_extra && tail == Cell::default(),
+        tail_empty: no_extra && tail.is_empty(),
+    }
+}
+
 /// The cell at `column` of a `Cell` record, reading only the parts that describe it: the text
 /// up to it, then its run, mark and the tail are found by skipping the others.
 fn decode_one_cell(bytes: &[u8], extras: &[Arc<CellExtra>], column: usize) -> Cell {
@@ -982,6 +1055,10 @@ impl HistoryCell for Cell {
     /// the end before cutting them off.
     fn max_record_bytes(width: usize) -> Option<usize> {
         Some(MAX_HEADER_BYTES + width * (4 + 20 + 6) + 19 + 30)
+    }
+
+    fn reflow_info(bytes: &[u8]) -> Option<ReflowInfo> {
+        Some(cell_reflow_info(bytes))
     }
 
     fn decode(bytes: &[u8], extras: &[Self::Extra], into: &mut Row<Self>) -> usize {
@@ -1571,6 +1648,76 @@ mod tests {
             cell.push_zerowidth('\u{301}');
         }
         assert_eq!(roundtrip(&row).layout().runs, 2);
+    }
+
+    /// The reflow's byte-copy fast path (`RowSource::next_reflow`): `reflow_info` describes the
+    /// tail exactly, and whenever its conditions hold, the record with only `W` changed
+    /// (`copy_with_width`) is byte for byte the record of the row grown or cut as the reflow
+    /// loop would (decode, `Row::grow` or `Row::shrink`, encode).
+    #[test]
+    fn byte_copy_matches_decode_and_encode() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0xb17e);
+        let mut pool = Vec::new();
+        for i in 0..3 {
+            let mut cell = Cell::default();
+            cell.set_hyperlink(Some(Hyperlink::new(None::<String>, format!("https://e/{i}"))));
+            pool.push(cell.extra.unwrap());
+        }
+
+        let (mut grown, mut shrunk) = (0, 0);
+        for n in 0..20_000 {
+            let width = rng.gen_range(1..=40);
+            let tail = match rng.gen_range(0..4) {
+                0 => Cell::default(),
+                1 => Cell { c: '\t', ..Cell::default() },
+                2 => Cell { flags: Flags::BOLD, ..Cell::default() },
+                _ => random_cell(&mut rng, &pool),
+            };
+            let prefix = rng.gen_range(0..=width);
+            let mut cells: Vec<Cell> = (0..prefix).map(|_| random_cell(&mut rng, &pool)).collect();
+            cells.resize(width, tail);
+            let row = Row::from_vec(cells, width);
+
+            let mut extras = VecDeque::new();
+            let mut record = Vec::new();
+            Cell::encode(&row, &mut record, &mut extras);
+            let extras: Vec<_> = extras.into_iter().collect();
+            let info = Cell::reflow_info(&record).unwrap();
+            let last = &row[Column(width - 1)];
+            assert_eq!(info.width, width, "row {n}");
+            assert_eq!(info.tail_default, *last == Cell::default(), "row {n}");
+            let empty = last.is_empty() && last.extra.is_none();
+            assert_eq!(info.tail_empty, empty, "row {n}");
+
+            let mut decoded = Row::default();
+            let reencode = |row: &Row<Cell>| {
+                let mut out = Vec::new();
+                Cell::encode(row, &mut out, &mut VecDeque::new());
+                out
+            };
+            let copied = |new_width| {
+                let mut out = Vec::new();
+                copy_with_width(&record, new_width, &mut out);
+                out
+            };
+
+            if info.tail_default {
+                let new_width = width + rng.gen_range(1..300);
+                Cell::decode(&record, &extras, &mut decoded);
+                decoded.grow(new_width);
+                assert_eq!(copied(new_width), reencode(&decoded), "row {n}: grow");
+                grown += 1;
+            }
+
+            let new_width = rng.gen_range(1..=width);
+            if info.stored < new_width {
+                Cell::decode(&record, &extras, &mut decoded);
+                decoded.shrink(new_width);
+                assert_eq!(copied(new_width), reencode(&decoded), "row {n}: shrink");
+                shrunk += 1;
+            }
+        }
+        assert!(grown > 1000 && shrunk > 1000, "{grown} grown, {shrunk} shrunk");
     }
 
     /// Which rows `plain_text` reads straight from the record, and what it reads.
