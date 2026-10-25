@@ -109,15 +109,26 @@ fn cell_p(cell: &Cell, ids: &mut HashMap<String, usize>, index: Option<usize>) -
 }
 
 /// Origin (after `expand_wide`), start and end of the range `Term::search_next` searches, and
-/// whether `max_lines` bounds it. Copied from upstream `search_next` and `next_match_left/right`;
-/// re-check against the source when the oracle moves to a new release.
+/// whether `max_lines` bounds it. Copied from upstream `search_next` and `next_match_left/right`,
+/// with feathercritty's origin for a leading spacer on the bottommost line (below); re-check
+/// against the source when the oracle moves to a new release.
 fn search_bounds(
     term: &Term<VoidListener>,
     origin: Point,
     direction: Direction,
     max_lines: Option<usize>,
 ) -> (Point, Point, Point, bool) {
-    let origin = term.expand_wide(origin, direction);
+    // Right from a leading spacer on the bottommost line, `expand_wide` leaves the grid: 0.26.0
+    // panics there, and feathercritty uses the cell its search lands on after reading the spacer,
+    // two cells on, clamped to the grid's last cell (fork change 5, `search_next`).
+    let expanded = term.expand_wide(origin, direction);
+    let origin = if expanded.line > term.bottommost_line() {
+        let last = Point::new(term.bottommost_line(), term.last_column());
+        let step = |p: Point| if p == last { p } else { p.add(term, Boundary::Grid, 1) };
+        step(step(origin))
+    } else {
+        expanded
+    };
     let max_lines = max_lines.filter(|max_lines| max_lines + 1 < term.total_lines());
     let (start, end) = match direction {
         Direction::Right => {
@@ -459,7 +470,14 @@ impl Side {
     ///   completion of the character at the range's end (`completion_right` going right,
     ///   `completion_left` going left);
     /// - the near end may also lie in the completion of the character at the range's start in the
-    ///   other direction (the second search, back to the start, completes it, as 0.26.0 does).
+    ///   other direction (the second search, back to the start, completes it, as 0.26.0 does);
+    /// - the near end comes no later than the far end along the range. A match whose ends both lie
+    ///   in the range but in the wrong order ran around the whole buffer: 0.26.0's last search of a
+    ///   range, from its end to itself, starting on a leading spacer reads past the end, around the
+    ///   buffer and back (differential soak seed `random_streams` 2013725: a rightward search
+    ///   answered with a match from (8,1) to (8,0) on a 2-column grid). A match that runs around
+    ///   the buffer's end inside the range, as a search that wraps around it reads, keeps its ends
+    ///   in order along the range.
     ///
     /// If upstream's or feathercritty's range handling in `search.rs` changes, update this.
     fn match_in_range(
@@ -499,8 +517,18 @@ impl Side {
                 (end, start, self.completion_right(range_start), self.completion_left(range_end))
             },
         };
-        (range.contains(&near) || near_completion.contains(&near))
-            && (range.contains(&far) || far_completion.contains(&far))
+        // Position along the range: the near completion lies before it, the far one after it.
+        let near = match range.iter().position(|&p| p == near) {
+            Some(index) => index as isize,
+            None if near_completion.contains(&near) => -1,
+            None => return false,
+        };
+        let far = match range.iter().position(|&p| p == far) {
+            Some(index) => index as isize,
+            None if far_completion.contains(&far) => range.len() as isize,
+            None => return false,
+        };
+        near <= far
     }
 
     /// What `regex_search_internal` reads at `point` going right and where it lands, following
@@ -657,8 +685,20 @@ impl Side {
 
     /// Whether a 0.26.0 `search_next` answer is one fork change 5 may change: the search did
     /// not terminate, or its match lies (at least partly) outside the searched range because
-    /// 0.26.0 missed the range's end and wrapped around.
+    /// 0.26.0 missed the range's end and wrapped around, or the search goes right from a leading
+    /// spacer on the bottommost line. There `expand_wide` moves 0.26.0's origin below the grid,
+    /// and 0.26.0 panics (debug builds, and release builds when the ring has no row there) or
+    /// answers from whichever row its ring holds at that index; feathercritty keeps the origin
+    /// on the line (`search_origin_on_bottom_line_stale_spacer`).
     pub fn oracle_search_is_off(&self, search: &SearchQ, answer: &QAns) -> bool {
+        let grid = self.term.grid();
+        let origin = self.point(search.origin);
+        if search.right
+            && origin.line == grid.bottommost_line()
+            && cell_at(grid, origin).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            return true;
+        }
         match answer {
             QAns::NoTermination => true,
             QAns::Match(Some((start, end))) => {

@@ -303,6 +303,33 @@ fn oracle_skips_searches_that_miss_their_end() {
     assert!(no_termination > 0);
 }
 
+/// Soak seeds that once diverged in regex search (fork change 5 and its modeling here), run
+/// whatever `DIFF_SEED_START` says, so every `cargo test` covers them. Each comment names the
+/// cause (README change 5 and `Side::match_in_range`/`Side::read` describe them).
+#[test]
+fn search_soak_regressions() {
+    let random = [
+        1_000_017, // a match around the buffer's end (start after end) is real
+        5_000_017, // 0.26.0's match ending in a stale spacer's completion is kept
+        2_001_369, // a leftward match's second search reads past a stale spacer's origin
+        2_008_270, // a rightward origin on a bottom-line stale spacer stays in the grid
+        2_013_725, // 0.26.0's match running around the buffer is outside the range
+        2_024_013, // the harness's range uses feathercritty's origin for that spacer
+        814,       // 0.26.0 answers from below the grid for that origin: not compared
+    ];
+    for seed in random {
+        let case = r#gen::random_case(seed, DEFAULT_STEPS);
+        if let Err(divergence) = support::run(&case.start, &case.steps) {
+            panic!("random_streams seed {seed}: {divergence}");
+        }
+    }
+    // A match across a line break hidden by wide characters is real.
+    let case = r#gen::realistic_case(Realistic::Cjk, 1_000_223);
+    if let Err(divergence) = support::run(&case.start, &case.steps) {
+        panic!("realistic_cjk seed 1000223: {divergence}");
+    }
+}
+
 /// The oracle compares cells in history, not only the screen.
 #[test]
 fn oracle_sees_history_difference() {
