@@ -42,9 +42,9 @@
 //! 3. `project.rs` hard-codes flag bit values (`WRAPLINE`, `WIDE_CHAR_SPACER`,
 //!    `LEADING_WIDE_CHAR_SPACER`) and `term_impl.rs`/`mod.rs` the `ALT_SCREEN` mode bit and the
 //!    generated hyperlink ID suffix `_alacritty`; check them against the new release.
-//!    `project::search_window` and `term_impl::search_terminates` replicate the start and end
-//!    computation of upstream `search_next` (`next_match_left/right`); re-check that against the
-//!    new source.
+//!    `term_impl::search_bounds` (used by `search_terminates`, `in_search_range` and, through the
+//!    same formulas, `project::search_window`) replicates the start and end computation of upstream
+//!    `search_next` (`next_match_left/right`); re-check it against the new source.
 //! 4. Re-check every workaround for a 0.26.0 bug (each is commented with the upstream behavior it
 //!    avoids; search for "0.26.0"). Remove the ones the new release fixes, so the oracle covers
 //!    those inputs again, and update the "Known gaps" list in `tests/differential.rs`.
@@ -76,7 +76,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::{Mutex, Once, mpsc};
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -172,6 +172,10 @@ pub struct Divergence {
     /// Index of the step after which the states differ.
     pub step: usize,
     pub diff: String,
+    /// feathercritty did not return from a query within its timeout. The query's thread is
+    /// still running (it cannot be stopped and keeps a core busy until the process exits), so
+    /// the runner reports this at once instead of minimizing, which would start more of them.
+    pub hang: bool,
 }
 
 impl fmt::Display for Divergence {
@@ -222,31 +226,62 @@ where
 {
     let ra = catch(a);
     let rb = catch(b);
-    match (ra, rb) {
-        (Ok(ra), Ok(rb)) => Ok((ra, rb)),
-        (Err(e), Ok(_)) => Err(Divergence {
-            step,
-            diff: format!(
-                "{what}: feathercritty panicked ({}), 0.26.0 did not",
-                panic_message(&*e)
-            ),
-        }),
-        (Ok(_), Err(e)) => Err(Divergence {
-            step,
-            diff: format!(
-                "{what}: 0.26.0 panicked ({}), feathercritty did not",
-                panic_message(&*e)
-            ),
-        }),
-        (Err(ea), Err(eb)) => Err(Divergence {
-            step,
-            diff: format!(
-                "{what}: both panicked (feathercritty: {}; 0.26.0: {})",
-                panic_message(&*ea),
-                panic_message(&*eb)
-            ),
-        }),
-    }
+    combine(step, what, ra, rb)
+}
+
+/// Turn the outcomes of one call on both sides into a divergence if either panicked.
+fn combine<RA, RB>(
+    step: usize,
+    what: &str,
+    ra: std::thread::Result<RA>,
+    rb: std::thread::Result<RB>,
+) -> Result<(RA, RB), Divergence> {
+    let diff = match (ra, rb) {
+        (Ok(ra), Ok(rb)) => return Ok((ra, rb)),
+        (Err(e), Ok(_)) => {
+            format!("{what}: feathercritty panicked ({}), 0.26.0 did not", panic_message(&*e))
+        },
+        (Ok(_), Err(e)) => {
+            format!("{what}: 0.26.0 panicked ({}), feathercritty did not", panic_message(&*e))
+        },
+        (Err(ea), Err(eb)) => format!(
+            "{what}: both panicked (feathercritty: {}; 0.26.0: {})",
+            panic_message(&*ea),
+            panic_message(&*eb)
+        ),
+    };
+    Err(Divergence { step, diff, hang: false })
+}
+
+/// Labeled query answers, as `Side::queries` returns them.
+type Answers = Vec<(&'static str, project::QAns)>;
+
+/// Run the feathercritty side's queries on another thread, so a search that never returns
+/// fails the run instead of hanging it. The side moves to the thread and back (no copy). After
+/// `FORK_TIMEOUT` the run fails with a `hang` divergence; the thread, and the side with it, is
+/// left running until the process exits.
+fn fork_queries(
+    side: fc::Side,
+    plan: &project::QueryPlan,
+    step: usize,
+) -> Result<(fc::Side, std::thread::Result<Answers>), Divergence> {
+    let (tx, rx) = mpsc::channel();
+    let thread_plan = plan.clone();
+    std::thread::spawn(move || {
+        let mut side = side;
+        let answers = catch(|| side.queries(&thread_plan));
+        let _ = tx.send((side, answers));
+    });
+    rx.recv_timeout(FORK_TIMEOUT).map_err(|_| Divergence {
+        step,
+        diff: format!(
+            "feathercritty queries did not return within {} s (a search that never \
+             terminates?)\nsearches: {:?}",
+            FORK_TIMEOUT.as_secs(),
+            plan.searches
+        ),
+        hang: true,
+    })
 }
 
 /// Bytes that leave the alternate screen whichever way it was entered. `run` feeds them after
@@ -339,46 +374,63 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
 
         let (sa, sb) = both(i, "snapshot", || a.snapshot(), || b.snapshot())?;
         if sa != sb {
-            return Err(Divergence { step: i, diff: project::diff(&sa, &sb) });
+            return Err(Divergence { step: i, diff: project::diff(&sa, &sb), hang: false });
         }
 
         let plan = project::QueryPlan::random(&mut qrng, &sa);
-        let (mut qa, qb) = both(i, "queries", || a.queries(&plan), || b.queries(&plan))?;
+        let (side, ra) = fork_queries(a, &plan, i)?;
+        a = side;
+        let rb = catch(|| b.queries(&plan));
+        let (mut qa, qb) = combine(i, "queries", ra, rb)?;
 
         // Fork change 5: where 0.26.0's search does not terminate or answers from outside the
-        // searched range, feathercritty's answer is checked on its own instead of compared.
+        // searched range, feathercritty's answer is checked on its own instead of compared,
+        // even when both answers are the same (both could be wrong the same way).
         // The searches follow the selections and `bounds_to_string` in the answers.
         let first = plan.selections.len() + 1;
         for (k, search) in plan.searches.iter().enumerate() {
+            assert_eq!((qa[first + k].0, qb[first + k].0), ("search_next", "search_next"));
             let (fork, oracle) = (&qa[first + k].1, &qb[first + k].1);
-            if fork != oracle && b.oracle_search_is_off(search, oracle) {
+            if b.oracle_search_is_off(search, oracle) {
                 if let Err(why) = a.check_search(search, search.max_lines, fork) {
                     let diff = format!(
                         "search_next where 0.26.0 cannot answer (fork change 5): feathercritty \
                          {fork:?} fails its own check: {why}\n0.26.0 {oracle:?}\nsearch {search:?}"
                     );
-                    return Err(Divergence { step: i, diff });
+                    return Err(Divergence { step: i, diff, hang: false });
                 }
                 stats.change5_answers += 1;
                 qa[first + k].1 = oracle.clone();
             }
             // Windows moved for 0.26.0's sake: feathercritty searches them as drawn.
             if let Some(unmoved) = search.unmoved {
-                let fork = a.search_detached(search, unmoved, DETACHED_TIMEOUT);
+                let Some(fork) = a.search_detached(search, unmoved, FORK_TIMEOUT) else {
+                    let diff = format!(
+                        "feathercritty search_next did not return within {} s on a window 0.26.0 \
+                         cannot search (fork change 5)\nsearch {search:?} with max_lines \
+                         {unmoved:?}",
+                        FORK_TIMEOUT.as_secs()
+                    );
+                    return Err(Divergence { step: i, diff, hang: true });
+                };
                 if let Err(why) = a.check_search(search, unmoved, &fork) {
                     let diff = format!(
                         "search_next on a window 0.26.0 cannot search (fork change 5): \
                          feathercritty {fork:?} fails its own check: {why}\nsearch {search:?} \
                          with max_lines {unmoved:?}"
                     );
-                    return Err(Divergence { step: i, diff });
+                    return Err(Divergence { step: i, diff, hang: false });
                 }
                 stats.change5_windows += 1;
             }
         }
 
         if qa != qb {
-            return Err(Divergence { step: i, diff: project::diff_queries(&plan, &qa, &qb) });
+            return Err(Divergence {
+                step: i,
+                diff: project::diff_queries(&plan, &qa, &qb),
+                hang: false,
+            });
         }
 
         stats.steps += 1;
@@ -395,9 +447,10 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
     Ok(stats)
 }
 
-/// How long feathercritty may take for a search that 0.26.0 cannot run (see
-/// `Side::search_detached`) before the oracle reports that it does not terminate.
-const DETACHED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long feathercritty's queries (`fork_queries`) or a search 0.26.0 cannot run
+/// (`Side::search_detached`) may take before the run fails as a hang. Generous, so debug builds
+/// on slow runners searching a 100,000-line history stay well inside it.
+const FORK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `TermMode::ALT_SCREEN`.
 const ALT_SCREEN_MODE: u32 = 1 << 12;
@@ -467,10 +520,20 @@ where
         return total;
     };
     let start = case.start;
+    let steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
+    if divergence.hang {
+        // Minimizing would rerun the hanging query many times, leaving a spinning thread each
+        // time; report the seed and the query instead.
+        panic!(
+            "differential divergence in `{test}`, seed {seed}, {divergence}\n\nreproduce: \
+             DIFF_SEED={seed}{steps} cargo test --test differential {test}\n\nstart: \
+             {start:?}\n(not minimized: a feathercritty query did not return, and its thread is \
+             still running)\n"
+        );
+    }
     let minimized = minimize::minimize(&case.steps, |steps| run(&start, steps).is_err());
     let after = run(&start, &minimized).err();
 
-    let steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
     let mut report = format!(
         "differential divergence in `{test}`, seed {seed}, {divergence}\n\nreproduce: \
          DIFF_SEED={seed}{steps} cargo test --test differential {test}\n\nstart: \
