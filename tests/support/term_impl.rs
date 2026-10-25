@@ -332,16 +332,17 @@ impl Side {
     }
 
     /// Run `search` with `max_lines` on a copy of this terminal's grid on another thread, and
-    /// answer [`QAns::NoTermination`] if it has not returned after `timeout` (the thread is
-    /// left running). Used for searches 0.26.0 cannot run (fork change 5), so a feathercritty
-    /// search that does not terminate fails the test with its seed instead of hanging it.
-    /// Search reads only the grid, so a fresh `Term` holding a clone of it searches the same.
+    /// answer `None` if it has not returned after `timeout`. Used for searches 0.26.0 cannot run
+    /// (fork change 5), so a feathercritty search that does not terminate fails the test with
+    /// its seed instead of hanging it. A timed-out thread cannot be stopped: it keeps running
+    /// (and a core busy) until the process exits. Search reads only the grid, so a fresh `Term`
+    /// holding a clone of it searches the same.
     pub fn search_detached(
         &self,
         search: &SearchQ,
         max_lines: Option<usize>,
         timeout: Duration,
-    ) -> QAns {
+    ) -> Option<QAns> {
         let grid = self.term.grid().clone();
         let size = TermSize::new(grid.columns(), grid.screen_lines());
         let mut term = Term::new(Config::default(), &size, VoidListener);
@@ -352,7 +353,7 @@ impl Side {
         thread::spawn(move || {
             let _ = tx.send(side.search(&search, max_lines, false));
         });
-        rx.recv_timeout(timeout).unwrap_or(QAns::NoTermination)
+        rx.recv_timeout(timeout).ok()
     }
 
     /// The cells of the character at `p`: a wide character with its spacer, plus the leading

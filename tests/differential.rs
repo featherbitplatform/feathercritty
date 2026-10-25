@@ -146,7 +146,7 @@ fn oracle_sees_fork_change_1() {
 /// searched as drawn on feathercritty only, which must terminate with a checked answer.
 #[test]
 fn oracle_sees_fork_change_5() {
-    use support::project::{QAns, SearchQ, search_window};
+    use support::project::{SearchQ, search_window};
     use support::{Pt, ac, fc};
 
     // 0: abc
@@ -179,20 +179,24 @@ fn oracle_sees_fork_change_5() {
                         };
                         let (fork, oracle) =
                             (a.search(&search, window, true), b.search(&search, window, true));
-                        if b.oracle_search_is_off(&search, &oracle) && fork != oracle {
-                            a.check_search(&search, window, &fork).unwrap();
+                        // Checked whenever 0.26.0 is off, even if both answers are equal.
+                        if b.oracle_search_is_off(&search, &oracle) {
+                            if let Err(why) = a.check_search(&search, window, &fork) {
+                                panic!("{why}: {search:?}: fork {fork:?}, 0.26.0 {oracle:?}");
+                            }
                             off += 1;
                         } else {
                             assert_eq!(fork, oracle, "{search:?}");
                             equal += 1;
                         }
                         if was_moved {
-                            let fork = a.search_detached(
-                                &search,
-                                max_lines,
-                                std::time::Duration::from_secs(30),
-                            );
-                            assert_ne!(fork, QAns::NoTermination);
+                            let fork = a
+                                .search_detached(
+                                    &search,
+                                    max_lines,
+                                    std::time::Duration::from_secs(30),
+                                )
+                                .expect("feathercritty search_next did not terminate");
                             a.check_search(&search, max_lines, &fork).unwrap();
                             moved += 1;
                         }
