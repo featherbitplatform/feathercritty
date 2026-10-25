@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 use std::cmp::max;
 use std::error::Error;
 use std::mem;
@@ -294,11 +296,16 @@ impl<T> Term<T> {
 
         let mut iter = self.grid.iter_from(start);
         let mut regex_match = None;
-        let mut done = false;
 
         let mut cell = iter.cell();
         self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
         let mut c = cell.c;
+
+        // feathercritty: upstream starts with `done = false`, so a search whose first fullwidth
+        // skip jumps over `end` (start on a wrapped wide char's spacer or leading spacer, end on
+        // the wide char) never stops. We stop once the skipped cells contain `end`, as in the loop
+        // below.
+        let mut done = self.skips_over(start, iter.point(), end, regex.direction);
         let mut last_wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
 
         let mut point = iter.point();
@@ -399,9 +406,20 @@ impl<T> Term<T> {
             // Check for completion before potentially skipping over fullwidth characters.
             done = iter.point() == end;
 
+            // feathercritty: upstream only checks the cell before the fullwidth skip (above) and
+            // the one after it (`point == end` at the top of the loop). Across a wrapped wide
+            // char the skip moves two cells: left from its spacer to the leading spacer, right
+            // from the leading spacer to its spacer, so it never stands on the wide char itself.
+            // An `end` on that cell (a leftward `search_next` with `max_lines` puts `end` at
+            // column 0 of any line) was missed and the search wrapped around the buffer forever,
+            // or returned a match from beyond `end`. We also stop when the skip jumped over `end`.
+            // When merging upstream: if `skip_fullwidth` or this completion check changed, re-run
+            // the `wrapped_wide_*` tests; if they pass without this, drop it.
+            let skip_from = iter.point();
             self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
 
             c = cell.c;
+            done |= self.skips_over(skip_from, iter.point(), end, regex.direction);
             let wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
 
             last_point = mem::replace(&mut point, iter.point());
@@ -430,6 +448,31 @@ impl<T> Term<T> {
         }
 
         Ok(regex_match)
+    }
+
+    /// Whether `end` lies strictly between `from` and `to`, walking from `from` in `direction`.
+    ///
+    /// feathercritty: not in upstream. Used where a fullwidth skip moves a search point over more
+    /// than one cell, so `end` cannot be jumped over. These skips move at most three cells, which
+    /// bounds the walk.
+    fn skips_over(&self, from: Point, to: Point, end: Point, direction: Direction) -> bool {
+        let step = |point: Point| match direction {
+            Direction::Right => point.add(self, Boundary::None, 1),
+            Direction::Left => point.sub(self, Boundary::None, 1),
+        };
+
+        let mut point = from;
+        for _ in 0..3 {
+            if point == to {
+                return false;
+            }
+            point = step(point);
+            if point == end && point != to {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// Advance a grid iterator over fullwidth characters.
@@ -639,12 +682,25 @@ impl<'a, T> RegexIter<'a, T> {
 
     /// Skip one cell, advancing the origin point to the next one.
     fn skip(&mut self) {
+        let from = self.point;
+
         self.point = self.term.expand_wide(self.point, self.direction);
 
         self.point = match self.direction {
             Direction::Right => self.point.add(self.term, Boundary::None, 1),
             Direction::Left => self.point.sub(self.term, Boundary::None, 1),
         };
+
+        // feathercritty: upstream only stops when a match ends exactly on `end`. Going left from a
+        // match that ends on a wrapped wide char's spacer, `expand_wide` moves to the leading
+        // spacer on the previous line, so the new origin can land past an `end` on the wide char
+        // or its leading spacer. The next search then wrapped around the buffer and the iterator
+        // cycled through its matches forever. The match already covers `end`, so we stop.
+        // When merging upstream: if `RegexIter` changed, re-run `wrapped_wide_regex_iter` and
+        // `wrapped_wide_fuzz`; if they pass without this, drop it.
+        if self.term.skips_over(from, self.point, self.end, self.direction) {
+            self.done = true;
+        }
     }
 
     /// Get the next match in the specified direction.
@@ -669,10 +725,33 @@ impl<T> Iterator for RegexIter<'_, T> {
             self.done = true;
         }
 
+        let origin = self.point;
         let regex_match = self.next_match()?;
 
         self.point = *regex_match.end();
-        if self.point == self.end {
+
+        // feathercritty: upstream only stops when the match ends right on `end`. Going right, a
+        // match can cover `end` and end one or two cells past it: when `end` is a wide char, the
+        // match ends on its spacer; when `end` is a leading spacer, the match ends on the
+        // wrapped wide char's spacer on the next line. Upstream then moved the origin past `end`,
+        // the next search wrapped around the buffer and the iterator cycled through its matches
+        // forever. We also stop when the match ends on the last cell of the glyph at `end`
+        // (`expand_wide`), unless this search started inside that glyph after `end` (the range
+        // then wraps around the whole buffer, so `end` is still ahead). Going left, the match's
+        // end is on the far side from `end`; `skip` handles that direction.
+        // When merging upstream: if `RegexIter` changed, re-run `wrapped_wide_regex_iter` and
+        // `wrapped_wide_fuzz`; if they pass without this, drop it.
+        let past_end = match self.direction {
+            Direction::Right => {
+                let glyph_end = self.term.expand_wide(self.end, Direction::Right);
+                let origin_in_glyph = origin == glyph_end
+                    || self.term.skips_over(self.end, glyph_end, origin, Direction::Right);
+                self.point == glyph_end && !origin_in_glyph
+            },
+            Direction::Left => false,
+        };
+
+        if self.point == self.end || past_end {
             // Stop when the match terminates right on the end limit.
             self.done = true;
         } else {
@@ -688,6 +767,11 @@ impl<T> Iterator for RegexIter<'_, T> {
 mod tests {
     use super::*;
 
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+    use std::{iter, thread};
+
+    use crate::event::VoidListener;
     use crate::index::{Column, Line};
     use crate::term::Config;
     use crate::term::test::{TermSize, mock_term};
@@ -1247,5 +1331,295 @@ mod tests {
         let match_start = Point::new(Line(1), Column(0));
         let match_end = Point::new(Line(0), Column(2));
         assert_eq!(term.regex_search_left(&mut regex, start, end), Some(match_end..=match_start));
+    }
+
+    /// Run `f` on another thread and fail, instead of hanging the test run, when it does not
+    /// finish within a few seconds.
+    fn terminates<R: Send + 'static>(what: &str, f: impl FnOnce() -> R + Send + 'static) -> R {
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => panic!("{what} did not terminate"),
+            Err(RecvTimeoutError::Disconnected) => panic!("{what} panicked"),
+        }
+    }
+
+    /// A wide character wrapped from line 1 to line 2:
+    ///
+    /// ```text
+    /// 0: abc
+    /// 1: ab<leading spacer>
+    /// 2: 字<spacer>c
+    /// 3: abc
+    /// ```
+    fn wrapped_wide_term() -> Term<VoidListener> {
+        let mut term = mock_term("abc\r\nab \n字c\r\nabc");
+        term.grid[Line(1)][Column(2)].flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+        term
+    }
+
+    #[test]
+    fn wrapped_wide_end_left() {
+        // The search ends on the wrapped wide character itself, which the leftward fullwidth skip
+        // used to jump over, wrapping around the buffer forever.
+        let result = terminates("leftward search ending on a wrapped wide char", || {
+            let term = wrapped_wide_term();
+
+            let mut regex = RegexSearch::new("x").unwrap();
+            let start = Point::new(Line(3), Column(2));
+            let end = Point::new(Line(2), Column(0));
+            let no_match = term.regex_search_left(&mut regex, start, end);
+
+            let mut regex = RegexSearch::new("字").unwrap();
+            let wide = term.regex_search_left(&mut regex, start, end);
+
+            (no_match, wide)
+        });
+
+        let match_start = Point::new(Line(1), Column(2));
+        let match_end = Point::new(Line(2), Column(1));
+        assert_eq!(result, (None, Some(match_start..=match_end)));
+    }
+
+    #[test]
+    fn wrapped_wide_search_next_max_lines() {
+        // `max_lines` puts the end of a leftward search at column 0 of an arbitrary line.
+        let result = terminates("leftward search_next with max_lines", || {
+            let term = wrapped_wide_term();
+            let origin = Point::new(Line(3), Column(2));
+
+            let mut regex = RegexSearch::new("x").unwrap();
+            let no_match =
+                term.search_next(&mut regex, origin, Direction::Left, Side::Left, Some(1));
+
+            let mut regex = RegexSearch::new("字").unwrap();
+            let wide = term.search_next(&mut regex, origin, Direction::Left, Side::Left, Some(1));
+
+            (no_match, wide)
+        });
+
+        let match_start = Point::new(Line(1), Column(2));
+        let match_end = Point::new(Line(2), Column(1));
+        assert_eq!(result, (None, Some(match_start..=match_end)));
+    }
+
+    #[test]
+    fn wrapped_wide_end_right() {
+        // Rightward, the fullwidth skip over a leading spacer used to jump over the wrapped wide
+        // character too.
+        let result = terminates("rightward search ending on a wrapped wide char", || {
+            let term = wrapped_wide_term();
+
+            let mut regex = RegexSearch::new("x").unwrap();
+            let start = Point::new(Line(0), Column(0));
+            let end = Point::new(Line(2), Column(0));
+            let no_match = term.regex_search_right(&mut regex, start, end);
+
+            let mut regex = RegexSearch::new("b字").unwrap();
+            let wide = term.regex_search_right(&mut regex, start, end);
+
+            (no_match, wide)
+        });
+
+        let match_start = Point::new(Line(1), Column(1));
+        let match_end = Point::new(Line(2), Column(1));
+        assert_eq!(result, (None, Some(match_start..=match_end)));
+    }
+
+    #[test]
+    fn wrapped_wide_regex_iter() {
+        // A match covering the iterator's end without ending on it used to move the iterator's
+        // origin past its end, so it cycled through the buffer's matches forever.
+        let matches = terminates("RegexIter over a wrapped wide char", || {
+            let term = wrapped_wide_term();
+            let mut regex = RegexSearch::new("字").unwrap();
+            let mut iter = |start, end, direction| {
+                RegexIter::new(start, end, direction, &term, &mut regex)
+                    .take(10)
+                    .collect::<Vec<_>>()
+            };
+
+            // Left, ending on the wide character or its leading spacer.
+            let left_wide = iter(
+                Point::new(Line(3), Column(2)),
+                Point::new(Line(2), Column(0)),
+                Direction::Left,
+            );
+            let left_leading = iter(
+                Point::new(Line(3), Column(2)),
+                Point::new(Line(1), Column(2)),
+                Direction::Left,
+            );
+
+            // Right, ending on the leading spacer or the wide character.
+            let right_leading = iter(
+                Point::new(Line(0), Column(0)),
+                Point::new(Line(1), Column(2)),
+                Direction::Right,
+            );
+            let right_wide = iter(
+                Point::new(Line(0), Column(0)),
+                Point::new(Line(2), Column(0)),
+                Direction::Right,
+            );
+
+            [left_wide, left_leading, right_leading, right_wide]
+        });
+
+        let wide = Point::new(Line(1), Column(2))..=Point::new(Line(2), Column(1));
+        assert_eq!(matches, [vec![wide.clone()], vec![wide.clone()], vec![wide.clone()], vec![
+            wide
+        ]]);
+    }
+
+    #[test]
+    fn empty_pattern_terminates() {
+        // On a plain grid the empty pattern already terminated; it only hung through the wrapped
+        // wide character end-cell skip.
+        let result = terminates("empty pattern", || {
+            let mut results = Vec::new();
+            for term in [mock_term("ab\r\ncd"), wrapped_wide_term()] {
+                for direction in [Direction::Left, Direction::Right] {
+                    let mut regex = RegexSearch::new("").unwrap();
+                    let origin = Point::new(Line(1), Column(0));
+                    for max_lines in [None, Some(0), Some(1), Some(2)] {
+                        results.push(term.search_next(
+                            &mut regex,
+                            origin,
+                            direction,
+                            Side::Left,
+                            max_lines,
+                        ));
+                    }
+                }
+            }
+            results
+        });
+
+        assert!(result.iter().all(Option::is_none));
+    }
+
+    /// Exhaustive search over small grids with wrapped wide characters, checking that every
+    /// search terminates and that `RegexIter` does not cycle.
+    #[test]
+    fn wrapped_wide_fuzz() {
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            for columns in 2..=4 {
+                for lines in 2..=4 {
+                    for mask in 0u32..(1 << (lines - 1)) {
+                        // Bit `n` wraps a wide character from line `n` to line `n + 1`.
+                        let wrapped: Vec<usize> =
+                            (0..lines - 1).filter(|n| mask & (1 << n) != 0).collect();
+
+                        // On two columns the wide character fills the line, so its line cannot
+                        // also end in a leading spacer.
+                        if columns == 2 && wrapped.windows(2).any(|w| w[1] == w[0] + 1) {
+                            continue;
+                        }
+
+                        wrapped_wide_fuzz_grid(&tx, columns, lines, &wrapped, false);
+
+                        // Also with a wide char that is not wrapped at the start of line 0.
+                        if columns >= 3 {
+                            wrapped_wide_fuzz_grid(&tx, columns, lines, &wrapped, true);
+                        }
+                    }
+                }
+            }
+            let _ = tx.send(String::from("done"));
+        });
+
+        let mut last = String::from("start");
+        loop {
+            match rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(case) if case == "done" => break,
+                Ok(case) => last = case,
+                Err(RecvTimeoutError::Timeout) => panic!("did not terminate: {last}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("panicked: {last}"),
+            }
+        }
+    }
+
+    fn wrapped_wide_fuzz_grid(
+        tx: &mpsc::Sender<String>,
+        columns: usize,
+        lines: usize,
+        wrapped: &[usize],
+        plain_wide: bool,
+    ) {
+        let size = TermSize::new(columns, lines);
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        for line in 0..lines {
+            for column in 0..columns {
+                let c = if (line + column) % 2 == 0 { 'a' } else { 'b' };
+                term.grid[Line(line as i32)][Column(column)].c = c;
+            }
+        }
+        if plain_wide {
+            term.grid[Line(0)][Column(0)].c = '字';
+            term.grid[Line(0)][Column(0)].flags.insert(Flags::WIDE_CHAR);
+            term.grid[Line(0)][Column(1)].c = ' ';
+            term.grid[Line(0)][Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+        }
+        for &line in wrapped {
+            let last_column = Column(columns - 1);
+            let cell = &mut term.grid[Line(line as i32)][last_column];
+            cell.c = ' ';
+            cell.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+
+            let next = Line(line as i32 + 1);
+            term.grid[next][Column(0)].c = '字';
+            term.grid[next][Column(0)].flags.insert(Flags::WIDE_CHAR);
+            term.grid[next][Column(1)].c = ' ';
+            term.grid[next][Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+        }
+
+        let points: Vec<Point> = (0..lines)
+            .flat_map(|line| {
+                (0..columns).map(move |column| Point::new(Line(line as i32), Column(column)))
+            })
+            .collect();
+        let cap = points.len() + 2;
+
+        for pattern in ["字", "a", "字a", "b字", "x", "", "a*", "."] {
+            let mut regex = RegexSearch::new(pattern).unwrap();
+            for &start in &points {
+                for &end in &points {
+                    let case = format!(
+                        "{columns}x{lines} wrapped {wrapped:?} plain {plain_wide} pattern \
+                         {pattern:?} {start:?} -> {end:?}"
+                    );
+                    let _ = tx.send(case.clone());
+
+                    term.regex_search_left(&mut regex, start, end);
+                    term.regex_search_right(&mut regex, start, end);
+
+                    for direction in [Direction::Left, Direction::Right] {
+                        let count = RegexIter::new(start, end, direction, &term, &mut regex)
+                            .take(cap)
+                            .count();
+                        assert!(count < cap, "RegexIter cycled: {case} {direction:?}");
+                    }
+                }
+
+                let max_lines = iter::once(None).chain((0..lines).map(Some));
+                for max_lines in max_lines {
+                    for direction in [Direction::Left, Direction::Right] {
+                        let _ = tx.send(format!(
+                            "{columns}x{lines} wrapped {wrapped:?} plain {plain_wide} pattern \
+                             {pattern:?} search_next {start:?} {direction:?} max_lines \
+                             {max_lines:?}"
+                        ));
+                        for side in [Side::Left, Side::Right] {
+                            term.search_next(&mut regex, start, direction, side, max_lines);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
