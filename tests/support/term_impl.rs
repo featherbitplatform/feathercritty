@@ -118,16 +118,15 @@ fn search_bounds(
     direction: Direction,
     max_lines: Option<usize>,
 ) -> (Point, Point, Point, bool) {
-    // Right from a leading spacer on the bottommost line, `expand_wide` leaves the grid: 0.26.0
-    // panics there, and feathercritty uses the cell its search lands on after reading the spacer,
-    // two cells on, clamped to the grid's last cell (fork change 5, `search_next`).
-    let expanded = term.expand_wide(origin, direction);
-    let origin = if expanded.line > term.bottommost_line() {
+    // Where `expand_wide` leaves the grid (`origin_leaves_grid`), feathercritty uses the cell its
+    // search lands on after reading the spacer, two cells on, clamped to the grid's last cell
+    // (fork change 5, `search_next`).
+    let origin = if origin_leaves_grid(term, origin, direction) {
         let last = Point::new(term.bottommost_line(), term.last_column());
         let step = |p: Point| if p == last { p } else { p.add(term, Boundary::Grid, 1) };
         step(step(origin))
     } else {
-        expanded
+        term.expand_wide(origin, direction)
     };
     let max_lines = max_lines.filter(|max_lines| max_lines + 1 < term.total_lines());
     let (start, end) = match direction {
@@ -156,6 +155,17 @@ fn search_bounds(
     (origin, start, end, max_lines.is_some())
 }
 
+/// Whether `search_next`'s origin is a leading spacer on the bottommost line, going right. 0.26.0's
+/// `expand_wide` then moves it to column 1 of the line below the grid, and 0.26.0 panics (debug
+/// builds, and release builds when its ring has no row there) or answers from whichever row its
+/// ring holds at that index. feathercritty keeps the origin on the line
+/// (`search_origin_on_bottom_line_stale_spacer`), so these searches are not compared.
+fn origin_leaves_grid(term: &Term<VoidListener>, origin: Point, direction: Direction) -> bool {
+    direction == Direction::Right
+        && origin.line == term.bottommost_line()
+        && cell_at(term.grid(), origin).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+}
+
 /// Whether `Term::search_next` returns for these arguments.
 ///
 /// Workaround for a 0.26.0 bug, still needed on the oracle side: 0.26.0's match iterator
@@ -181,6 +191,14 @@ fn search_terminates(
     side: KSide,
     max_lines: Option<usize>,
 ) -> bool {
+    // On the oracle side, searches 0.26.0 cannot run sensibly are answered "does not terminate"
+    // without running them: an origin that leaves the grid (`origin_leaves_grid`; walking the
+    // iterator here from feathercritty's origin can take very long on a large history, and
+    // 0.26.0's own search reads outside the grid anyway), and ranges whose end the searches can
+    // step over (`first_search_misses_end`).
+    if ORACLE && origin_leaves_grid(term, origin, direction) {
+        return false;
+    }
     let (origin, start, end, _) = search_bounds(term, origin, direction, max_lines);
     if ORACLE && first_search_misses_end(term, end, direction) {
         return false;
@@ -685,18 +703,11 @@ impl Side {
 
     /// Whether a 0.26.0 `search_next` answer is one fork change 5 may change: the search did
     /// not terminate, or its match lies (at least partly) outside the searched range because
-    /// 0.26.0 missed the range's end and wrapped around, or the search goes right from a leading
-    /// spacer on the bottommost line. There `expand_wide` moves 0.26.0's origin below the grid,
-    /// and 0.26.0 panics (debug builds, and release builds when the ring has no row there) or
-    /// answers from whichever row its ring holds at that index; feathercritty keeps the origin
-    /// on the line (`search_origin_on_bottom_line_stale_spacer`).
+    /// 0.26.0 missed the range's end and wrapped around, or its origin leaves the grid
+    /// (`origin_leaves_grid`), whatever 0.26.0 answered.
     pub fn oracle_search_is_off(&self, search: &SearchQ, answer: &QAns) -> bool {
-        let grid = self.term.grid();
-        let origin = self.point(search.origin);
-        if search.right
-            && origin.line == grid.bottommost_line()
-            && cell_at(grid, origin).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-        {
+        let direction = if search.right { Direction::Right } else { Direction::Left };
+        if origin_leaves_grid(&self.term, self.point(search.origin), direction) {
             return true;
         }
         match answer {
