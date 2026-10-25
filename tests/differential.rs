@@ -15,9 +15,11 @@
 //! `tests/support/mod.rs`:
 //! - Fork change 1 (kitty keyboard stack eviction) needs more than 4,096 pushes; the generator
 //!   stays below 4,000, and `oracle_sees_fork_change_1` checks that the oracle does notice it.
-//! - Fork change 5 (regex search over wrapped wide characters terminates): where 0.26.0 does not
-//!   terminate or answers from outside the searched range, feathercritty's answer is checked on its
-//!   own instead of compared; `oracle_sees_fork_change_5` covers it.
+//! - Fork change 5 (regex search over leading spacers terminates and stays in range; complete in
+//!   `0.26.0+fbterm.3`): where 0.26.0 does not terminate or answers from outside the searched
+//!   range, feathercritty's answer is checked on its own instead of compared, even when both are
+//!   equal; `oracle_sees_fork_change_5` covers it. Every feathercritty query runs under a timeout,
+//!   so a search that never returns fails with its seed instead of hanging the run.
 //!
 //! Known gaps, all from 0.26.0 bugs the harness steers around (see the comments at each
 //! workaround; remove them when upstream fixes the bug):
@@ -177,8 +179,12 @@ fn oracle_sees_fork_change_5() {
                             max_lines: window,
                             unmoved: was_moved.then_some(max_lines),
                         };
-                        let (fork, oracle) =
-                            (a.search(&search, window, true), b.search(&search, window, true));
+                        // feathercritty runs under a timeout, so a search that never returns
+                        // fails the test instead of hanging it.
+                        let fork = a
+                            .search_detached(&search, window, std::time::Duration::from_secs(30))
+                            .expect("feathercritty search_next did not terminate");
+                        let oracle = b.search(&search, window, true);
                         // Checked whenever 0.26.0 is off, even if both answers are equal.
                         if b.oracle_search_is_off(&search, &oracle) {
                             if let Err(why) = a.check_search(&search, window, &fork) {

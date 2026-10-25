@@ -42,7 +42,7 @@
 //! 3. `project.rs` hard-codes flag bit values (`WRAPLINE`, `WIDE_CHAR_SPACER`,
 //!    `LEADING_WIDE_CHAR_SPACER`) and `term_impl.rs`/`mod.rs` the `ALT_SCREEN` mode bit and the
 //!    generated hyperlink ID suffix `_alacritty`; check them against the new release.
-//!    `term_impl::search_bounds` (used by `search_terminates`, `in_search_range` and, through the
+//!    `term_impl::search_bounds` (used by `search_terminates`, `match_in_range` and, through the
 //!    same formulas, `project::search_window`) replicates the start and end computation of upstream
 //!    `search_next` (`next_match_left/right`); re-check it against the new source.
 //! 4. Re-check every workaround for a 0.26.0 bug (each is commented with the upstream behavior it
@@ -51,11 +51,15 @@
 //! 5. Re-check the intended differences (the README's change list) and how the oracle models them:
 //!    - Fork change 1 (kitty keyboard stack eviction): the generator stays below the stack depth
 //!      (`gen::MAX_KITTY_PUSHES`); `oracle_sees_fork_change_1` shows the oracle notices it.
-//!    - Fork change 5 (regex search over wrapped wide characters terminates): where 0.26.0's
-//!      `search_next` does not terminate or answers from outside the searched range
+//!    - Fork change 5 (regex search over leading spacers, complete in `0.26.0+fbterm.3`: every
+//!      search terminates, and matches stay in their range up to the glyph completion at its ends;
+//!      where 0.26.0 terminates in range the answers are 0.26.0's): where 0.26.0's `search_next`
+//!      does not terminate or answers from outside the searched range
 //!      (`Side::oracle_search_is_off`), [`run`] does not require equality but checks
-//!      feathercritty's answer on its own (`Side::check_search`: it terminated, and a match
-//!      overlaps the range at both ends and spells a match of the pattern); windows that
+//!      feathercritty's answer on its own, even when both answers are equal (`Side::check_search`:
+//!      it terminated, and a match lies in the range, allowing the glyph completion at its ends
+//!      (`Side::match_in_range`), and spells a match of the pattern as the search reads cells,
+//!      `Side::text_right`/`text_left`, which follow `skip_fullwidth`); windows that
 //!      `project::search_window` moves for 0.26.0 are also searched as drawn on feathercritty alone
 //!      and checked the same way. Both are counted in [`Stats`]; `oracle_sees_fork_change_5` shows
 //!      both paths are taken. If the new oracle release carries the same fix, drop that modeling

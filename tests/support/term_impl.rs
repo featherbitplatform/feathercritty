@@ -148,11 +148,12 @@ fn search_bounds(
 /// Whether `Term::search_next` returns for these arguments.
 ///
 /// Workaround for a 0.26.0 bug, still needed on the oracle side: 0.26.0's match iterator
-/// (`RegexIter`) can cycle between two matches forever (next to a `LEADING_WIDE_CHAR_SPACER` at
-/// the end of a line). This walks the same iterator `search_next` walks, with the same start, end
+/// (`RegexIter`) can cycle between two matches forever (next to a `LEADING_WIDE_CHAR_SPACER`,
+/// wrapped or stale). This walks the same iterator `search_next` walks, with the same start, end
 /// and stop condition (`search_bounds`), but gives up after more matches than the grid has cells.
-/// feathercritty fixed the cycle (fork change 5), so on its side this always returns `true`;
-/// remove it once the oracle release fixes the cycle too.
+/// feathercritty fixed the cycle (fork change 5, `+fbterm.3`), so on its side this returns `true`
+/// (anything else fails the run through `check_search`); keep it while the oracle runs 0.26.0
+/// and remove it once the oracle release fixes the cycle too.
 fn search_terminates(
     term: &Term<VoidListener>,
     regex: &mut RegexSearch,
@@ -356,98 +357,199 @@ impl Side {
         rx.recv_timeout(timeout).ok()
     }
 
-    /// The cells of the character at `p`: a wide character with its spacer, plus the leading
-    /// spacer on the previous line when it wrapped.
-    fn glyph(&self, p: Point) -> Vec<Point> {
+    /// The cells after `p` that a rightward search reads or steps over together with it, as
+    /// `skip_fullwidth` in feathercritty's `src/term/search.rs` does (`Term::glyph_end` there):
+    /// the two cells after a `LEADING_WIDE_CHAR_SPACER` (wrapped: the wide character and its
+    /// spacer; stale, even mid-line: the next cell, read in the spacer's place, and the one
+    /// after it), or the spacer after a wide character. Clamped to the grid's last cell.
+    fn completion_right(&self, p: Point) -> Vec<Point> {
         let grid = self.term.grid();
-        let last = grid.last_column();
-        let top = grid.topmost_line();
-        let bottom = grid.bottommost_line();
-        let flags = |p: Point| grid[p].flags;
-
-        let mut wide = p;
-        if flags(p).contains(Flags::LEADING_WIDE_CHAR_SPACER) && p.line < bottom {
-            wide = Point::new(p.line + 1, Column(0));
-        } else if flags(p).contains(Flags::WIDE_CHAR_SPACER) && p.column.0 > 0 {
-            wide = Point::new(p.line, p.column - 1);
-        }
-        let mut cells = vec![p, wide];
-        if flags(wide).contains(Flags::WIDE_CHAR) {
-            if wide.column < last {
-                cells.push(Point::new(wide.line, wide.column + 1));
+        let last = Point::new(grid.bottommost_line(), grid.last_column());
+        let flags = grid[p].flags;
+        let count = if flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+            2
+        } else if flags.contains(Flags::WIDE_CHAR) && p.column < grid.last_column() {
+            1
+        } else {
+            0
+        };
+        let mut cells = Vec::new();
+        let mut point = p;
+        for _ in 0..count {
+            if point == last {
+                break;
             }
-            let above = Point::new(wide.line - 1, last);
-            if wide.column.0 == 0
-                && wide.line > top
-                && flags(above).contains(Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                cells.push(above);
+            point = point.add(grid, Boundary::Grid, 1);
+            cells.push(point);
+        }
+        cells
+    }
+
+    /// The cells before `p` that a leftward search reads or steps over together with it: the
+    /// wide character before its spacer, and a leading spacer before a wrapped wide character
+    /// (left onto a wrapped wide character, the search reports it at its leading spacer). A
+    /// stale leading spacer reads as a blank going left, so it adds nothing.
+    fn completion_left(&self, p: Point) -> Vec<Point> {
+        let grid = self.term.grid();
+        let first = Point::new(grid.topmost_line(), Column(0));
+        let before = |p: Point| (p > first).then(|| p.sub(grid, Boundary::Grid, 1));
+        let mut cells = Vec::new();
+        let mut wide = p;
+        if grid[p].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            let Some(w) = before(p) else { return cells };
+            cells.push(w);
+            wide = w;
+        }
+        if grid[wide].flags.contains(Flags::WIDE_CHAR) {
+            if let Some(s) = before(wide) {
+                if grid[s].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                    cells.push(s);
+                }
             }
         }
         cells
     }
 
-    /// Whether the character at `p` overlaps the range `search_next` searches for `search`
-    /// with `max_lines` (walked cell by cell from its start to its end, wrapping around the
-    /// buffer as the search does).
-    fn in_search_range(&self, search: &SearchQ, max_lines: Option<usize>, p: Pt) -> bool {
+    /// Whether the match `start..=end` (grid order) lies in the range `search_next` searches for
+    /// `search` with `max_lines`, as fork change 5 (`+fbterm.3`) bounds it:
+    /// - the range runs from the search's start to its end in search direction, wrapping around the
+    ///   buffer like the search (an unbounded search covers the whole buffer);
+    /// - the far end of the match (its end going right, its start going left) may also lie in the
+    ///   completion of the character at the range's end (`completion_right` going right,
+    ///   `completion_left` going left);
+    /// - the near end may also lie in the completion of the character at the range's start in the
+    ///   other direction (the second search, back to the start, completes it, as 0.26.0 does).
+    ///
+    /// If upstream's or feathercritty's range handling in `search.rs` changes, update this.
+    fn match_in_range(
+        &self,
+        search: &SearchQ,
+        max_lines: Option<usize>,
+        start: Pt,
+        end: Pt,
+    ) -> bool {
         let term = &self.term;
         let direction = if search.right { Direction::Right } else { Direction::Left };
-        let (_, start, end, bounded) =
+        let (_, range_start, range_end, bounded) =
             search_bounds(term, self.point(search.origin), direction, max_lines);
         if !bounded {
             return true;
         }
-        let glyph = self.glyph(self.point(p));
-        let mut point = start;
+
+        let mut range = Vec::new();
+        let mut point = range_start;
         for _ in 0..=term.total_lines() * term.columns() {
-            if glyph.contains(&point) {
-                return true;
-            }
-            if point == end {
-                return false;
+            range.push(point);
+            if point == range_end {
+                break;
             }
             point = match direction {
                 Direction::Right => point.add(term, Boundary::None, 1),
                 Direction::Left => point.sub(term, Boundary::None, 1),
             };
         }
-        false
+
+        let (start, end) = (self.point(start), self.point(end));
+        let (near, far, near_completion, far_completion) = match direction {
+            Direction::Right => {
+                (start, end, self.completion_left(range_start), self.completion_right(range_end))
+            },
+            Direction::Left => {
+                (end, start, self.completion_right(range_start), self.completion_left(range_end))
+            },
+        };
+        (range.contains(&near) || near_completion.contains(&near))
+            && (range.contains(&far) || far_completion.contains(&far))
     }
 
-    /// Whether the cells from `start` to `end` (grid order) spell a match of `pattern` as
-    /// `RegexSearch` reads them: the characters of all but spacer cells, only across wrapped
-    /// line ends, with smart case (case insensitive unless the pattern has an uppercase letter).
+    /// The text `regex_search_internal` reads from `start` to `end` going right, following
+    /// `skip_fullwidth` in feathercritty's `src/term/search.rs`: a wide character is read and the
+    /// cell after it stepped over; at a `LEADING_WIDE_CHAR_SPACER` the next cell is read in its
+    /// place and the cell after that stepped over (for a stale spacer that next cell is an
+    /// ordinary one); every other cell, a stray spacer included, is read as its character.
+    fn text_right(&self, start: Point, end: Point) -> String {
+        let grid = self.term.grid();
+        let last = Point::new(grid.bottommost_line(), grid.last_column());
+        let mut text = String::new();
+        let mut point = start;
+        loop {
+            let cell = &grid[point];
+            let skip = if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && point < last {
+                text.push(grid[point.add(grid, Boundary::Grid, 1)].c);
+                3
+            } else {
+                text.push(cell.c);
+                if cell.flags.contains(Flags::WIDE_CHAR) && point.column < grid.last_column() {
+                    2
+                } else {
+                    1
+                }
+            };
+            for _ in 0..skip {
+                if point >= end || point == last {
+                    return text;
+                }
+                point = point.add(grid, Boundary::Grid, 1);
+            }
+            if point > end {
+                return text;
+            }
+        }
+    }
+
+    /// The text read from `end` back to `start` going left, as `skip_fullwidth` does: at a
+    /// wide character's spacer the wide character is read (and a leading spacer just before it
+    /// stepped over); every other cell, a stale leading spacer included, is read as its
+    /// character (a stale spacer reads as a blank).
+    fn text_left(&self, start: Point, end: Point) -> String {
+        let grid = self.term.grid();
+        let first = Point::new(grid.topmost_line(), Column(0));
+        let mut text = Vec::new();
+        let mut point = end;
+        loop {
+            let cell = &grid[point];
+            let mut skip = 1;
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && point > first {
+                let wide = point.sub(grid, Boundary::Grid, 1);
+                text.push(grid[wide].c);
+                skip = 2;
+                if wide > first
+                    && grid[wide.sub(grid, Boundary::Grid, 1)]
+                        .flags
+                        .contains(Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    skip = 3;
+                }
+            } else {
+                text.push(cell.c);
+            }
+            for _ in 0..skip {
+                if point <= start || point == first {
+                    return text.into_iter().rev().collect();
+                }
+                point = point.sub(grid, Boundary::Grid, 1);
+            }
+            if point < start {
+                return text.into_iter().rev().collect();
+            }
+        }
+    }
+
+    /// Whether the cells from `start` to `end` (grid order) spell a match of `pattern` the way
+    /// the search reads them (`text_right` or `text_left`; a rightward search finds a match's
+    /// end reading right and its start reading back left, so either reading may be the one that
+    /// matched), only across wrapped line ends, with smart case (case insensitive unless the
+    /// pattern has an uppercase letter), as `RegexSearch` does.
     fn is_real_match(&self, pattern: &str, start: Pt, end: Pt) -> Result<(), String> {
         let grid = self.term.grid();
         let (start, end) = (self.point(start), self.point(end));
         if start > end {
             return Err(format!("match start {start:?} after its end {end:?}"));
         }
-        let mut text = String::new();
-        let mut point = start;
-        let mut skip_next = false;
-        loop {
-            let cell = &grid[point];
-            // `regex_search_internal` reads a wide character and steps over the cell after it
-            // (whatever its flags), and steps over leading spacers.
-            if skip_next {
-                skip_next = false;
-            } else if !cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-            {
-                text.push(cell.c);
-                skip_next =
-                    cell.flags.contains(Flags::WIDE_CHAR) && point.column < grid.last_column();
+        for line in start.line.0..end.line.0 {
+            if !grid[Line(line)][grid.last_column()].flags.contains(Flags::WRAPLINE) {
+                return Err(format!("match crosses the unwrapped end of line {line}"));
             }
-            if point == end {
-                break;
-            }
-            if point.column == grid.last_column() && !cell.flags.contains(Flags::WRAPLINE) {
-                return Err(format!("match crosses the unwrapped end of line {}", point.line.0));
-            }
-            point = point.add(grid, Boundary::Grid, 1);
         }
 
         let case_insensitive = !pattern.chars().any(char::is_uppercase);
@@ -455,16 +557,17 @@ impl Side {
             .syntax(regex_automata::util::syntax::Config::new().case_insensitive(case_insensitive))
             .build(&format!(r"\A(?:{pattern})\z"))
             .map_err(|err| err.to_string())?;
-        if regex.is_match(&text) {
+        let (right, left) = (self.text_right(start, end), self.text_left(start, end));
+        if regex.is_match(&right) || regex.is_match(&left) {
             Ok(())
         } else {
-            Err(format!("{text:?} does not match {pattern:?}"))
+            Err(format!("neither {right:?} nor {left:?} matches {pattern:?}"))
         }
     }
 
     /// Check a `search_next` answer without an oracle (used on the feathercritty side where
-    /// 0.26.0 cannot answer, fork change 5): it must have terminated, and a match must overlap
-    /// the searched range at both ends and be a real match of the pattern. `Match(None)` is
+    /// 0.26.0 cannot answer, fork change 5): it must have terminated, and a match must lie in
+    /// the searched range (`match_in_range`) and be a real match of the pattern. `Match(None)` is
     /// accepted (absence is not checked).
     pub fn check_search(
         &self,
@@ -475,10 +578,8 @@ impl Side {
         match answer {
             QAns::Match(None) => Ok(()),
             QAns::Match(Some((start, end))) => {
-                for p in [start, end] {
-                    if !self.in_search_range(search, max_lines, *p) {
-                        return Err(format!("match end {p:?} lies outside the searched range"));
-                    }
+                if !self.match_in_range(search, max_lines, *start, *end) {
+                    return Err("the match lies outside the searched range".to_owned());
                 }
                 self.is_real_match(&search.pattern, *start, *end)
             },
@@ -493,8 +594,7 @@ impl Side {
         match answer {
             QAns::NoTermination => true,
             QAns::Match(Some((start, end))) => {
-                !self.in_search_range(search, search.max_lines, *start)
-                    || !self.in_search_range(search, search.max_lines, *end)
+                !self.match_in_range(search, search.max_lines, *start, *end)
             },
             _ => false,
         }
