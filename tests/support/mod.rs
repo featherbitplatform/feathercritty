@@ -1,12 +1,57 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
 //! Shared support for the differential tests: one step list drives feathercritty and unmodified
-//! `alacritty_terminal` 0.26.0 side by side, and their states are compared through a projection
-//! after every step.
+//! `alacritty_terminal` (the oracle, a crates.io dev-dependency pinned with `=`) side by side, and
+//! their states are compared through a crate-neutral projection after every step.
 //!
-//! Layout: [`Step`] and [`Start`] describe a run, [`gen`] produces runs, [`fc`] and [`ac`] apply
-//! steps to each crate's `Term` and project it, [`project`] holds the crate-neutral snapshot,
-//! query plan and diff, [`run`] compares the two, and [`minimize`] shrinks a failing step list.
+//! # What is compared
+//!
+//! After every [`Step`] (and after a final synthetic [`EXIT_ALT_SCREEN`]), [`run`] compares a
+//! [`project::Snapshot`] of each terminal: every cell of every history and screen row of the
+//! active grid (character, zero-width characters, fg, bg, flag bits, underline color, hyperlink
+//! URI and ID pattern), the cursor and saved cursor (point, `input_needs_wrap`, template cell),
+//! display offset, history size, columns, lines, mode bits and the persistent selection's range
+//! and text. Then both answer the same seeded [`project::QueryPlan`]: `selection_to_string` for
+//! each selection type, `bounds_to_string`, `search_next` both ways, `bracket_search`,
+//! `semantic_search_left/right`, `line_search_left/right`, `expand_wide` and three chained vi
+//! motions. Queries leave the selection and display offset as they found them.
+//!
+//! # How both crates are driven
+//!
+//! `term_impl.rs` holds all code that touches a `Term`. It is compiled twice, as `fc::imp` and
+//! `ac::imp`, each with `k` aliased to one crate (`fc.rs`: feathercritty, `ac.rs`:
+//! `alacritty_terminal`), so both sides run literally the same harness code. Both crates parse
+//! with the same `vte` crate. Everything outside `term_impl.rs` is crate neutral: [`Step`],
+//! [`Start`], the generators in [`gen`], the snapshot, plan and diffs in [`project`], the
+//! runner and [`minimize`].
+//!
+//! # Moving the oracle to a newer upstream release
+//!
+//! When feathercritty merges a new upstream `alacritty_terminal` release X.Y.Z:
+//! 1. Bump the dev-dependency `alacritty_terminal = "=X.Y.Z"` in `Cargo.toml` to the release the
+//!    fork is now based on, and update `Cargo.lock`.
+//! 2. `term_impl.rs` must compile against both crates. It uses this upstream API: `Term::new`,
+//!    `Config` (`scrolling_history`, `kitty_keyboard`), `term::test::TermSize`, `Term::resize`,
+//!    `scroll_display(Scroll::Delta)`, `set_options`, the public `Term::selection` field,
+//!    `Selection::new/update/to_range`, `grid()` with `Grid` indexing by `Line`/`Column`,
+//!    `topmost_line`/`bottommost_line`/`history_size`/`display_offset`, the public
+//!    `Grid::cursor`/`saved_cursor` fields, `Cell` (`c`, `fg`, `bg`, `flags`, `zerowidth()`,
+//!    `underline_color()`, `hyperlink()`), `TermMode::bits`, `RegexSearch`, `RegexIter`,
+//!    `search_next`, the other search functions, `ViModeCursor::motion` and the `ViMotion` list
+//!    (`MOTIONS`). If upstream changes one of these, change `term_impl.rs` for both sides.
+//! 3. `project.rs` hard-codes flag bit values (`WRAPLINE`, `WIDE_CHAR_SPACER`,
+//!    `LEADING_WIDE_CHAR_SPACER`) and `term_impl.rs`/`mod.rs` the `ALT_SCREEN` mode bit and the
+//!    generated hyperlink ID suffix `_alacritty`; check them against the new release.
+//!    `project::search_window` and `term_impl::search_terminates` replicate the start and end
+//!    computation of upstream `search_next` (`next_match_left/right`); re-check that against the
+//!    new source.
+//! 4. Re-check every workaround for a 0.26.0 bug (each is commented with the upstream behavior it
+//!    avoids; search for "0.26.0"). Remove the ones the new release fixes, so the oracle covers
+//!    those inputs again, and update the "Known gaps" list in `tests/differential.rs`.
+//! 5. Re-check the intended differences (the README's change list): today only fork change 1, which
+//!    the generator avoids with `gen::MAX_KITTY_PUSHES`.
+//!
+//! [`gen`]: mod@r#gen
 
 // Each test binary uses a different part of this module.
 #![allow(dead_code)]
@@ -194,15 +239,83 @@ where
     }
 }
 
-/// Drive both terminals through `steps`, comparing the projection and a seeded set of queries
-/// after every step.
-pub fn run(start: &Start, steps: &[Step]) -> Result<(), Divergence> {
+/// Bytes that leave the alternate screen whichever way it was entered. `run` feeds them after
+/// the last step: 0.26.0 has no getter for the inactive grid (feathercritty's
+/// `Term::inactive_grid` is fork change 3), so this is how history that was hidden behind the
+/// alternate screen at the end of a run still gets compared. If the oracle release gains an
+/// inactive-grid getter, compare the inactive grid directly instead.
+pub const EXIT_ALT_SCREEN: &[u8] = b"\x1b[?1049l\x1b[?47l\x1b[?1047l";
+
+/// What a run covered.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Stats {
+    pub cases: usize,
+    pub steps: usize,
+    /// Steps after which the alternate screen was up (its primary history is not compared).
+    pub alt_steps: usize,
+    /// Largest history seen.
+    pub max_history: usize,
+    /// Cases whose history reached the current limit (limit above 0) at least once.
+    pub reached_limit: usize,
+    /// `search_next` queries run.
+    pub searches: usize,
+    /// Of those, searches whose window end was moved off a wrapped wide character.
+    pub moved_windows: usize,
+    /// Of those, searches answered "does not terminate" (0.26.0's match iterator cycles).
+    pub no_termination: usize,
+}
+
+impl Stats {
+    fn add(&mut self, other: &Stats) {
+        self.cases += other.cases;
+        self.steps += other.steps;
+        self.alt_steps += other.alt_steps;
+        self.max_history = self.max_history.max(other.max_history);
+        self.reached_limit += other.reached_limit;
+        self.searches += other.searches;
+        self.moved_windows += other.moved_windows;
+        self.no_termination += other.no_termination;
+    }
+}
+
+impl fmt::Display for Stats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let pct = |n: usize, of: usize| if of == 0 { 0.0 } else { 100.0 * n as f64 / of as f64 };
+        write!(
+            f,
+            "{} cases, {} steps ({:.1}% with the alternate screen up), max history {}, {} cases \
+             ({:.1}%) reached their history limit, {} searches: {:.1}% windows moved, {:.1}% not \
+             terminating",
+            self.cases,
+            self.steps,
+            pct(self.alt_steps, self.steps),
+            self.max_history,
+            self.reached_limit,
+            pct(self.reached_limit, self.cases),
+            self.searches,
+            pct(self.moved_windows, self.searches),
+            pct(self.no_termination, self.searches),
+        )
+    }
+}
+
+/// Drive both terminals through `steps`, then through [`EXIT_ALT_SCREEN`], comparing the
+/// projection and a seeded set of queries after every step. A divergence after the synthetic
+/// exit is reported at step `steps.len()`.
+pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
     let mut a = fc::Side::new(start);
     let mut b = ac::Side::new(start);
     let mut qrng = ChaCha8Rng::seed_from_u64(start.query_seed);
+    let mut stats = Stats { cases: 1, ..Stats::default() };
+    let mut limit = start.history;
+    let mut reached = false;
 
-    for (i, step) in steps.iter().enumerate() {
+    let exit = Step::Bytes(EXIT_ALT_SCREEN.to_vec());
+    for (i, step) in steps.iter().chain([&exit]).enumerate() {
         both(i, "step", || a.apply(step), || b.apply(step))?;
+        if let Step::SetHistory(new) = step {
+            limit = *new;
+        }
 
         let (sa, sb) = both(i, "snapshot", || a.snapshot(), || b.snapshot())?;
         if sa != sb {
@@ -214,10 +327,23 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<(), Divergence> {
         if qa != qb {
             return Err(Divergence { step: i, diff: project::diff_queries(&plan, &qa, &qb) });
         }
-    }
 
-    Ok(())
+        stats.steps += 1;
+        stats.alt_steps += usize::from(sa.mode & ALT_SCREEN_MODE != 0);
+        stats.max_history = stats.max_history.max(sa.history_size);
+        reached |= limit > 0 && sa.history_size == limit;
+        stats.searches += plan.searches.len();
+        stats.moved_windows += plan.moved_windows;
+        stats.no_termination +=
+            qa.iter().filter(|(_, q)| *q == project::QAns::NoTermination).count();
+    }
+    stats.reached_limit = usize::from(reached);
+
+    Ok(stats)
 }
+
+/// `TermMode::ALT_SCREEN`.
+const ALT_SCREEN_MODE: u32 = 1 << 12;
 
 fn env_u64(name: &str) -> Option<u64> {
     let value = std::env::var(name).ok()?;
@@ -242,15 +368,18 @@ pub fn seeds(count: u64) -> Vec<u64> {
     }
 }
 
-/// Run `make(seed)` for every seed on all cores. On the first divergence, minimize it and panic
-/// with the seed, the minimized steps and the difference.
-pub fn run_pass<F>(test: &str, seeds: &[u64], make: F)
+/// Run `make(seed)` for every seed on all cores and return the combined [`Stats`] (also
+/// printed; see them with `--nocapture`). On the first divergence, minimize it and panic with
+/// the seed, the minimized steps and the difference. `steps` is the `DIFF_STEPS` value the pass
+/// used, for the reproduce command (`None` for passes that ignore it).
+pub fn run_pass<F>(test: &str, seeds: &[u64], steps: Option<usize>, make: F) -> Stats
 where
     F: Fn(u64) -> Case + Sync,
 {
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let failure: Mutex<Option<(u64, Case, Divergence)>> = Mutex::new(None);
+    let total = Mutex::new(Stats::default());
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(seeds.len());
 
     std::thread::scope(|scope| {
@@ -260,28 +389,35 @@ where
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(&seed) = seeds.get(index) else { break };
                     let case = make(seed);
-                    if let Err(divergence) = run(&case.start, &case.steps) {
-                        stop.store(true, Ordering::Relaxed);
-                        let mut failure = failure.lock().unwrap();
-                        if failure.as_ref().is_none_or(|(s, ..)| seed < *s) {
-                            *failure = Some((seed, case, divergence));
-                        }
+                    match run(&case.start, &case.steps) {
+                        Ok(stats) => total.lock().unwrap().add(&stats),
+                        Err(divergence) => {
+                            stop.store(true, Ordering::Relaxed);
+                            let mut failure = failure.lock().unwrap();
+                            if failure.as_ref().is_none_or(|(s, ..)| seed < *s) {
+                                *failure = Some((seed, case, divergence));
+                            }
+                        },
                     }
                 }
             });
         }
     });
 
-    let Some((seed, case, divergence)) = failure.into_inner().unwrap() else { return };
+    let Some((seed, case, divergence)) = failure.into_inner().unwrap() else {
+        let total = total.into_inner().unwrap();
+        println!("{test}: {total}");
+        return total;
+    };
     let start = case.start;
     let minimized = minimize::minimize(&case.steps, |steps| run(&start, steps).is_err());
     let after = run(&start, &minimized).err();
 
+    let steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
     let mut report = format!(
         "differential divergence in `{test}`, seed {seed}, {divergence}\n\nreproduce: \
-         DIFF_SEED={seed} DIFF_STEPS={} cargo test --test differential {test}\n\nstart: \
-         {start:?}\nminimized steps ({} of {}):\n",
-        case.steps.len(),
+         DIFF_SEED={seed}{steps} cargo test --test differential {test}\n\nstart: \
+         {start:?}\nminimized steps ({} of {}; a synthetic alternate screen exit follows them):\n",
         minimized.len(),
         case.steps.len(),
     );

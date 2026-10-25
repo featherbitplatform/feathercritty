@@ -65,8 +65,9 @@ pub struct Snapshot {
     /// Every row from the topmost history line down to the bottom of the screen.
     pub rows: Vec<Vec<CellP>>,
     /// The persistent selection: its range (start, end, is_block) and its text, or `Err` when
-    /// computing them panics (0.26.0 does for some selections, e.g. an integer underflow in
-    /// debug builds for some `Lines` selections reaching above the history).
+    /// computing them panics. Workaround: 0.26.0 panics for some selections (e.g. an integer
+    /// underflow in debug builds for some `Lines` selections reaching above the history); once
+    /// upstream fixes that, a panic here is still compared but should no longer occur.
     pub selection: Result<SelectionP, Panicked>,
 }
 
@@ -90,6 +91,8 @@ pub struct QueryPlan {
     pub bounds: (Pt, Pt),
     /// `(pattern, origin, right, side_right, max_lines)` for `search_next`.
     pub searches: Vec<(String, Pt, bool, bool, Option<usize>)>,
+    /// How many search windows `search_window` moved (statistics only).
+    pub moved_windows: usize,
     /// Points for `bracket_search`, `semantic_search_*`, `line_search_*` and `expand_wide`.
     pub points: Vec<Pt>,
     /// Start point and three vi motions (indices into the motion table of each side).
@@ -106,6 +109,11 @@ pub enum QAns {
     Point(Pt),
     OptPoint(Option<Pt>),
     Match(Option<(Pt, Pt)>),
+    /// The query panicked. Both crates run 0.26.0's code for every query, so they panic on the
+    /// same inputs; the panic is compared like any other answer.
+    Panicked,
+    /// `search_next` would never return (see `term_impl::search_terminates`).
+    NoTermination,
 }
 
 /// `WIDE_CHAR_SPACER | LEADING_WIDE_CHAR_SPACER`.
@@ -130,70 +138,68 @@ const WRAPLINE: u16 = 0b0000_0000_0001_0000;
 /// `Flags::LEADING_WIDE_CHAR_SPACER`.
 const LEADING_SPACER: u16 = 0b0000_0100_0000_0000;
 
-/// The `max_lines` to use for a `search_next` from `origin_line`, or `None` to skip the search.
+/// `Flags::WIDE_CHAR_SPACER`.
+const WIDE_SPACER: u16 = 0b0000_0000_0100_0000;
+
+/// The `max_lines` to use for a `search_next` from `origin_line`, and whether it had to change.
 ///
-/// 0.26.0's regex search skips two cells at once over a wide character that wrapped (one whose
-/// previous line ends in a `LEADING_WIDE_CHAR_SPACER`). When the cell it skips is the end of
-/// the searched range, the search wraps around the buffer forever, and its match iterator can
-/// also cycle between two matches near such a cell. So searches stay one line clear of every
-/// line that ends in a leading spacer: the requested window is kept when it is clear, and is
-/// otherwise shrunk to the clear lines next to the start (skipped when there are none). Windows
-/// wrap around the buffer like the search does (`Boundary::None`).
+/// Works around a 0.26.0 bug; remove it (and re-run the oracle) once upstream fixes it. Going
+/// left, `regex_search_internal` steps over a wide character that wrapped (its row's previous
+/// row ends in a `LEADING_WIDE_CHAR_SPACER`) in one move, from its spacer at column 1 straight to
+/// the leading spacer above, so it never stands on the wide character at column 0. When that
+/// cell is the end of the searched range, the search misses its end and wraps around the buffer
+/// forever. Only a leftward search with `max_lines` puts its end at column 0 of an arbitrary
+/// line (`start.line - max_lines`, wrapped like `Line::grid_clamp(Boundary::None)`), so in that
+/// case the window grows by one line until its end is not such a cell. Nothing is skipped.
+/// The other 0.26.0 search hang, the match iterator cycling between two matches, is caught by
+/// `term_impl::search_terminates` instead.
 fn search_window(
     snap: &Snapshot,
     origin_line: i32,
     right: bool,
     max_lines: Option<usize>,
-) -> Option<Option<usize>> {
+) -> (Option<usize>, bool) {
+    let total = snap.rows.len();
+    let Some(mut m) = max_lines.filter(|m| m + 1 < total) else { return (max_lines, false) };
+    if right || snap.columns < 2 {
+        return (max_lines, false);
+    }
+
     let top = snap.topmost_line();
     let bottom = snap.lines as i32 - 1;
-    let total = snap.rows.len() as i32;
+    let screen = snap.lines as i32;
     let last = snap.columns - 1;
-    let flags = |line: i32| snap.rows[(line - top) as usize][last].flags;
-    // Leading spacers belong in the last column, but a resize can leave one in another.
-    let leading: Vec<bool> = snap
-        .rows
-        .iter()
-        .map(|row| row.iter().any(|cell| cell.flags & LEADING_SPACER != 0))
-        .collect();
-    let tainted = |index: i32| leading[index.rem_euclid(total) as usize];
+    let flags = |line: i32, col: usize| snap.rows[(line - top) as usize][col].flags;
 
-    // The line the search starts on (`line_search_left` / `line_search_right`).
+    // `line_search_right(origin)`.
     let mut start = origin_line;
-    if right {
-        while start > top && flags(start - 1) & WRAPLINE != 0 {
-            start -= 1;
-        }
-    } else {
-        while start < bottom && flags(start) & WRAPLINE != 0 {
-            start += 1;
-        }
+    while start + 1 < screen && flags(start, last) & WRAPLINE != 0 {
+        start += 1;
     }
-    let start = start - top;
-    let step = if right { 1 } else { -1 };
-
-    // Lines `start ..= start + m` in search direction, plus one line on either side.
-    let clear = |m: i32| {
-        if m + 3 >= total {
-            return (0..total).all(|index| !tainted(index));
+    // `(start.line - m).grid_clamp(term, Boundary::None)`.
+    let end_line = |m: usize| {
+        let line = start - m as i32;
+        if line >= screen {
+            top + (line - screen) % total as i32
+        } else {
+            bottom + (line - screen + 1) % total as i32
         }
-        (-1..=m + 1).all(|offset| !tainted(start + step * offset))
+    };
+    let trap = |line: i32| {
+        line > top
+            && flags(line, 1) & WIDE_SPACER != 0
+            && flags(line - 1, last) & LEADING_SPACER != 0
     };
 
-    match max_lines.filter(|m| m + 1 < total as usize) {
-        None if clear(total) => return Some(max_lines),
-        Some(m) if clear(m as i32) => return Some(Some(m)),
-        _ => (),
-    }
-
-    if !clear(0) {
-        return None;
-    }
-    let mut m = 0;
-    while m + 2 < total && clear(m + 1) {
+    let mut moved = false;
+    while trap(end_line(m)) {
+        moved = true;
         m += 1;
+        if m + 1 >= total {
+            return (None, true);
+        }
     }
-    Some(Some(m as usize))
+    (Some(m), moved)
 }
 
 impl QueryPlan {
@@ -215,6 +221,7 @@ impl QueryPlan {
 
         // Patterns are sampled from the text, with a few generic ones mixed in.
         let mut searches = Vec::new();
+        let mut moved_windows = 0;
         for right in [false, true] {
             let pattern = if rng.gen_bool(0.15) {
                 ["[a-z]+", r"\d+", r"\w+ \w+", "[^ ]+ ?", "é|中|😀"]
@@ -232,15 +239,16 @@ impl QueryPlan {
                     .take(len)
                     .map(|cell| cell.c)
                     .collect();
-                // A pattern that matches the empty string makes `search_next` loop forever in
-                // 0.26.0 (the UI never searches for one), so never sample an empty pattern.
+                // Workaround: a pattern that matches the empty string makes `search_next` loop
+                // forever in 0.26.0 (the UI never searches for one), so never sample an empty
+                // pattern. Remove this once upstream fixes it.
                 if text.is_empty() { "x".to_owned() } else { escape_regex(&text) }
             };
             let max_lines = rng.gen_bool(0.5).then(|| rng.gen_range(0..=snap.rows.len()));
             let origin = point(rng);
-            if let Some(max_lines) = search_window(snap, origin.line, right, max_lines) {
-                searches.push((pattern, origin, right, rng.gen_bool(0.5), max_lines));
-            }
+            let (max_lines, moved) = search_window(snap, origin.line, right, max_lines);
+            moved_windows += usize::from(moved);
+            searches.push((pattern, origin, right, rng.gen_bool(0.5), max_lines));
         }
 
         // Prefer bracket cells for one point so `bracket_search` finds pairs.
@@ -257,7 +265,7 @@ impl QueryPlan {
         let vi_start = point(rng);
         let motions = [(); 3].map(|()| rng.gen_range(0..VI_MOTIONS));
 
-        Self { selections, bounds, searches, points, vi: (vi_start, motions) }
+        Self { selections, bounds, searches, moved_windows, points, vi: (vi_start, motions) }
     }
 }
 

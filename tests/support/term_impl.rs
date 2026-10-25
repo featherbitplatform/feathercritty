@@ -105,10 +105,14 @@ fn cell_p(cell: &Cell, ids: &mut HashMap<String, usize>, index: Option<usize>) -
     }
 }
 
-/// Whether `Term::search_next` returns for these arguments. In 0.26.0 its match iterator can
-/// cycle between two matches forever (seen with a `LEADING_WIDE_CHAR_SPACER` at the end of a
-/// line), so this walks the same iterator `search_next` walks, with the same start, end and stop
-/// condition, but gives up after more matches than the grid has cells.
+/// Whether `Term::search_next` returns for these arguments.
+///
+/// Workaround for a 0.26.0 bug: its match iterator (`RegexIter`) can cycle between two matches
+/// forever (seen next to a `LEADING_WIDE_CHAR_SPACER` at the end of a line). This walks the same
+/// iterator `search_next` walks, with the same start, end and stop condition copied from
+/// upstream `next_match_left/right` (re-check them when the oracle moves to a new release), but
+/// gives up after more matches than the grid has cells. Remove it once upstream fixes the
+/// cycle.
 fn search_terminates(
     term: &Term<VoidListener>,
     regex: &mut RegexSearch,
@@ -170,12 +174,15 @@ fn search_terminates(
     false
 }
 
-/// Run one query, answering "panicked" if it panics. Both crates share 0.26.0's code here, so
-/// they panic on the same inputs (several query functions panic on some grid states, e.g. a vi
-/// motion that follows wrapped lines past the bottom of the screen); the oracle compares that
-/// outcome like any other answer.
+/// Run one query, answering [`QAns::Panicked`] if it panics.
+///
+/// Workaround: several 0.26.0 query functions panic on some grid states (vi `Last` and
+/// `FirstOccupied` follow wrapped lines past the bottom of the screen, vi `Right` from a stray
+/// `LEADING_WIDE_CHAR_SPACER` on the bottom line, block selections as above). Both crates run
+/// the same code there, so the panic is compared like any other answer. Once upstream fixes
+/// those, this can stay; it then only reports real differences.
 fn guarded(query: impl FnOnce() -> QAns) -> QAns {
-    catch(query).unwrap_or_else(|_| QAns::Text(Some("panicked".to_owned())))
+    catch(query).unwrap_or(QAns::Panicked)
 }
 
 impl Side {
@@ -203,10 +210,12 @@ impl Side {
     fn selection(&self, ty: SelTy, start: Pt, end: Pt) -> Selection {
         let (a, b) = (self.point(start), self.point(end));
         let (mut start_side, mut end_side) = (side(start.right), side(end.right));
-        // 0.26.0 panics in `selection_to_string` for a block selection whose upper anchor is the
-        // right half of the last column and whose lower anchor is the left half of the same
-        // column (its range starts one column past the grid), so use the left half for the
-        // upper anchor in that shape.
+        // Workaround: 0.26.0 panics in `selection_to_string` for a block selection whose upper
+        // anchor is the right half of the last column and whose lower anchor is the left half
+        // of the same column (`range_block` starts the range one column past the grid), so use
+        // the left half for the upper anchor in that shape. Queries would only record the panic,
+        // but the persistent selection's text would be lost for the rest of the run. Remove
+        // this once upstream fixes it.
         let last = self.term.last_column();
         if ty == SelTy::Block && a.column == last && b.column == last && a.line != b.line {
             let (upper, lower) = if a.line < b.line {
@@ -314,7 +323,7 @@ impl Side {
                             term.search_next(&mut regex, origin, direction, side, *max_lines);
                         QAns::Match(found.map(|m| (pt(*m.start()), pt(*m.end()))))
                     } else {
-                        QAns::Text(Some("search_next does not terminate".to_owned()))
+                        QAns::NoTermination
                     }
                 },
                 Err(_) => QAns::Text(None),
@@ -356,14 +365,15 @@ impl Side {
             let term = &mut self.term;
             let moved = catch(|| cursor.motion(term, MOTIONS[motion]));
             let Ok(moved) = moved else {
-                out.push(("vi_motion", QAns::Text(Some("panicked".to_owned()))));
+                out.push(("vi_motion", QAns::Panicked));
                 break;
             };
             cursor = moved;
             out.push(("vi_motion", QAns::Point(pt(cursor.point))));
-            // Some motions in 0.26.0 can leave the grid (`Middle` on a one-line screen without
-            // history, `Right` from a stray `LEADING_WIDE_CHAR_SPACER` on the bottom line), and
-            // motions from there read rows outside it, so the chain stops.
+            // Workaround: some 0.26.0 motions can leave the grid (`Middle` on a one-line screen
+            // without history, `Right` from a stray `LEADING_WIDE_CHAR_SPACER` on the bottom
+            // line), and motions from there read rows outside it, so the chain stops. Remove
+            // this once upstream keeps motions inside the grid.
             let line = cursor.point.line;
             if line < self.term.topmost_line() || line > self.term.bottommost_line() {
                 break;
