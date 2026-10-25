@@ -11,9 +11,13 @@
 //! the pass used and a minimized step list. Each pass prints coverage statistics (see them with
 //! `--nocapture`).
 //!
-//! The only intended behavioral difference, fork change 1 (kitty keyboard stack eviction), needs
-//! more than 4,096 pushes; the generator stays below 4,000, and
-//! `oracle_sees_fork_change_1` checks that the oracle does notice it.
+//! Intended behavioral differences (README change list), modeled as described in
+//! `tests/support/mod.rs`:
+//! - Fork change 1 (kitty keyboard stack eviction) needs more than 4,096 pushes; the generator
+//!   stays below 4,000, and `oracle_sees_fork_change_1` checks that the oracle does notice it.
+//! - Fork change 5 (regex search over wrapped wide characters terminates): where 0.26.0 does not
+//!   terminate or answers from outside the searched range, feathercritty's answer is checked on its
+//!   own instead of compared; `oracle_sees_fork_change_5` covers it.
 //!
 //! Known gaps, all from 0.26.0 bugs the harness steers around (see the comments at each
 //! workaround; remove them when upstream fixes the bug):
@@ -21,8 +25,12 @@
 //!   kept short and every run ends by leaving the alternate screen, but a difference that appears
 //!   in the hidden history and is undone before the exit goes unseen.
 //! - Leftward searches whose window would end on a wrapped wide character get a window one or more
-//!   lines larger, so that exact end is never searched; searches whose match iterator cycles are
-//!   answered "does not terminate" without calling `search_next`.
+//!   lines larger for the comparison, and searches whose 0.26.0 match iterator cycles are answered
+//!   "does not terminate" there (0.26.0 would hang). feathercritty also searches the original
+//!   window, but its answers there and in the cycling cases are only checked on their own: a match
+//!   must be real and inside the range; a "no match" answer is not verified.
+//! - Empty search patterns are never drawn (0.26.0 hangs on them; feathercritty's fix is covered by
+//!   its own `empty_pattern_terminates` unit test).
 //! - Wide characters never meet a one-column grid.
 //! - Queries that panic in 0.26.0 are compared as "panicked", so whatever those functions would
 //!   have returned there is not checked.
@@ -128,6 +136,74 @@ fn oracle_sees_fork_change_1() {
     let divergence = support::run(&start, &[below, Step::Bytes(b"\x1b[>1u".to_vec())])
         .expect_err("0.26.0 should panic on the 4,097th push");
     assert!(divergence.diff.contains("0.26.0 panicked"), "{divergence}");
+}
+
+/// The oracle models fork change 5 (regex search over wrapped wide characters). On a grid with a
+/// wide character wrapped from line 1 to line 2, it searches from every cell, both ways, with
+/// and without `max_lines`. Where 0.26.0 does not terminate or answers from outside the searched
+/// range, feathercritty's answer must pass its own check (and such cases must exist); everywhere
+/// else the answers must be equal. Windows `search_window` moves for 0.26.0 (it would hang) are
+/// searched as drawn on feathercritty only, which must terminate with a checked answer.
+#[test]
+fn oracle_sees_fork_change_5() {
+    use support::project::{QAns, SearchQ, search_window};
+    use support::{Pt, ac, fc};
+
+    // 0: abc
+    // 1: ab<leading spacer>
+    // 2: 字<spacer>c
+    // 3: abc
+    let start = Start { lines: 4, columns: 3, history: 0, kitty: false, query_seed: 0 };
+    let bytes = Step::Bytes("abc\r\nab字c\r\nabc".as_bytes().to_vec());
+    let (mut a, mut b) = (fc::Side::new(&start), ac::Side::new(&start));
+    a.apply(&bytes);
+    b.apply(&bytes);
+    let snap = a.snapshot();
+    assert_eq!(snap, b.snapshot());
+    assert_eq!(snap.rows[2][0].c, '字');
+
+    let (mut off, mut moved, mut equal) = (0, 0, 0);
+    for pattern in ["字", "b字", "a", "c", "x", "[a-z]+"] {
+        for line in 0..4 {
+            for col in 0..3 {
+                for right in [false, true] {
+                    for max_lines in [None, Some(0), Some(1), Some(2)] {
+                        let (window, was_moved) = search_window(&snap, line, right, max_lines);
+                        let search = SearchQ {
+                            pattern: pattern.to_owned(),
+                            origin: Pt::new(line, col),
+                            right,
+                            side_right: false,
+                            max_lines: window,
+                            unmoved: was_moved.then_some(max_lines),
+                        };
+                        let (fork, oracle) =
+                            (a.search(&search, window, true), b.search(&search, window, true));
+                        if b.oracle_search_is_off(&search, &oracle) && fork != oracle {
+                            a.check_search(&search, window, &fork).unwrap();
+                            off += 1;
+                        } else {
+                            assert_eq!(fork, oracle, "{search:?}");
+                            equal += 1;
+                        }
+                        if was_moved {
+                            let fork = a.search_detached(
+                                &search,
+                                max_lines,
+                                std::time::Duration::from_secs(30),
+                            );
+                            assert_ne!(fork, QAns::NoTermination);
+                            a.check_search(&search, max_lines, &fork).unwrap();
+                            moved += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(off > 0, "no search where 0.26.0 cannot answer");
+    assert!(moved > 0, "no window moved for 0.26.0");
+    assert!(equal > off);
 }
 
 /// The oracle compares cells in history, not only the screen.

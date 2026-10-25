@@ -56,6 +56,9 @@ alacritty_terminal = "=0.26.0"
 # ChaCha keeps generated test cases identical on every platform.
 rand = "0.8"
 rand_chacha = "0.3"
+# Checks that a match the fork returns where 0.26.0 cannot answer is a real match (the library
+# already depends on this crate).
+regex-automata = "0.4.3"
 
 # Benchmarks print their own tables (and take `--gate`), so they bring their own `main`.
 [[bench]]

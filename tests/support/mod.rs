@@ -48,8 +48,18 @@
 //! 4. Re-check every workaround for a 0.26.0 bug (each is commented with the upstream behavior it
 //!    avoids; search for "0.26.0"). Remove the ones the new release fixes, so the oracle covers
 //!    those inputs again, and update the "Known gaps" list in `tests/differential.rs`.
-//! 5. Re-check the intended differences (the README's change list): today only fork change 1, which
-//!    the generator avoids with `gen::MAX_KITTY_PUSHES`.
+//! 5. Re-check the intended differences (the README's change list) and how the oracle models them:
+//!    - Fork change 1 (kitty keyboard stack eviction): the generator stays below the stack depth
+//!      (`gen::MAX_KITTY_PUSHES`); `oracle_sees_fork_change_1` shows the oracle notices it.
+//!    - Fork change 5 (regex search over wrapped wide characters terminates): where 0.26.0's
+//!      `search_next` does not terminate or answers from outside the searched range
+//!      (`Side::oracle_search_is_off`), [`run`] does not require equality but checks
+//!      feathercritty's answer on its own (`Side::check_search`: it terminated, and a match
+//!      overlaps the range at both ends and spells a match of the pattern); windows that
+//!      `project::search_window` moves for 0.26.0 are also searched as drawn on feathercritty alone
+//!      and checked the same way. Both are counted in [`Stats`]; `oracle_sees_fork_change_5` shows
+//!      both paths are taken. If the new oracle release carries the same fix, drop that modeling
+//!      and require equality again; if feathercritty's change was dropped, drop it too.
 //!
 //! [`gen`]: mod@r#gen
 
@@ -263,6 +273,12 @@ pub struct Stats {
     pub moved_windows: usize,
     /// Of those, searches answered "does not terminate" (0.26.0's match iterator cycles).
     pub no_termination: usize,
+    /// Searches where 0.26.0 did not terminate or answered from outside the searched range, so
+    /// feathercritty's answer was checked on its own instead (fork change 5).
+    pub change5_answers: usize,
+    /// Moved windows that feathercritty also searched as drawn, checked on its own (fork
+    /// change 5; 0.26.0 would hang there).
+    pub change5_windows: usize,
 }
 
 impl Stats {
@@ -275,6 +291,8 @@ impl Stats {
         self.searches += other.searches;
         self.moved_windows += other.moved_windows;
         self.no_termination += other.no_termination;
+        self.change5_answers += other.change5_answers;
+        self.change5_windows += other.change5_windows;
     }
 }
 
@@ -284,8 +302,8 @@ impl fmt::Display for Stats {
         write!(
             f,
             "{} cases, {} steps ({:.1}% with the alternate screen up), max history {}, {} cases \
-             ({:.1}%) reached their history limit, {} searches: {:.1}% windows moved, {:.1}% not \
-             terminating",
+             ({:.1}%) reached their history limit, {} searches: {:.1}% windows moved, {} not \
+             terminating in 0.26.0; fork change 5 checked alone: {} answers, {} windows",
             self.cases,
             self.steps,
             pct(self.alt_steps, self.steps),
@@ -294,7 +312,9 @@ impl fmt::Display for Stats {
             pct(self.reached_limit, self.cases),
             self.searches,
             pct(self.moved_windows, self.searches),
-            pct(self.no_termination, self.searches),
+            self.no_termination,
+            self.change5_answers,
+            self.change5_windows,
         )
     }
 }
@@ -323,7 +343,40 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
         }
 
         let plan = project::QueryPlan::random(&mut qrng, &sa);
-        let (qa, qb) = both(i, "queries", || a.queries(&plan), || b.queries(&plan))?;
+        let (mut qa, qb) = both(i, "queries", || a.queries(&plan), || b.queries(&plan))?;
+
+        // Fork change 5: where 0.26.0's search does not terminate or answers from outside the
+        // searched range, feathercritty's answer is checked on its own instead of compared.
+        // The searches follow the selections and `bounds_to_string` in the answers.
+        let first = plan.selections.len() + 1;
+        for (k, search) in plan.searches.iter().enumerate() {
+            let (fork, oracle) = (&qa[first + k].1, &qb[first + k].1);
+            if fork != oracle && b.oracle_search_is_off(search, oracle) {
+                if let Err(why) = a.check_search(search, search.max_lines, fork) {
+                    let diff = format!(
+                        "search_next where 0.26.0 cannot answer (fork change 5): feathercritty \
+                         {fork:?} fails its own check: {why}\n0.26.0 {oracle:?}\nsearch {search:?}"
+                    );
+                    return Err(Divergence { step: i, diff });
+                }
+                stats.change5_answers += 1;
+                qa[first + k].1 = oracle.clone();
+            }
+            // Windows moved for 0.26.0's sake: feathercritty searches them as drawn.
+            if let Some(unmoved) = search.unmoved {
+                let fork = a.search_detached(search, unmoved, DETACHED_TIMEOUT);
+                if let Err(why) = a.check_search(search, unmoved, &fork) {
+                    let diff = format!(
+                        "search_next on a window 0.26.0 cannot search (fork change 5): \
+                         feathercritty {fork:?} fails its own check: {why}\nsearch {search:?} \
+                         with max_lines {unmoved:?}"
+                    );
+                    return Err(Divergence { step: i, diff });
+                }
+                stats.change5_windows += 1;
+            }
+        }
+
         if qa != qb {
             return Err(Divergence { step: i, diff: project::diff_queries(&plan, &qa, &qb) });
         }
@@ -335,12 +388,16 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
         stats.searches += plan.searches.len();
         stats.moved_windows += plan.moved_windows;
         stats.no_termination +=
-            qa.iter().filter(|(_, q)| *q == project::QAns::NoTermination).count();
+            qb.iter().filter(|(_, q)| *q == project::QAns::NoTermination).count();
     }
     stats.reached_limit = usize::from(reached);
 
     Ok(stats)
 }
+
+/// How long feathercritty may take for a search that 0.26.0 cannot run (see
+/// `Side::search_detached`) before the oracle reports that it does not terminate.
+const DETACHED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// `TermMode::ALT_SCREEN`.
 const ALT_SCREEN_MODE: u32 = 1 << 12;
