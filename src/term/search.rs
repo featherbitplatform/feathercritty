@@ -554,19 +554,36 @@ impl<T> Term<T> {
         distance.rem_euclid(total.max(1)) as usize
     }
 
-    /// The last cell of the character at `end` as a rightward search reads it: `expand_wide`,
-    /// except that a leading spacer on the bottommost line stays put (`expand_wide` would
-    /// return a point below the grid).
+    /// The cell where a rightward search lands after reading the character at `point`: the
+    /// spacer of a wide char, the second cell after a leading spacer (stale or not, as
+    /// `skip_fullwidth` steps), and `point` itself otherwise. This is `expand_wide` for
+    /// characters that wrapped as they should; unlike `expand_wide` it follows a stale leading
+    /// spacer in the middle of a line, and it stays inside the grid on the bottommost line.
     ///
     /// feathercritty: not in upstream; see `regex_search_right` and `RegexIter::next`.
-    fn glyph_end(&self, end: Point) -> Point {
-        if end.line >= self.bottommost_line()
-            && self.grid[end].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-        {
-            end
+    fn glyph_end(&self, point: Point) -> Point {
+        let flags = self.grid[point].flags;
+        let last = Point::new(self.bottommost_line(), self.last_column());
+        let step =
+            |point: Point| if point == last { point } else { point.add(self, Boundary::None, 1) };
+        if flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+            step(step(point))
+        } else if flags.contains(Flags::WIDE_CHAR) && point.column < self.last_column() {
+            step(point)
         } else {
-            self.expand_wide(end, Direction::Right)
+            point
         }
+    }
+
+    /// Whether two matches share a cell (in grid order, wrapping around the buffer).
+    ///
+    /// feathercritty: not in upstream; see `RegexIter::next`.
+    fn matches_overlap(&self, a: &Match, b: &Match) -> bool {
+        let within = |point: Point, m: &Match| {
+            self.search_distance(*m.start(), point, Direction::Right)
+                <= self.search_distance(*m.start(), *m.end(), Direction::Right)
+        };
+        within(*a.start(), b) || within(*b.start(), a)
     }
 
     /// Whether `end` is a stale leading spacer: its next line does not start with a wide char
@@ -776,6 +793,11 @@ pub struct RegexIter<'a, T> {
     start: Point,
     travelled: usize,
     end_distance: usize,
+    // feathercritty: the first and the last match returned, and whether the origin of the
+    // next search was moved forward by the origin rule, for the checks in `next`.
+    first: Option<Match>,
+    last: Option<Match>,
+    forced: bool,
 }
 
 impl<'a, T> RegexIter<'a, T> {
@@ -797,6 +819,9 @@ impl<'a, T> RegexIter<'a, T> {
             start,
             travelled: 0,
             end_distance,
+            first: None,
+            last: None,
+            forced: false,
         }
     }
 
@@ -836,6 +861,41 @@ impl<T> Iterator for RegexIter<'_, T> {
     type Item = Match;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // feathercritty: upstream returns every match its searches find. In a range that wraps
+        // around the whole buffer the last search can find the first match again, and after the
+        // origin rule in `next_unfiltered` moved an origin forward (next to a stale spacer) the
+        // search can find a match overlapping the last one. We skip a match equal to the first
+        // or the last one returned, and one overlapping the last one when its search started
+        // from a moved origin. Other overlaps are upstream's: going left, each search starts
+        // inside the previous match (one cell left of its right end), so consecutive leftward
+        // matches can overlap, and those stay. Each search still moves the origin forward, so
+        // this stays bounded.
+        // When merging upstream: keep this with the origin rule in `next_unfiltered`.
+        loop {
+            let forced = self.forced;
+            let regex_match = self.next_unfiltered()?;
+            let same = |other: &Option<Match>| other.as_ref() == Some(&regex_match);
+            let overlaps_last = forced
+                && self
+                    .last
+                    .as_ref()
+                    .is_some_and(|last| self.term.matches_overlap(last, &regex_match));
+            if same(&self.first) || same(&self.last) || overlaps_last {
+                continue;
+            }
+
+            if self.first.is_none() {
+                self.first = Some(regex_match.clone());
+            }
+            self.last = Some(regex_match.clone());
+            return Some(regex_match);
+        }
+    }
+}
+
+impl<T> RegexIter<'_, T> {
+    /// The next match, before the overlap check in `next`; upstream's `next`.
+    fn next_unfiltered(&mut self) -> Option<Match> {
         if self.done {
             return None;
         }
@@ -912,14 +972,29 @@ impl<T> Iterator for RegexIter<'_, T> {
         // A new origin that is not further than the last one (a match next to a stale spacer
         // that ends past its origin, see `stale_spacer_match_past_origin`) does not stop the
         // iterator, which would drop the rest of the range: the next search starts one cell past
-        // the last origin instead. Origins still move forward by at least one cell per match.
+        // the farther of the last origin and this match's far end instead. Origins still move
+        // forward by at least one cell per match.
+        self.forced = false;
         if !self.done {
-            let mut travelled = self.term.search_distance(self.start, self.point, self.direction);
+            let distance = |point| self.term.search_distance(self.start, point, self.direction);
+            let mut travelled = distance(self.point);
             if travelled <= self.travelled {
-                travelled = self.travelled + 1;
+                self.forced = true;
+                let far_end = match self.direction {
+                    Direction::Right => *regex_match.end(),
+                    Direction::Left => *regex_match.start(),
+                };
+                let (from, from_travelled) = if distance(far_end) > self.travelled
+                    && distance(far_end) <= self.end_distance
+                {
+                    (far_end, distance(far_end))
+                } else {
+                    (origin, self.travelled)
+                };
+                travelled = from_travelled + 1;
                 self.point = match self.direction {
-                    Direction::Right => origin.add(self.term, Boundary::None, 1),
-                    Direction::Left => origin.sub(self.term, Boundary::None, 1),
+                    Direction::Right => from.add(self.term, Boundary::None, 1),
+                    Direction::Left => from.sub(self.term, Boundary::None, 1),
                 };
             }
 
@@ -1751,9 +1826,10 @@ mod tests {
     }
 
     /// Whether both ends of `m` lie in the range a search from `start` to `end` in `direction`
-    /// covers, allowing the documented glyph completion: the character at `end` is read whole
-    /// (up to two cells past `end`), and the second search, back to `start`, completes the
-    /// character at `start` (up to two cells behind `start`).
+    /// covers, allowing only the documented glyph completion at each end: the character at
+    /// `end` is read whole (going right up to `glyph_end`, going left up to `expand_wide`), and
+    /// the second search, back to `start`, completes the character at `start` the same way in
+    /// the other direction.
     fn in_search_range(
         term: &Term<VoidListener>,
         start: Point,
@@ -1761,10 +1837,24 @@ mod tests {
         direction: Direction,
         m: &Match,
     ) -> bool {
-        let to_end = term.search_distance(start, end, direction);
+        let back = match direction {
+            Direction::Right => Direction::Left,
+            Direction::Left => Direction::Right,
+        };
+        let completion = |point: Point, direction: Direction| match direction {
+            Direction::Right => term.glyph_end(point),
+            Direction::Left => term.expand_wide(point, Direction::Left),
+        };
+
+        let ahead = term.search_distance(start, end, direction).max(term.search_distance(
+            start,
+            completion(end, direction),
+            direction,
+        ));
+        let behind = term.search_distance(start, completion(start, back), back);
         [*m.start(), *m.end()].into_iter().all(|point| {
-            term.search_distance(start, point, direction) <= to_end + 2
-                || term.search_distance(point, start, direction) <= 2
+            term.search_distance(start, point, direction) <= ahead
+                || term.search_distance(start, point, back) <= behind
         })
     }
 
@@ -1846,11 +1936,23 @@ mod tests {
                             .take(cap)
                             .collect::<Vec<_>>();
                         assert!(matches.len() < cap, "RegexIter cycled: {case} {direction:?}");
-                        for m in &matches {
+                        for (i, m) in matches.iter().enumerate() {
                             assert!(
                                 in_search_range(&term, start, end, direction, m),
                                 "RegexIter match outside the range: {case} {direction:?} {m:?}"
                             );
+                            assert!(
+                                !matches[..i].contains(m),
+                                "RegexIter repeated a match: {case} {direction:?} {matches:?}"
+                            );
+                            // Going left, each search starts inside the previous match (as
+                            // upstream does), so leftward matches may overlap.
+                            if i > 0 && direction == Direction::Right {
+                                assert!(
+                                    !term.matches_overlap(&matches[i - 1], m),
+                                    "RegexIter matches overlap: {case} {direction:?} {matches:?}"
+                                );
+                            }
                         }
                     }
                 }
@@ -2278,5 +2380,23 @@ mod tests {
             matches.first(),
             Some(&(Point::new(Line(3), Column(0))..=Point::new(Line(3), Column(0))))
         );
+    }
+
+    #[test]
+    fn regex_iter_skips_repeated_matches() {
+        // In a range that wraps around the whole buffer and starts inside a wrapped wide char,
+        // the last search found the first match again.
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("a ", ".L"),
+            ("字 ", "Ws"),
+        ]);
+        let mut regex = RegexSearch::new("字").unwrap();
+        let start = Point::new(Line(1), Column(0));
+        let end = Point::new(Line(0), Column(1));
+        let matches = RegexIter::new(start, end, Direction::Right, &term, &mut regex)
+            .take(10)
+            .collect::<Vec<_>>();
+        assert_eq!(matches, [Point::new(Line(0), Column(1))..=Point::new(Line(1), Column(1))]);
     }
 }
