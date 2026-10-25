@@ -152,6 +152,7 @@ The sites classified as history-capable in 0.26.0: `Term::line_to_string`, `Term
 - `Cargo.toml`: `test-hooks` feature and the self dev-dependency.
 
 **Phase 4 (unreleased, on `feature/compact-history`): tuning.** Targeted fast paths for the design gates; behavior is unchanged (the differential test proves it). Files changed, and what to watch when merging:
+- `src/grid/compact.rs`: faster encoder and decoder (module docs, "Speed"); the record format is unchanged.
 - `src/term/mod.rs`: `clear_line` lowers the row's `occ` after an erase that reaches the end of the line (`Row::set_equal_from`), so the encoder does not scan a background-colored blank line. If upstream changes that loop, keep the call only where every cell from `left` to the end gets the same reset cell.
 - `src/grid/row.rs`: new `Row::set_equal_from` (no upstream counterpart).
 

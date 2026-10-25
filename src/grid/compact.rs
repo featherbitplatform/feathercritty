@@ -89,6 +89,26 @@
 //! - Records are produced by this module only. Malformed bytes make the decoder panic (out of
 //!   bounds, invalid UTF-8, unknown color); it never reads outside the slice it is given.
 //!
+//! # Speed (phase 4 tuning)
+//!
+//! A row is encoded every time it scrolls off the screen, so the encoder is on the ingest path;
+//! the decoder is on every history read and reflow. What keeps them fast, and must stay true:
+//!
+//! - The scan for `P` starts at `occ` (see Invariants). `Term::clear_line` lowers `occ` after an
+//!   erase to the end of the line (`Row::set_equal_from`), so a background-colored blank line costs
+//!   no scan.
+//! - Cells are compared field by field with non-short-circuiting `&` (`cell_eq`, `RunKey`), the
+//!   extra by `Arc` identity; a run's style is read once per run.
+//! - Text that is all ASCII is written and read as one byte per cell in a single pass
+//!   (`write_text`; the decoder writes each run's cells whole), with a per-character fallback.
+//! - When `P + 1 < 128`, `R`, `M` and `E` each take one byte, so the header is written first with
+//!   placeholders and patched at the end; the body is never moved.
+//! - Small fixed-size pieces (header, a run's style) are copied as whole arrays and cut back
+//!   (`put_fixed`), which the compiler inlines instead of calling `memcpy`.
+//! - The marks pass runs only when a stored cell has a structural flag.
+//!
+//! `codec_timing` (an ignored test) prints the cost of typical rows for tuning.
+//!
 //! # When merging upstream
 //!
 //! Re-check this file whenever upstream changes `Cell`, `Flags`, `CellExtra` or vte's colors:
@@ -230,11 +250,18 @@ pub(crate) fn write_varint(out: &mut Vec<u8>, value: usize) {
 
 /// Append the header: `W`, `P` (`header.len`), `R`, `M`, `E` as varints, then the bits byte.
 pub(crate) fn write_header(out: &mut Vec<u8>, header: &RowHeader, runs: usize, marks: usize) {
-    write_varint(out, header.width as usize);
-    write_varint(out, header.len as usize);
-    write_varint(out, runs);
-    write_varint(out, marks);
-    write_varint(out, header.extras as usize);
+    let mut buf = [0; MAX_HEADER_BYTES];
+    let len = put_header(&mut buf, header, runs, marks);
+    put_fixed(out, &buf, len);
+}
+
+/// Most bytes a header takes: five varints of `u32` values (at most 5 bytes each) and the bits
+/// byte.
+const MAX_HEADER_BYTES: usize = 5 * 5 + 1;
+
+/// The header's bits byte.
+#[inline]
+fn header_bits(header: &RowHeader) -> u8 {
     let mut bits = 0;
     if header.wraps {
         bits |= HEADER_WRAPS;
@@ -242,7 +269,35 @@ pub(crate) fn write_header(out: &mut Vec<u8>, header: &RowHeader, runs: usize, m
     if header.clear {
         bits |= HEADER_CLEAR;
     }
-    out.push(bits);
+    bits
+}
+
+/// Append the first `len` bytes of `buf`. The whole array is copied (a fixed-size copy the
+/// compiler inlines, where a copy of a run-time length would call `memcpy`) and the rest is cut
+/// off again.
+#[inline(always)]
+fn put_fixed<const N: usize>(out: &mut Vec<u8>, buf: &[u8; N], len: usize) {
+    debug_assert!(len <= N);
+    let end = out.len() + len;
+    out.extend_from_slice(buf);
+    out.truncate(end);
+}
+
+/// Write the header into `buf` (see `write_header`) and return its length.
+#[inline]
+fn put_header(
+    buf: &mut [u8; MAX_HEADER_BYTES],
+    header: &RowHeader,
+    runs: usize,
+    marks: usize,
+) -> usize {
+    let mut n = put_varint(buf, 0, header.width as usize);
+    n = put_varint(buf, n, header.len as usize);
+    n = put_varint(buf, n, runs);
+    n = put_varint(buf, n, marks);
+    n = put_varint(buf, n, header.extras as usize);
+    buf[n] = header_bits(header);
+    n + 1
 }
 
 /// Read the header of the record at the start of `bytes` without decoding the row.
@@ -382,6 +437,12 @@ struct Style {
 }
 
 impl Style {
+    /// A cell with character `c` and this style.
+    #[inline(always)]
+    fn cell(&self, c: char) -> Cell {
+        Cell { c, fg: self.fg, bg: self.bg, flags: self.flags, extra: self.extra.clone() }
+    }
+
     #[inline]
     fn apply(&self, cell: &mut Cell) {
         cell.fg = self.fg;
@@ -519,18 +580,52 @@ fn mark_flags(bits: u8) -> Flags {
         .fold(Flags::empty(), |flags, (flag, _)| flags | *flag)
 }
 
-/// Whether `a` and `b` belong to the same run: everything but the character and the
-/// structural flags is equal, the extra by identity.
-#[inline]
-fn same_run(a: &Cell, b: &Cell) -> bool {
-    a.fg == b.fg
-        && a.bg == b.bg
-        && a.flags.difference(STRUCTURAL) == b.flags.difference(STRUCTURAL)
-        && match (&a.extra, &b.extra) {
-            (None, None) => true,
-            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
-            _ => false,
+/// The extra of a cell by identity, for comparing runs without touching the reference count.
+#[inline(always)]
+fn extra_ptr(extra: &Option<Arc<CellExtra>>) -> *const CellExtra {
+    extra.as_ref().map_or(std::ptr::null(), Arc::as_ptr)
+}
+
+/// What a run shares, read once per run so that the per-cell check compares plain values:
+/// colors, the non-structural flags and the extra by identity (see `RunKey::matches`).
+#[derive(Clone, Copy)]
+struct RunKey {
+    fg: Color,
+    bg: Color,
+    flags: Flags,
+    extra: *const CellExtra,
+}
+
+impl RunKey {
+    #[inline(always)]
+    fn of(cell: &Cell) -> Self {
+        Self {
+            fg: cell.fg,
+            bg: cell.bg,
+            flags: cell.flags.difference(STRUCTURAL),
+            extra: extra_ptr(&cell.extra),
         }
+    }
+
+    /// Whether `cell` belongs to this run: everything but the character and the structural
+    /// flags is equal, the extra by identity (`Arc::ptr_eq`). The comparisons do not
+    /// short-circuit, so the loop over a run has no data-dependent branch but its end.
+    #[inline(always)]
+    fn matches(&self, cell: &Cell) -> bool {
+        (cell.fg == self.fg)
+            & (cell.bg == self.bg)
+            & (cell.flags.difference(STRUCTURAL) == self.flags)
+            & std::ptr::eq(extra_ptr(&cell.extra), self.extra)
+    }
+}
+
+/// Full `Cell` equality, cheapest fields first and without short-circuiting them; the extras
+/// are compared by identity first and by value only when they are different `Arc`s (as
+/// `Arc`'s own `PartialEq` does).
+#[inline(always)]
+fn cell_eq(a: &Cell, b: &Cell) -> bool {
+    ((a.c == b.c) & (a.flags == b.flags) & (a.fg == b.fg) & (a.bg == b.bg))
+        && (std::ptr::eq(extra_ptr(&a.extra), extra_ptr(&b.extra)) || a.extra == b.extra)
 }
 
 #[inline]
@@ -542,19 +637,46 @@ fn write_char(out: &mut Vec<u8>, c: char) {
     }
 }
 
-/// Append colors, `flags` and the extra reference of `cell`, pushing its extra onto `extras`
-/// unless it is the entry this row pushed last.
+/// Append the UTF-8 text of `cells`, one character per cell. Text that is all ASCII (the common
+/// case) is one byte per cell, written in a single pass; otherwise character by character.
+#[inline]
+fn write_text(out: &mut Vec<u8>, cells: &[Cell]) {
+    let start = out.len();
+    let mut high = 0u32;
+    out.extend(cells.iter().map(|cell| {
+        high |= cell.c as u32;
+        cell.c as u8
+    }));
+    if high >= 0x80 {
+        out.truncate(start);
+        for cell in cells {
+            write_char(out, cell.c);
+        }
+    }
+}
+
+/// Append colors, `flags` and the extra reference of `cell` (prefixed by the run length
+/// `len`, when there is one) in one copy, pushing its extra onto `extras` unless it is the entry
+/// this row pushed last.
 #[inline]
 fn write_style(
     out: &mut Vec<u8>,
+    len: Option<usize>,
     cell: &Cell,
     flags: Flags,
     extras: &mut VecDeque<Arc<CellExtra>>,
     first_extra: usize,
 ) {
-    out.extend_from_slice(&pack_color(cell.fg));
-    out.extend_from_slice(&pack_color(cell.bg));
-    out.extend_from_slice(&flags.bits().to_le_bytes());
+    // A varint of a `usize` takes at most 10 bytes: length, 10 bytes of style, extra reference.
+    let mut buf = [0u8; 30];
+    let mut n = 0;
+    if let Some(len) = len {
+        n = put_varint(&mut buf, n, len);
+    }
+    buf[n..n + 4].copy_from_slice(&pack_color(cell.fg));
+    buf[n + 4..n + 8].copy_from_slice(&pack_color(cell.bg));
+    buf[n + 8..n + 10].copy_from_slice(&flags.bits().to_le_bytes());
+    n += 10;
     let reference = match &cell.extra {
         None => 0,
         Some(extra) => {
@@ -566,7 +688,21 @@ fn write_style(
             extras.len() - first_extra
         },
     };
-    write_varint(out, reference);
+    n = put_varint(&mut buf, n, reference);
+    put_fixed(out, &buf, n);
+}
+
+/// Write `value` as a varint into `buf` at `n`, returning the position after it.
+#[inline(always)]
+fn put_varint(buf: &mut [u8], mut n: usize, value: usize) -> usize {
+    let mut value = value as u64;
+    while value >= 0x80 {
+        buf[n] = (value as u8 & 0x7f) | 0x80;
+        value >>= 7;
+        n += 1;
+    }
+    buf[n] = value as u8;
+    n + 1
 }
 
 /// Decode a `Cell` record into `into` and return its length in bytes.
@@ -578,16 +714,31 @@ fn decode_cell_row(bytes: &[u8], extras: &[Arc<CellExtra>], into: &mut Row<Cell>
     let stored = header.len as usize;
     let cells = prepare_row(into, width);
 
-    for cell in &mut cells[..stored] {
-        cell.c = reader.char();
+    // Text that is all ASCII is exactly `stored` bytes, one per cell, so each run writes its
+    // cells whole in one pass. Otherwise the characters are decoded first and the runs keep
+    // them.
+    let text_start = reader.position();
+    let ascii = bytes.get(text_start..text_start + stored).filter(|text| text.is_ascii());
+    if ascii.is_some() {
+        reader.pos += stored;
+    } else {
+        for cell in &mut cells[..stored] {
+            cell.c = reader.char();
+        }
     }
 
     let mut col = 0;
     for _ in 0..runs {
         let len = reader.varint();
         let style = reader.style(extras);
-        for cell in &mut cells[col..col + len] {
-            style.apply(cell);
+        let run = &mut cells[col..col + len];
+        match ascii {
+            Some(text) => {
+                for (cell, &byte) in run.iter_mut().zip(&text[col..col + len]) {
+                    *cell = style.cell(char::from(byte));
+                }
+            },
+            None => run.iter_mut().for_each(|cell| *cell = style.cell(cell.c)),
         }
         col += len;
     }
@@ -602,11 +753,8 @@ fn decode_cell_row(bytes: &[u8], extras: &[Arc<CellExtra>], into: &mut Row<Cell>
 
     if width > 0 {
         let c = reader.char();
-        let style = reader.style(extras);
-        for cell in &mut cells[stored..] {
-            cell.c = c;
-            style.apply(cell);
-        }
+        let tail = reader.style(extras).cell(c);
+        cells[stored..].fill(tail);
     }
 
     reader.position()
@@ -673,63 +821,95 @@ impl HistoryCell for Cell {
             write_header(out, &header, 0, 0);
             return header;
         };
+        let width32 = u32::try_from(width).expect("row wider than u32::MAX cells");
 
         // `P`: cells from `occ` on all equal the tail (the `Row` invariant), so the scan for the
         // last differing cell starts there.
         let scan_end = row.occ.min(width - 1);
-        let stored = cells[..scan_end].iter().rposition(|cell| cell != tail).map_or(0, |i| i + 1);
+        let stored =
+            cells[..scan_end].iter().rposition(|cell| !cell_eq(cell, tail)).map_or(0, |i| i + 1);
         debug_assert!(
             cells[stored..].iter().all(|cell| cell == tail),
             "Row occ invariant broken: cells from occ on are not all equal"
         );
         let explicit = &cells[..stored];
 
-        // The body first; the header, whose counts are known only at the end, is moved in front
-        // of it afterwards.
-        for cell in explicit {
-            write_char(out, cell.c);
-        }
+        // The header's counts `R`, `M` and `E` are known only at the end. Each is at most
+        // `P + 1` (a run, a mark or an extra per stored cell, plus the tail's extra), so when
+        // that is below 128 each is one byte: the header goes first with placeholders that are
+        // patched at the end, and the body is written once, in place. Longer rows write the body
+        // first and move it up behind the header.
+        let counts_at = (stored < 0x7f).then(|| {
+            let mut head = [0; MAX_HEADER_BYTES];
+            let n = put_varint(&mut head, 0, width);
+            let n = put_varint(&mut head, n, stored);
+            put_fixed(out, &head, n + 4);
+            start + n
+        });
 
+        write_text(out, explicit);
+
+        // Runs, noting on the way whether any cell has a structural flag (most rows have none,
+        // and then the marks need no pass of their own).
         let mut runs = 0;
+        let mut any_flags = Flags::empty();
         let mut col = 0;
         while col < stored {
             let first = &explicit[col];
-            let len = explicit[col + 1..]
-                .iter()
-                .position(|cell| !same_run(cell, first))
-                .map_or(stored - col, |n| n + 1);
-            write_varint(out, len);
-            write_style(out, first, first.flags.difference(STRUCTURAL), extras, first_extra);
+            let key = RunKey::of(first);
+            let mut end = col + 1;
+            while end < stored && key.matches(&explicit[end]) {
+                any_flags |= explicit[end].flags;
+                end += 1;
+            }
+            any_flags |= first.flags;
+            write_style(out, Some(end - col), first, key.flags, extras, first_extra);
             runs += 1;
-            col += len;
+            col = end;
         }
 
         let mut marks = 0;
-        let mut previous = 0;
-        for (col, cell) in explicit.iter().enumerate() {
-            let bits = mark_bits(cell.flags);
-            if bits != 0 {
-                write_varint(out, col - previous);
-                out.push(bits);
-                previous = col;
-                marks += 1;
+        if any_flags.intersects(STRUCTURAL) {
+            let mut previous = 0;
+            for (col, cell) in explicit.iter().enumerate() {
+                let bits = mark_bits(cell.flags);
+                if bits != 0 {
+                    write_varint(out, col - previous);
+                    out.push(bits);
+                    previous = col;
+                    marks += 1;
+                }
             }
         }
 
         write_char(out, tail.c);
-        write_style(out, tail, tail.flags, extras, first_extra);
+        write_style(out, None, tail, tail.flags, extras, first_extra);
 
         let header = RowHeader {
-            width: u32::try_from(width).expect("row wider than u32::MAX cells"),
+            width: width32,
             wraps: tail.flags.contains(Flags::WRAPLINE),
             clear: tail.is_empty() && explicit.iter().all(GridCell::is_empty),
             extras: (extras.len() - first_extra) as u32,
             len: stored as u32,
         };
-        let body_end = out.len();
-        write_header(out, &header, runs, marks);
-        let header_len = out.len() - body_end;
-        out[start..].rotate_right(header_len);
+        match counts_at {
+            Some(at) => {
+                debug_assert!(runs < 0x80 && marks < 0x80 && header.extras < 0x80);
+                out[at] = runs as u8;
+                out[at + 1] = marks as u8;
+                out[at + 2] = header.extras as u8;
+                out[at + 3] = header_bits(&header);
+            },
+            None => {
+                // Move the body up by the header's length and write the header in front of it.
+                let mut head = [0; MAX_HEADER_BYTES];
+                let head_len = put_header(&mut head, &header, runs, marks);
+                let body_end = out.len();
+                out.extend_from_slice(&head[..head_len]);
+                out.copy_within(start..body_end, start + head_len);
+                out[start..start + head_len].copy_from_slice(&head[..head_len]);
+            },
+        }
 
         header
     }
@@ -1242,5 +1422,139 @@ mod tests {
                 extras.drain(..first_extra);
             }
         }
+    }
+
+    /// Rows around the header's one-byte-count limit: with `P + 1 < 128` the header is written
+    /// first and its counts patched at the end; from there on the body is written first and moved
+    /// up behind the header. Every count (`R`, `M`, `E`) at its largest: a different style, a
+    /// mark and a fresh extra on every stored cell.
+    #[test]
+    fn header_counts_at_one_byte_limit() {
+        for stored in [0, 1, 125, 126, 127, 128, 129, 200, 300] {
+            let width = stored + 1;
+            let mut row = Row::new(width);
+            for col in 0..stored {
+                let mut cell = Cell {
+                    c: if col % 3 == 0 { 'é' } else { 'a' },
+                    fg: Color::Indexed(col as u8),
+                    flags: if col % 2 == 0 { Flags::WIDE_CHAR } else { Flags::WIDE_CHAR_SPACER },
+                    ..Cell::default()
+                };
+                cell.push_zerowidth('\u{301}');
+                row[Column(col)] = cell;
+            }
+            let mut tail = Cell { c: 'z', ..Cell::default() };
+            tail.push_zerowidth('\u{302}');
+            row[Column(stored)] = tail;
+
+            let encoded = roundtrip(&row);
+            let layout = encoded.layout();
+            assert_eq!(encoded.header.len as usize, stored, "stored {stored}");
+            assert_eq!((layout.runs, layout.marks), (stored, stored), "stored {stored}");
+            assert_eq!(encoded.header.extras as usize, stored + 1, "stored {stored}");
+        }
+    }
+
+    /// The ASCII text path of the encoder and decoder against rows whose text is ASCII except
+    /// for one character anywhere, so the fallbacks run with every prefix length.
+    #[test]
+    fn text_ascii_and_fallback() {
+        for width in [1, 2, 3, 40] {
+            for at in 0..width {
+                for c in ['a', 'é', '中', '😀', '\u{7f}', '\u{80}'] {
+                    let mut row = Row::new(width);
+                    put_text(&mut row, 0, &"x".repeat(width), &Cell::default());
+                    row[Column(at)].c = c;
+                    roundtrip(&row);
+                }
+            }
+        }
+    }
+
+    /// `P` uses full `Cell` equality: cells whose extras are different `Arc`s with equal
+    /// contents equal the tail, as they did before the faster comparison.
+    #[test]
+    fn stored_cells_compare_extras_by_value() {
+        let mut row = Row::<Cell>::new(10);
+        for cell in &mut row[..] {
+            cell.push_zerowidth('\u{301}');
+        }
+        put_text(&mut row, 0, "ab", &Cell::default());
+        let encoded = roundtrip(&row);
+        assert_eq!(encoded.header.len, 2);
+        assert_eq!(encoded.header.extras, 1, "only the tail's extra");
+
+        // Runs still break on a different `Arc`, even with equal contents.
+        let mut row = Row::<Cell>::new(4);
+        for cell in &mut row[..][..2] {
+            cell.c = 'q';
+            cell.push_zerowidth('\u{301}');
+        }
+        assert_eq!(roundtrip(&row).layout().runs, 2);
+    }
+
+    /// Encode and decode cost of typical 126-column rows (`cargo test --release --lib
+    /// codec_timing -- --ignored --nocapture --test-threads=1`); a tool for tuning the codec,
+    /// not a gate (`benches/ingest.rs` and `benches/reads.rs` are).
+    #[test]
+    #[ignore]
+    fn codec_timing() {
+        use std::time::Instant;
+
+        let width = 126;
+        let mut uniform = Row::new(width);
+        uniform[..].fill(Cell::from(Color::Indexed(3)));
+        uniform.set_equal_from(0);
+        let mut plain = Row::<Cell>::new(width);
+        for (i, cell) in plain[..].iter_mut().enumerate() {
+            cell.c = char::from(b'a' + (i % 26) as u8);
+        }
+        let colored = |cells: usize, run: usize| {
+            let mut row = Row::new(width);
+            for i in 0..cells {
+                let fg = Color::Indexed((i / run) as u8);
+                row[Column(i)] = Cell { c: 'q', fg, ..Cell::default() };
+            }
+            row
+        };
+        let mut wide = Row::new(width);
+        for i in 0..width / 2 {
+            row_wide_pair(&mut wide, 2 * i);
+        }
+        let rows = [
+            ("uniform", uniform),
+            ("plain", plain),
+            ("short", colored(20, 10)),
+            ("log", colored(95, 16)),
+            ("dense", colored(width, 1)),
+            ("wide", wide),
+        ];
+
+        let n = 200_000;
+        for (name, row) in rows {
+            let mut out = Vec::with_capacity(1 << 16);
+            let mut extras = VecDeque::new();
+            let start = Instant::now();
+            for _ in 0..n {
+                out.clear();
+                Cell::encode(std::hint::black_box(&row), &mut out, &mut extras);
+            }
+            let encode = start.elapsed().as_nanos() as f64 / n as f64;
+            let mut into = Row::default();
+            let start = Instant::now();
+            for _ in 0..n {
+                decode_cell_row(std::hint::black_box(&out), &[], &mut into);
+            }
+            let decode = start.elapsed().as_nanos() as f64 / n as f64;
+            println!(
+                "{name:8} encode {encode:7.1} ns, decode {decode:7.1} ns, {} bytes",
+                out.len()
+            );
+        }
+    }
+
+    fn row_wide_pair(row: &mut Row<Cell>, col: usize) {
+        row[Column(col)] = Cell { c: '中', flags: Flags::WIDE_CHAR, ..Cell::default() };
+        row[Column(col + 1)] = Cell { flags: Flags::WIDE_CHAR_SPACER, ..Cell::default() };
     }
 }
