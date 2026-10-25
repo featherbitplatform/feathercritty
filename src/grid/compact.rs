@@ -106,6 +106,8 @@
 //! - Small fixed-size pieces (header, a run's style) are copied as whole arrays and cut back
 //!   (`put_fixed`), which the compiler inlines instead of calling `memcpy`.
 //! - The marks pass runs only when a stored cell has a structural flag.
+//! - Readers that need only the text of a plain row (`Term::line_to_string`) read it straight from
+//!   the record ([`plain_text`]), without decoding cells.
 //!
 //! `codec_timing` (an ignored test) prints the cost of typical rows for tuning.
 //!
@@ -766,6 +768,58 @@ fn decode_cell_row(bytes: &[u8], extras: &[Arc<CellExtra>], into: &mut Row<Cell>
     }
 
     reader.position()
+}
+
+/// A history row that is plain text, read straight from its `Cell` record without decoding
+/// cells (the text fast path of design spec 5.6/8, used by `Term::line_to_string` for selection
+/// and export). See [`plain_text`] for when a row qualifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PlainText<'a> {
+    /// The characters of the stored cells (`0..P`), one ASCII byte per cell.
+    pub(crate) text: &'a [u8],
+    /// The character of every cell from `P` to the end of the row (the tail), ASCII.
+    pub(crate) tail: u8,
+    /// Cells in the row.
+    pub(crate) width: usize,
+    /// The tail has `WRAPLINE`, so every cell from `P` on has it (the row wraps).
+    pub(crate) wraps: bool,
+}
+
+/// The row of the `Cell` record at the start of `bytes` as [`PlainText`], when it is: no marks
+/// (no wide-character flags and no `WRAPLINE` before the tail), no extras (no zero-width
+/// characters, hyperlinks or underline colors), ASCII text without tabs, and a tail that is ASCII,
+/// not a tab and has no wide-character flag. Its colors and style flags are not read. `None`
+/// otherwise; callers then decode the row.
+pub(crate) fn plain_text(bytes: &[u8]) -> Option<PlainText<'_>> {
+    let mut reader = RecordReader::new(bytes);
+    let Layout { header, runs, marks } = reader.layout();
+    if marks != 0 || header.extras != 0 || header.width == 0 {
+        return None;
+    }
+
+    let stored = header.len as usize;
+    let text = bytes.get(reader.pos..reader.pos + stored)?;
+    if !text.is_ascii() || text.contains(&b'\t') {
+        return None;
+    }
+    reader.pos += stored;
+    for _ in 0..runs {
+        reader.varint();
+        reader.skip_style();
+    }
+
+    let tail = reader.byte();
+    if tail >= 0x80 || tail == b'\t' {
+        return None;
+    }
+    reader.pos += 8;
+    let flags = Flags::from_bits_retain(u16::from_le_bytes(reader.array()));
+    if flags.intersects(STRUCTURAL.difference(Flags::WRAPLINE)) {
+        return None;
+    }
+
+    let width = header.width as usize;
+    Some(PlainText { text, tail, width, wraps: flags.contains(Flags::WRAPLINE) })
 }
 
 /// The cell at `column` of a `Cell` record, reading only the parts that describe it: the text
@@ -1517,6 +1571,72 @@ mod tests {
             cell.push_zerowidth('\u{301}');
         }
         assert_eq!(roundtrip(&row).layout().runs, 2);
+    }
+
+    /// Which rows `plain_text` reads straight from the record, and what it reads.
+    #[test]
+    fn plain_text_conditions() {
+        let plain = |row: &Row<Cell>| {
+            let bytes = roundtrip(row).bytes;
+            plain_text(&bytes).map(|p| (p.text.to_vec(), p.tail, p.width, p.wraps))
+        };
+
+        // Text, colors and style flags: plain.
+        let mut row = Row::new(12);
+        put_text(&mut row, 0, "ab ", &fg(Color::Indexed(3)));
+        put_text(&mut row, 3, "cd", &Cell { flags: Flags::BOLD, ..Cell::default() });
+        assert_eq!(plain(&row), Some((b"ab cd".to_vec(), b' ', 12, false)));
+
+        // A wrapping row: the tail carries `WRAPLINE`.
+        let mut wrapping = Row::new(4);
+        put_text(&mut wrapping, 0, "wxyz", &Cell::default());
+        wrapping[Column(3)].flags.insert(Flags::WRAPLINE);
+        assert_eq!(plain(&wrapping), Some((b"wxy".to_vec(), b'z', 4, true)));
+
+        // A background-colored tail of another character.
+        let mut tail = Row::new(5);
+        tail[..].fill(Cell { c: '-', bg: Color::Indexed(1), ..Cell::default() });
+        put_text(&mut tail, 0, "a", &Cell::default());
+        assert_eq!(plain(&tail), Some((b"a".to_vec(), b'-', 5, false)));
+
+        // Not plain: a tab (text or tail), a non-ASCII character (text or tail), a zero-width
+        // character, a hyperlink, a wide character, a structural flag on a stored cell, a leading
+        // wide-character spacer in the tail.
+        let mut cases = Vec::new();
+        for text in ["a\tb", "aéb"] {
+            let mut row = Row::new(6);
+            put_text(&mut row, 0, text, &Cell::default());
+            cases.push(row);
+        }
+        for c in ['\t', 'é'] {
+            let mut row = Row::new(6);
+            row[..].fill(Cell { c, ..Cell::default() });
+            put_text(&mut row, 0, "a", &Cell::default());
+            cases.push(row);
+        }
+        let mut zero_width = Row::new(6);
+        put_text(&mut zero_width, 0, "e", &Cell::default());
+        zero_width[Column(0)].push_zerowidth('\u{301}');
+        cases.push(zero_width);
+        let mut link = Cell::default();
+        link.set_hyperlink(Some(Hyperlink::new(Some("l"), "https://e".into())));
+        let mut linked = Row::new(6);
+        put_text(&mut linked, 0, "go", &link);
+        cases.push(linked);
+        let mut wide = Row::new(6);
+        row_wide_pair(&mut wide, 0);
+        cases.push(wide);
+        let mut marked = Row::new(6);
+        put_text(&mut marked, 0, "abc", &Cell::default());
+        marked[Column(1)].flags.insert(Flags::WRAPLINE);
+        cases.push(marked);
+        let mut leading = Row::new(6);
+        put_text(&mut leading, 0, "abcde", &Cell::default());
+        leading[Column(5)].flags.insert(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+        cases.push(leading);
+        for (i, row) in cases.iter().enumerate() {
+            assert_eq!(plain(row), None, "case {i}");
+        }
     }
 
     /// Encode and decode cost of typical 126-column rows (`cargo test --release --lib

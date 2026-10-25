@@ -93,9 +93,10 @@
 use std::collections::VecDeque;
 use std::{fmt, mem};
 
-use crate::grid::compact::read_header;
+use crate::grid::compact::{self, PlainText, read_header};
 use crate::grid::{Dimensions, Grid, HistoryCell, Row};
 use crate::index::{Column, Line};
+use crate::term::cell::Cell;
 
 /// Size of a history block in bytes, unless a test asks for another one.
 pub(crate) const DEFAULT_BLOCK_BYTES: usize = 64 * 1024;
@@ -575,6 +576,15 @@ impl<T: HistoryCell> History<T> {
             self.spares.reserve_exact(MAX_SPARES);
         }
         self.spares.push(bytes);
+    }
+}
+
+impl History<Cell> {
+    /// Row `i` (0 is the newest) as plain text read straight from its record, when it
+    /// qualifies (see `compact::plain_text`); `None` when it does not or is not there.
+    pub(crate) fn plain_text(&self, i: usize) -> Option<PlainText<'_>> {
+        let pos = self.position(i)?;
+        compact::plain_text(self.record(self.index[pos]))
     }
 }
 

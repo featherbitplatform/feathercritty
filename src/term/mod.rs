@@ -16,7 +16,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
-use crate::grid::{Dimensions, Grid, GridIterator, RowReader, Scroll};
+use crate::grid::{Dimensions, Grid, GridIterator, PlainText, RowReader, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
 use crate::term::cell::{Cell, Flags, LineLength};
@@ -590,6 +590,64 @@ impl<T> Term<T> {
     /// The caller keeps one reader across lines so the copies reuse one allocation. If upstream
     /// adds a grid read here, read it from `grid_line` or `self.grid.cell`.
     fn line_to_string(
+        &self,
+        reader: &mut RowReader<Cell>,
+        line: Line,
+        cols: Range<Column>,
+        include_wrapped_wide: bool,
+    ) -> String {
+        // feathercritty: text fast path (no upstream counterpart). A history row that is plain
+        // text (`Grid::history_plain_text`) is read straight from its record instead of being
+        // decoded into cells; `plain_line_to_string` gives the same result as the body below.
+        if let Some(plain) = self.grid.history_plain_text(line) {
+            return self.plain_line_to_string(plain, cols);
+        }
+
+        self.cells_line_to_string(reader, line, cols, include_wrapped_wide)
+    }
+
+    /// `line_to_string` for a history row that is plain text (see `compact::plain_text`).
+    ///
+    /// feathercritty addition. It is upstream's `line_to_string` (below, as
+    /// `cells_line_to_string`) reduced to what can happen on such a row: no cell is a
+    /// wide-character spacer or a tab and none has zero-width characters, so the column range is
+    /// never widened, nothing is skipped and every cell adds its character; only cells from `P` on
+    /// (the tail) can have `WRAPLINE`; no cell is a leading wide-character spacer, so the line
+    /// above is never read. When merging upstream: if `line_to_string`, `LineLength` or the
+    /// spacer handling change, change this to match or narrow `compact::plain_text`; the
+    /// differential test and `plain_line_to_string_matches_cells` check them against each other.
+    fn plain_line_to_string(&self, row: PlainText<'_>, cols: Range<Column>) -> String {
+        let PlainText { text, tail, width, wraps } = row;
+        let stored = text.len();
+
+        // `LineLength::line_length`: the whole row when its last cell wraps, else up to its last
+        // cell that is not a space.
+        let length = if wraps || tail != b' ' {
+            width
+        } else {
+            text.iter().rposition(|&c| c != b' ').map_or(0, |i| i + 1)
+        };
+        let line_length = cmp::min(length, cols.end.0 + 1);
+
+        let mut line = String::new();
+        let start = cols.start.0;
+        if start < line_length {
+            let head = &text[start.min(stored)..line_length.min(stored)];
+            line.push_str(str::from_utf8(head).expect("plain history text is ASCII"));
+            line.extend((start.max(stored)..line_length).map(|_| char::from(tail)));
+        }
+
+        // Upstream checks `WRAPLINE` on the last cell taken. With `cols` reaching the last
+        // column, a wrapping row is taken whole, so that cell is the tail's.
+        if cols.end >= self.columns() - 1 && (line_length == 0 || !wraps) {
+            line.push('\n');
+        }
+
+        line
+    }
+
+    /// `line_to_string` for any line, through its cells (upstream's body).
+    fn cells_line_to_string(
         &self,
         reader: &mut RowReader<Cell>,
         line: Line,
@@ -3369,6 +3427,71 @@ mod tests {
         term.title = Some("Test".into());
         term.set_title(None);
         assert_eq!(term.title, None);
+    }
+
+    /// The text fast path (`plain_line_to_string`) gives exactly what reading the cells
+    /// (`cells_line_to_string`) gives, for every history row that takes it, over random column
+    /// ranges; rows with tabs, wide characters, zero-width characters, hyperlinks, colored and
+    /// wrapping tails make sure the conditions of `compact::plain_text` are exercised both ways.
+    #[test]
+    fn plain_line_to_string_matches_cells() {
+        use rand::{Rng, SeedableRng};
+        use rand_chacha::ChaCha8Rng;
+
+        use crate::vte::ansi::Processor;
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0x7e47);
+        let pieces: [&[u8]; 14] = [
+            b"plain words  ",
+            b"   ",
+            b"\t",
+            b"\x1b[31mred\x1b[0m",
+            b"\x1b[1;4mbold\x1b[0m",
+            b"\x1b[44m\x1b[K",
+            b"\x1b[42mx\x1b[0m",
+            "\u{4e2d}\u{6587}".as_bytes(),
+            "e\u{301}".as_bytes(),
+            b"\x1b]8;;https://e\x1b\\link\x1b]8;;\x1b\\",
+            b"\x1b[58;5;3m\x1b[4munder\x1b[0m",
+            b"0123456789",
+            b"\r\n",
+            b"\r\n",
+        ];
+        // At least 2 columns: a wide character does not fit in one (upstream panics there).
+        for columns in [2, 3, 7, 20, 33] {
+            let size = TermSize::new(columns, 4);
+            let config = Config { scrolling_history: 400, ..Config::default() };
+            let mut term = Term::new(config, &size, VoidListener);
+            let mut parser: Processor = Processor::new();
+            for _ in 0..1500 {
+                parser.advance(&mut term, pieces[rng.gen_range(0..pieces.len())]);
+            }
+            assert!(term.history_size() > 100);
+
+            let (mut plain, mut other) = (0, 0);
+            let mut reader = RowReader::new();
+            for line in (term.topmost_line().0..0).map(Line) {
+                let Some(row) = term.grid.history_plain_text(line) else {
+                    other += 1;
+                    continue;
+                };
+                plain += 1;
+                for _ in 0..4 {
+                    let start = Column(rng.gen_range(0..columns));
+                    let end = Column(rng.gen_range(start.0..columns));
+                    let wide = rng.r#gen();
+                    let expected = term.cells_line_to_string(&mut reader, line, start..end, wide);
+                    let fast = term.plain_line_to_string(row, start..end);
+                    assert_eq!(
+                        fast, expected,
+                        "{columns} columns, line {}, {start:?}..{end:?}",
+                        line.0
+                    );
+                    assert_eq!(term.line_to_string(&mut reader, line, start..end, wide), expected);
+                }
+            }
+            assert!(plain > 10 && other > 10, "{columns} columns: {plain} plain, {other} other");
+        }
     }
 
     #[test]

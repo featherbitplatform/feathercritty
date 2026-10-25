@@ -6,7 +6,7 @@ use std::cmp::{max, min};
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
 
 use crate::index::{Column, Line, Point};
-use crate::term::cell::{Flags, ResetDiscriminant};
+use crate::term::cell::{Cell, Flags, ResetDiscriminant};
 use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
 mod compact;
@@ -20,6 +20,7 @@ mod tests;
 // feathercritty: the history and its read API (see `history.rs`), and the trait for cells it
 // stores, next to their row codec (see `compact.rs`).
 pub use self::compact::HistoryCell;
+pub(crate) use self::compact::PlainText;
 pub use self::history::{History, RowReader};
 pub use self::row::Row;
 use self::storage::Storage;
@@ -725,6 +726,20 @@ impl<T: HistoryCell> Grid<T> {
         } else {
             self.history.is_clear((-line.0 - 1) as usize)
         }
+    }
+}
+
+impl Grid<Cell> {
+    /// History line `line` as plain text read straight from its record, without decoding its
+    /// cells (feathercritty: the text fast path; see `compact::plain_text` for which rows
+    /// qualify). `None` for a screen line, a line outside the grid, or a row that does not
+    /// qualify; read those through [`RowReader`].
+    #[inline]
+    pub(crate) fn history_plain_text(&self, line: Line) -> Option<PlainText<'_>> {
+        if line.0 >= 0 || line < self.topmost_line() {
+            return None;
+        }
+        self.history.plain_text((-line.0 - 1) as usize)
     }
 }
 
