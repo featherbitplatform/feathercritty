@@ -237,6 +237,20 @@ impl<T> Term<T> {
         let match_start = self.regex_search(start, end, &mut regex.left_fdfa)?;
         let match_end = self.regex_search(match_start, start, &mut regex.left_rdfa)?;
 
+        // feathercritty: as in `regex_search_right`, a search from `end` to itself whose first
+        // fullwidth skip leaves `end` (a wide char's spacer) reads on around the buffer, and
+        // upstream returned whatever it found there. We keep the glyph completion at `end` (a
+        // wrapped wide char is reported at its leading spacer, `expand_wide`) and return none
+        // for a match starting further than that. Both searches run as upstream runs them.
+        // When merging upstream: if upstream bounds its matches by `end` itself, drop this.
+        let to_match = self.search_distance(start, match_start, Direction::Left);
+        if to_match > self.search_distance(start, end, Direction::Left) {
+            let glyph_end = self.expand_wide(end, Direction::Left);
+            if to_match > self.search_distance(start, glyph_end, Direction::Left) {
+                return None;
+            }
+        }
+
         Some(match_start..=match_end)
     }
 
@@ -268,7 +282,7 @@ impl<T> Term<T> {
         let to_end = self.search_distance(start, end, Direction::Right);
         let to_match = self.search_distance(start, match_end, Direction::Right);
         if to_match > to_end {
-            let glyph_end = self.expand_wide(end, Direction::Right);
+            let glyph_end = self.glyph_end(end);
             if to_match > self.search_distance(start, glyph_end, Direction::Right)
                 || self.search_distance(start, match_start, Direction::Right) > to_end
             {
@@ -340,7 +354,9 @@ impl<T> Term<T> {
         // `start` to `end` the search is on or past `end` and stops there. When `start == end`
         // and the first fullwidth skip leaves it, upstream reads around the whole buffer back to
         // `end`, so that case gets one full lap. Where upstream stops without passing `end`, it
-        // stops before this bound, so results there are unchanged.
+        // stops before this bound, so results there are unchanged. Only cell advances count:
+        // the `continue 'outer` retry after an empty match feeds the same character again
+        // without advancing, at most once per character, so it does not decrement.
         // When merging upstream: keep this bound unless upstream bounds the loop itself.
         let mut steps_left = match self.search_distance(start, end, regex.direction) {
             0 => self.total_lines() * self.columns(),
@@ -536,6 +552,21 @@ impl<T> Term<T> {
         };
 
         distance.rem_euclid(total.max(1)) as usize
+    }
+
+    /// The last cell of the character at `end` as a rightward search reads it: `expand_wide`,
+    /// except that a leading spacer on the bottommost line stays put (`expand_wide` would
+    /// return a point below the grid).
+    ///
+    /// feathercritty: not in upstream; see `regex_search_right` and `RegexIter::next`.
+    fn glyph_end(&self, end: Point) -> Point {
+        if end.line >= self.bottommost_line()
+            && self.grid[end].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            end
+        } else {
+            self.expand_wide(end, Direction::Right)
+        }
     }
 
     /// Whether `end` is a stale leading spacer: its next line does not start with a wide char
@@ -853,7 +884,7 @@ impl<T> Iterator for RegexIter<'_, T> {
         // `wrapped_wide_fuzz`; if they pass without this, drop it.
         let past_end = match self.direction {
             Direction::Right => {
-                let glyph_end = self.term.expand_wide(self.end, Direction::Right);
+                let glyph_end = self.term.glyph_end(self.end);
                 let origin_in_glyph = origin == glyph_end
                     || self.term.skips_over(self.end, glyph_end, origin, Direction::Right);
                 self.point == glyph_end && !origin_in_glyph
@@ -877,9 +908,22 @@ impl<T> Iterator for RegexIter<'_, T> {
         // by the size of its range. Where upstream's origins stay inside the range they always
         // move forward, so results there are unchanged.
         // When merging upstream: keep this bound unless upstream bounds `RegexIter` itself.
+        //
+        // A new origin that is not further than the last one (a match next to a stale spacer
+        // that ends past its origin, see `stale_spacer_match_past_origin`) does not stop the
+        // iterator, which would drop the rest of the range: the next search starts one cell past
+        // the last origin instead. Origins still move forward by at least one cell per match.
         if !self.done {
-            let travelled = self.term.search_distance(self.start, self.point, self.direction);
-            if travelled <= self.travelled || travelled > self.end_distance {
+            let mut travelled = self.term.search_distance(self.start, self.point, self.direction);
+            if travelled <= self.travelled {
+                travelled = self.travelled + 1;
+                self.point = match self.direction {
+                    Direction::Right => origin.add(self.term, Boundary::None, 1),
+                    Direction::Left => origin.sub(self.term, Boundary::None, 1),
+                };
+            }
+
+            if travelled > self.end_distance {
                 self.done = true;
             } else {
                 self.travelled = travelled;
@@ -1706,6 +1750,24 @@ mod tests {
         }
     }
 
+    /// Whether both ends of `m` lie in the range a search from `start` to `end` in `direction`
+    /// covers, allowing the documented glyph completion: the character at `end` is read whole
+    /// (up to two cells past `end`), and the second search, back to `start`, completes the
+    /// character at `start` (up to two cells behind `start`).
+    fn in_search_range(
+        term: &Term<VoidListener>,
+        start: Point,
+        end: Point,
+        direction: Direction,
+        m: &Match,
+    ) -> bool {
+        let to_end = term.search_distance(start, end, direction);
+        [*m.start(), *m.end()].into_iter().all(|point| {
+            term.search_distance(start, point, direction) <= to_end + 2
+                || term.search_distance(point, start, direction) <= 2
+        })
+    }
+
     /// One grid of `wrapped_wide_fuzz`: `lines` lines in all, the first `history` of them in the
     /// scrollback.
     fn wrapped_wide_fuzz_grid(
@@ -1768,14 +1830,28 @@ mod tests {
                     let case = format!("{grid} pattern {pattern:?} {start:?} -> {end:?}");
                     let _ = tx.send(case.clone());
 
-                    term.regex_search_left(&mut regex, start, end);
-                    term.regex_search_right(&mut regex, start, end);
+                    let left = term.regex_search_left(&mut regex, start, end);
+                    let right = term.regex_search_right(&mut regex, start, end);
+                    for (direction, found) in [(Direction::Left, left), (Direction::Right, right)] {
+                        if let Some(m) = found {
+                            assert!(
+                                in_search_range(&term, start, end, direction, &m),
+                                "match outside the range: {case} {direction:?} {m:?}"
+                            );
+                        }
+                    }
 
                     for direction in [Direction::Left, Direction::Right] {
-                        let count = RegexIter::new(start, end, direction, &term, &mut regex)
+                        let matches = RegexIter::new(start, end, direction, &term, &mut regex)
                             .take(cap)
-                            .count();
-                        assert!(count < cap, "RegexIter cycled: {case} {direction:?}");
+                            .collect::<Vec<_>>();
+                        assert!(matches.len() < cap, "RegexIter cycled: {case} {direction:?}");
+                        for m in &matches {
+                            assert!(
+                                in_search_range(&term, start, end, direction, m),
+                                "RegexIter match outside the range: {case} {direction:?} {m:?}"
+                            );
+                        }
                     }
                 }
 
@@ -1882,6 +1958,111 @@ mod tests {
 
         assert!(result.0.len() < 10, "RegexIter cycled: {:?}", result.0);
         assert!(result.1.is_some());
+    }
+
+    #[test]
+    fn stale_leading_spacer_seed_500() {
+        // The literal grid of differential soak seed 500, step 170: 2 columns, 66 lines of
+        // scrollback, stale leading spacers among wrapped wide chars. `RegexIter` cycled.
+        let result = terminates("search_next on the seed 500 grid", || {
+            #[rustfmt::skip]
+            let term = term_from_rows(66, &[
+                ("ec", ".r"),
+                ("e ", ".L"),
+                ("日 ", "WS"),
+                ("$C", ".r"),
+                (":\\", ".r"),
+                ("di", ".r"),
+                ("rz", ".r"),
+                ("6Ø", ".r"),
+                ("<t", ".r"),
+                ("ag", ".r"),
+                (">(", ".r"),
+                ("ju", ".r"),
+                ("mp", ".r"),
+                ("s)", ".r"),
+                ("(G", ".r"),
+                ("wj", ".r"),
+                ("ス ", "WS"),
+                ("~V", ".r"),
+                ("ł ", ".L"),
+                ("本 ", "WS"),
+                ("q ", ".L"),
+                ("本 ", "WS"),
+                ("1!", ".r"),
+                (") ", ".L"),
+                ("👍 ", "WS"),
+                ("🏽 ", "WS"),
+                ("?{", ".r"),
+                ("( ", ".L"),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("d ", ".L"),
+                ("字 ", "WS"),
+                ("W ", ".L"),
+                ("⚡ ", "WS"),
+                ("R)", ".r"),
+                ("{}", ".r"),
+                ("y ", ".L"),
+                ("本 ", "WS"),
+                ("ΩK", ".r"),
+                ("e ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("👨 ", "WS"),
+                ("👩 ", "WS"),
+                ("👧 ", "WS"),
+                ("çs", ".r"),
+                ("rc", ".r"),
+                ("/m", ".r"),
+                ("ai", ".r"),
+                ("n.", ".r"),
+                ("rs", ".r"),
+                ("x=", ".r"),
+                ("1;", ".r"),
+                ("字 ", "WS"),
+                ("< ", ".L"),
+                ("日 ", "WS"),
+                ("│|", ".r"),
+                ("pi", ".r"),
+                ("pe", ".r"),
+                ("|l", ".r"),
+                ("az", ".r"),
+                ("y ", ".L"),
+                ("語 ", "WS"),
+                ("{k", ".r"),
+                ("ey", ".r"),
+                (": ", ".r"),
+                ("v}", ".r"),
+                ("Eu", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+                ("  ", ".."),
+            ]);
+            let mut regex = RegexSearch::new(" ").unwrap();
+            let origin = Point::new(Line(-41), Column(1));
+            term.search_next(&mut regex, origin, Direction::Left, Side::Right, Some(9))
+        });
+
+        assert!(result.is_some());
     }
 
     /// A grid from rows of (cell chars, cell flags), the first `history` rows in the scrollback.
@@ -2067,5 +2248,35 @@ mod tests {
         let result = term.search_next(&mut regex, start, Direction::Left, Side::Right, Some(0));
         let result = result.unwrap();
         assert_eq!((result.start().line, result.end().line), (Line(1), Line(1)));
+    }
+
+    #[test]
+    fn stale_spacer_match_past_origin() {
+        // Going left from (3,2), the search from the stale leading spacer at (2,2) reads (3,0) in
+        // its place, so that match ends at (3,1), past its origin but inside the range. The next
+        // origin then lay behind the previous one; 0.26.0 cycled there, and the first version of
+        // the progress check stopped and dropped the blank at (0,1).
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("x x", "..."),
+            ("abc", "..."),
+            ("ab ", "..L"),
+            (" cd", "..."),
+            ("abc", "..."),
+        ]);
+        let mut regex = RegexSearch::new(" ").unwrap();
+        let start = Point::new(Line(3), Column(2));
+        let end = Point::new(Line(0), Column(0));
+        let matches = RegexIter::new(start, end, Direction::Left, &term, &mut regex)
+            .take(20)
+            .collect::<Vec<_>>();
+
+        let blank = Point::new(Line(0), Column(1));
+        assert!(matches.len() < 20, "RegexIter cycled: {matches:?}");
+        assert!(matches.contains(&(blank..=blank)), "{matches:?}");
+        assert_eq!(
+            matches.first(),
+            Some(&(Point::new(Line(3), Column(0))..=Point::new(Line(3), Column(0))))
+        );
     }
 }
