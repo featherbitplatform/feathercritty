@@ -5,13 +5,16 @@
 //! expose the same API here.
 
 use std::collections::HashMap;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use super::k;
 use k::event::VoidListener;
 use k::grid::{Dimensions, Scroll};
 use k::index::{Boundary, Column, Direction, Line, Point, Side as KSide};
 use k::selection::{Selection, SelectionType};
-use k::term::cell::Cell;
+use k::term::cell::{Cell, Flags};
 use k::term::search::{RegexIter, RegexSearch};
 use k::term::test::TermSize;
 use k::term::{Config, Term};
@@ -19,7 +22,7 @@ use k::vi_mode::{ViModeCursor, ViMotion};
 use k::vte::ansi::Processor;
 
 use crate::support::project::{
-    CellP, CursorP, LinkP, Panicked, QAns, QueryPlan, Snapshot, VI_MOTIONS,
+    CellP, CursorP, LinkP, Panicked, QAns, QueryPlan, SearchQ, Snapshot, VI_MOTIONS,
 };
 use crate::support::{Pt, SelTy, Start, Step, catch};
 
@@ -105,22 +108,15 @@ fn cell_p(cell: &Cell, ids: &mut HashMap<String, usize>, index: Option<usize>) -
     }
 }
 
-/// Whether `Term::search_next` returns for these arguments.
-///
-/// Workaround for a 0.26.0 bug: its match iterator (`RegexIter`) can cycle between two matches
-/// forever (seen next to a `LEADING_WIDE_CHAR_SPACER` at the end of a line). This walks the same
-/// iterator `search_next` walks, with the same start, end and stop condition copied from
-/// upstream `next_match_left/right` (re-check them when the oracle moves to a new release), but
-/// gives up after more matches than the grid has cells. Remove it once upstream fixes the
-/// cycle.
-fn search_terminates(
+/// Origin (after `expand_wide`), start and end of the range `Term::search_next` searches, and
+/// whether `max_lines` bounds it. Copied from upstream `search_next` and `next_match_left/right`;
+/// re-check against the source when the oracle moves to a new release.
+fn search_bounds(
     term: &Term<VoidListener>,
-    regex: &mut RegexSearch,
     origin: Point,
     direction: Direction,
-    side: KSide,
     max_lines: Option<usize>,
-) -> bool {
+) -> (Point, Point, Point, bool) {
     let origin = term.expand_wide(origin, direction);
     let max_lines = max_lines.filter(|max_lines| max_lines + 1 < term.total_lines());
     let (start, end) = match direction {
@@ -146,6 +142,26 @@ fn search_terminates(
             (start, end)
         },
     };
+    (origin, start, end, max_lines.is_some())
+}
+
+/// Whether `Term::search_next` returns for these arguments.
+///
+/// Workaround for a 0.26.0 bug, still needed on the oracle side: 0.26.0's match iterator
+/// (`RegexIter`) can cycle between two matches forever (next to a `LEADING_WIDE_CHAR_SPACER` at
+/// the end of a line). This walks the same iterator `search_next` walks, with the same start, end
+/// and stop condition (`search_bounds`), but gives up after more matches than the grid has cells.
+/// feathercritty fixed the cycle (fork change 5), so on its side this always returns `true`;
+/// remove it once the oracle release fixes the cycle too.
+fn search_terminates(
+    term: &Term<VoidListener>,
+    regex: &mut RegexSearch,
+    origin: Point,
+    direction: Direction,
+    side: KSide,
+    max_lines: Option<usize>,
+) -> bool {
+    let (origin, start, end, _) = search_bounds(term, origin, direction, max_lines);
 
     let limit = term.total_lines() * term.columns() + 2;
     let mut matches = RegexIter::new(start, end, direction, term, regex);
@@ -295,6 +311,194 @@ impl Side {
         }
     }
 
+    /// Run `search` with `max_lines`. With `probe`, first check with `search_terminates` that
+    /// it returns (the 0.26.0 workaround); without, call `search_next` directly, which only the
+    /// feathercritty side may do for windows 0.26.0 cannot search.
+    pub fn search(&self, search: &SearchQ, max_lines: Option<usize>, probe: bool) -> QAns {
+        let term = &self.term;
+        let direction = if search.right { Direction::Right } else { Direction::Left };
+        let (origin, side) = (self.point(search.origin), side(search.side_right));
+        guarded(|| match RegexSearch::new(&search.pattern) {
+            Ok(mut regex) => {
+                if probe && !search_terminates(term, &mut regex, origin, direction, side, max_lines)
+                {
+                    return QAns::NoTermination;
+                }
+                let found = term.search_next(&mut regex, origin, direction, side, max_lines);
+                QAns::Match(found.map(|m| (pt(*m.start()), pt(*m.end()))))
+            },
+            Err(_) => QAns::Text(None),
+        })
+    }
+
+    /// Run `search` with `max_lines` on a copy of this terminal's grid on another thread, and
+    /// answer [`QAns::NoTermination`] if it has not returned after `timeout` (the thread is
+    /// left running). Used for searches 0.26.0 cannot run (fork change 5), so a feathercritty
+    /// search that does not terminate fails the test with its seed instead of hanging it.
+    /// Search reads only the grid, so a fresh `Term` holding a clone of it searches the same.
+    pub fn search_detached(
+        &self,
+        search: &SearchQ,
+        max_lines: Option<usize>,
+        timeout: Duration,
+    ) -> QAns {
+        let grid = self.term.grid().clone();
+        let size = TermSize::new(grid.columns(), grid.screen_lines());
+        let mut term = Term::new(Config::default(), &size, VoidListener);
+        *term.grid_mut() = grid;
+        let side = Side { term, parser: Processor::new(), kitty: false };
+        let search = search.clone();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(side.search(&search, max_lines, false));
+        });
+        rx.recv_timeout(timeout).unwrap_or(QAns::NoTermination)
+    }
+
+    /// The cells of the character at `p`: a wide character with its spacer, plus the leading
+    /// spacer on the previous line when it wrapped.
+    fn glyph(&self, p: Point) -> Vec<Point> {
+        let grid = self.term.grid();
+        let last = grid.last_column();
+        let top = grid.topmost_line();
+        let bottom = grid.bottommost_line();
+        let flags = |p: Point| grid[p].flags;
+
+        let mut wide = p;
+        if flags(p).contains(Flags::LEADING_WIDE_CHAR_SPACER) && p.line < bottom {
+            wide = Point::new(p.line + 1, Column(0));
+        } else if flags(p).contains(Flags::WIDE_CHAR_SPACER) && p.column.0 > 0 {
+            wide = Point::new(p.line, p.column - 1);
+        }
+        let mut cells = vec![p, wide];
+        if flags(wide).contains(Flags::WIDE_CHAR) {
+            if wide.column < last {
+                cells.push(Point::new(wide.line, wide.column + 1));
+            }
+            let above = Point::new(wide.line - 1, last);
+            if wide.column.0 == 0
+                && wide.line > top
+                && flags(above).contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                cells.push(above);
+            }
+        }
+        cells
+    }
+
+    /// Whether the character at `p` overlaps the range `search_next` searches for `search`
+    /// with `max_lines` (walked cell by cell from its start to its end, wrapping around the
+    /// buffer as the search does).
+    fn in_search_range(&self, search: &SearchQ, max_lines: Option<usize>, p: Pt) -> bool {
+        let term = &self.term;
+        let direction = if search.right { Direction::Right } else { Direction::Left };
+        let (_, start, end, bounded) =
+            search_bounds(term, self.point(search.origin), direction, max_lines);
+        if !bounded {
+            return true;
+        }
+        let glyph = self.glyph(self.point(p));
+        let mut point = start;
+        for _ in 0..=term.total_lines() * term.columns() {
+            if glyph.contains(&point) {
+                return true;
+            }
+            if point == end {
+                return false;
+            }
+            point = match direction {
+                Direction::Right => point.add(term, Boundary::None, 1),
+                Direction::Left => point.sub(term, Boundary::None, 1),
+            };
+        }
+        false
+    }
+
+    /// Whether the cells from `start` to `end` (grid order) spell a match of `pattern` as
+    /// `RegexSearch` reads them: the characters of all but spacer cells, only across wrapped
+    /// line ends, with smart case (case insensitive unless the pattern has an uppercase letter).
+    fn is_real_match(&self, pattern: &str, start: Pt, end: Pt) -> Result<(), String> {
+        let grid = self.term.grid();
+        let (start, end) = (self.point(start), self.point(end));
+        if start > end {
+            return Err(format!("match start {start:?} after its end {end:?}"));
+        }
+        let mut text = String::new();
+        let mut point = start;
+        let mut skip_next = false;
+        loop {
+            let cell = &grid[point];
+            // `regex_search_internal` reads a wide character and steps over the cell after it
+            // (whatever its flags), and steps over leading spacers.
+            if skip_next {
+                skip_next = false;
+            } else if !cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                text.push(cell.c);
+                skip_next =
+                    cell.flags.contains(Flags::WIDE_CHAR) && point.column < grid.last_column();
+            }
+            if point == end {
+                break;
+            }
+            if point.column == grid.last_column() && !cell.flags.contains(Flags::WRAPLINE) {
+                return Err(format!("match crosses the unwrapped end of line {}", point.line.0));
+            }
+            point = point.add(grid, Boundary::Grid, 1);
+        }
+
+        let case_insensitive = !pattern.chars().any(char::is_uppercase);
+        let regex = regex_automata::meta::Regex::builder()
+            .syntax(regex_automata::util::syntax::Config::new().case_insensitive(case_insensitive))
+            .build(&format!(r"\A(?:{pattern})\z"))
+            .map_err(|err| err.to_string())?;
+        if regex.is_match(&text) {
+            Ok(())
+        } else {
+            Err(format!("{text:?} does not match {pattern:?}"))
+        }
+    }
+
+    /// Check a `search_next` answer without an oracle (used on the feathercritty side where
+    /// 0.26.0 cannot answer, fork change 5): it must have terminated, and a match must overlap
+    /// the searched range at both ends and be a real match of the pattern. `Match(None)` is
+    /// accepted (absence is not checked).
+    pub fn check_search(
+        &self,
+        search: &SearchQ,
+        max_lines: Option<usize>,
+        answer: &QAns,
+    ) -> Result<(), String> {
+        match answer {
+            QAns::Match(None) => Ok(()),
+            QAns::Match(Some((start, end))) => {
+                for p in [start, end] {
+                    if !self.in_search_range(search, max_lines, *p) {
+                        return Err(format!("match end {p:?} lies outside the searched range"));
+                    }
+                }
+                self.is_real_match(&search.pattern, *start, *end)
+            },
+            other => Err(format!("expected a search result, got {other:?}")),
+        }
+    }
+
+    /// Whether a 0.26.0 `search_next` answer is one fork change 5 may change: the search did
+    /// not terminate, or its match lies (at least partly) outside the searched range because
+    /// 0.26.0 missed the range's end and wrapped around.
+    pub fn oracle_search_is_off(&self, search: &SearchQ, answer: &QAns) -> bool {
+        match answer {
+            QAns::NoTermination => true,
+            QAns::Match(Some((start, end))) => {
+                !self.in_search_range(search, search.max_lines, *start)
+                    || !self.in_search_range(search, search.max_lines, *end)
+            },
+            _ => false,
+        }
+    }
+
     pub fn queries(&mut self, plan: &QueryPlan) -> Vec<(&'static str, QAns)> {
         let mut out = Vec::new();
 
@@ -313,22 +517,8 @@ impl Side {
             guarded(|| QAns::Text(Some(term.bounds_to_string(start, end)))),
         ));
 
-        for (pattern, origin, right, side_right, max_lines) in &plan.searches {
-            let direction = if *right { Direction::Right } else { Direction::Left };
-            let (origin, side) = (self.point(*origin), side(*side_right));
-            let answer = guarded(|| match RegexSearch::new(pattern) {
-                Ok(mut regex) => {
-                    if search_terminates(term, &mut regex, origin, direction, side, *max_lines) {
-                        let found =
-                            term.search_next(&mut regex, origin, direction, side, *max_lines);
-                        QAns::Match(found.map(|m| (pt(*m.start()), pt(*m.end()))))
-                    } else {
-                        QAns::NoTermination
-                    }
-                },
-                Err(_) => QAns::Text(None),
-            });
-            out.push(("search_next", answer));
+        for search in &plan.searches {
+            out.push(("search_next", self.search(search, search.max_lines, true)));
         }
 
         for &p in &plan.points {

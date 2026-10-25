@@ -89,8 +89,8 @@ pub struct QueryPlan {
     pub selections: Vec<(SelTy, Pt, Pt)>,
     /// `bounds_to_string(start, end)`, `start <= end`.
     pub bounds: (Pt, Pt),
-    /// `(pattern, origin, right, side_right, max_lines)` for `search_next`.
-    pub searches: Vec<(String, Pt, bool, bool, Option<usize>)>,
+    /// `search_next` queries, one leftward and one rightward.
+    pub searches: Vec<SearchQ>,
     /// How many search windows `search_window` moved (statistics only).
     pub moved_windows: usize,
     /// Points for `bracket_search`, `semantic_search_*`, `line_search_*` and `expand_wide`.
@@ -101,6 +101,22 @@ pub struct QueryPlan {
 
 /// Number of `ViMotion` variants; both sides list them in the same order.
 pub const VI_MOTIONS: usize = 21;
+
+/// One `search_next` query.
+#[derive(Debug, Clone)]
+pub struct SearchQ {
+    pub pattern: String,
+    pub origin: Pt,
+    pub right: bool,
+    /// `Side::Right` when true.
+    pub side_right: bool,
+    /// The `max_lines` both crates search with.
+    pub max_lines: Option<usize>,
+    /// The `max_lines` drawn before `search_window` moved it, when it did. 0.26.0 cannot run
+    /// that search (it would hang); feathercritty runs it and its answer is checked on its own
+    /// (fork change 5).
+    pub unmoved: Option<Option<usize>>,
+}
 
 /// One query answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,7 +169,11 @@ const WIDE_SPACER: u16 = 0b0000_0000_0100_0000;
 /// case the window grows by one line until its end is not such a cell. Nothing is skipped.
 /// The other 0.26.0 search hang, the match iterator cycling between two matches, is caught by
 /// `term_impl::search_terminates` instead.
-fn search_window(
+///
+/// feathercritty fixed both hangs (fork change 5), but the oracle still runs 0.26.0, so this
+/// stays until the oracle release fixes them. The window as drawn is kept in
+/// `SearchQ::unmoved`, and `run` searches it on feathercritty alone.
+pub fn search_window(
     snap: &Snapshot,
     origin_line: i32,
     right: bool,
@@ -241,14 +261,22 @@ impl QueryPlan {
                     .collect();
                 // Workaround: a pattern that matches the empty string makes `search_next` loop
                 // forever in 0.26.0 (the UI never searches for one), so never sample an empty
-                // pattern. Remove this once upstream fixes it.
+                // pattern. feathercritty fixed this (fork change 5), but the oracle still hangs;
+                // remove this once the oracle release fixes it.
                 if text.is_empty() { "x".to_owned() } else { escape_regex(&text) }
             };
             let max_lines = rng.gen_bool(0.5).then(|| rng.gen_range(0..=snap.rows.len()));
             let origin = point(rng);
-            let (max_lines, moved) = search_window(snap, origin.line, right, max_lines);
+            let (moved_max_lines, moved) = search_window(snap, origin.line, right, max_lines);
             moved_windows += usize::from(moved);
-            searches.push((pattern, origin, right, rng.gen_bool(0.5), max_lines));
+            searches.push(SearchQ {
+                pattern,
+                origin,
+                right,
+                side_right: rng.gen_bool(0.5),
+                max_lines: moved_max_lines,
+                unmoved: moved.then_some(max_lines),
+            });
         }
 
         // Prefer bracket cells for one point so `bracket_search` finds pairs.
