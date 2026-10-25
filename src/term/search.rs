@@ -337,7 +337,9 @@ impl<T> Term<T> {
         let mut iter = self.grid.iter_from(start);
         let mut regex_match = None;
 
-        let mut cell = iter.cell();
+        // feathercritty: upstream borrowed `cell` from the grid (`&Cell`); the iterator now
+        // yields owned cells and `iter.cell()` borrows from the iterator, so `cell` is a copy.
+        let mut cell = iter.cell().clone();
         self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
         let mut c = cell.c;
 
@@ -455,7 +457,8 @@ impl<T> Term<T> {
                     let line = topmost_line - point.line + screen_lines - 1;
                     let start = Point::new(line, last_column - point.column);
                     iter = self.grid.iter_from(start);
-                    iter.cell()
+                    // feathercritty: a copy, as for the first cell above.
+                    iter.cell().clone()
                 },
             };
 
@@ -562,7 +565,8 @@ impl<T> Term<T> {
     ///
     /// feathercritty: not in upstream; see `regex_search_right` and `RegexIter::next`.
     fn glyph_end(&self, point: Point) -> Point {
-        let flags = self.grid[point].flags;
+        // feathercritty (compact history): `point` can be in history, read through `Grid::cell`.
+        let flags = self.grid.cell(point).flags;
         let last = Point::new(self.bottommost_line(), self.last_column());
         let step =
             |point: Point| if point == last { point } else { point.add(self, Boundary::None, 1) };
@@ -591,16 +595,25 @@ impl<T> Term<T> {
     ///
     /// feathercritty: not in upstream; see `regex_search_right`.
     fn stale_spacer_end(&self, end: Point) -> bool {
-        self.grid[end].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        // feathercritty (compact history): both points can be in history, read through
+        // `Grid::cell`.
+        self.grid.cell(end).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
             && (end.line >= self.bottommost_line()
-                || !self.grid[Point::new(end.line + 1, Column(0))].flags.contains(Flags::WIDE_CHAR))
+                || !self
+                    .grid
+                    .cell(Point::new(end.line + 1, Column(0)))
+                    .flags
+                    .contains(Flags::WIDE_CHAR))
     }
 
     /// Advance a grid iterator over fullwidth characters.
-    fn skip_fullwidth<'a>(
+    ///
+    /// feathercritty: upstream took `cell: &mut &'a Cell` borrowed from the grid; the iterator
+    /// yields owned cells now, so `cell` is an owned copy, replaced the same way.
+    fn skip_fullwidth(
         &self,
-        iter: &'a mut GridIterator<'_, Cell>,
-        cell: &mut &'a Cell,
+        iter: &mut GridIterator<'_, Cell>,
+        cell: &mut Cell,
         direction: Direction,
     ) {
         match direction {
@@ -623,8 +636,9 @@ impl<T> Term<T> {
                     *cell = new_cell;
                 }
 
+                // feathercritty: upstream `self.grid[prev]`; `prev` can be in history.
                 let prev = iter.point().sub(self, Boundary::Grid, 1);
-                if self.grid[prev].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                if self.grid.cell(prev).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
                     iter.prev();
                 }
             },
@@ -634,7 +648,9 @@ impl<T> Term<T> {
 
     /// Find next matching bracket.
     pub fn bracket_search(&self, point: Point) -> Option<Point> {
-        let start_char = self.grid[point].c;
+        // feathercritty: upstream `self.grid[point]`; `point` can be in history. The iterator
+        // below yields owned cells.
+        let start_char = self.grid.cell(point).c;
 
         // Find the matching bracket we're looking for
         let (forward, end_char) = BRACKET_PAIRS.iter().find_map(|(open, close)| {
@@ -734,7 +750,9 @@ impl<T> Term<T> {
         let last_column = self.columns() - 1;
 
         // Immediately stop if start point in on line break.
-        if point.column == last_column && !self.grid[point].flags.contains(Flags::WRAPLINE) {
+        //
+        // feathercritty: upstream `self.grid[point]`; `point` can be in history.
+        if point.column == last_column && !self.grid.cell(point).flags.contains(Flags::WRAPLINE) {
             return Err(point);
         }
 
@@ -755,9 +773,9 @@ impl<T> Term<T> {
 
     /// Find the beginning of the current line across linewraps.
     pub fn line_search_left(&self, mut point: Point) -> Point {
-        while point.line > self.topmost_line()
-            && self.grid[point.line - 1i32][self.last_column()].flags.contains(Flags::WRAPLINE)
-        {
+        // feathercritty: upstream read `self.grid[line][self.last_column()].flags` for
+        // `WRAPLINE`; lines can be in history, read through `Grid::wraps`.
+        while point.line > self.topmost_line() && self.grid.wraps(point.line - 1i32) {
             point.line -= 1;
         }
 
@@ -768,9 +786,9 @@ impl<T> Term<T> {
 
     /// Find the end of the current line across linewraps.
     pub fn line_search_right(&self, mut point: Point) -> Point {
-        while point.line + 1 < self.screen_lines()
-            && self.grid[point.line][self.last_column()].flags.contains(Flags::WRAPLINE)
-        {
+        // feathercritty: upstream read `self.grid[line][self.last_column()].flags` for
+        // `WRAPLINE`; lines can be in history, read through `Grid::wraps`.
+        while point.line + 1 < self.screen_lines() && self.grid.wraps(point.line) {
             point.line += 1;
         }
 
@@ -1360,7 +1378,7 @@ mod tests {
             xxx \n\
             🦇xx\
         ");
-        term.grid[Line(0)][Column(3)].flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+        term.grid.screen_mut()[Line(0)][Column(3)].flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
 
         let mut regex = RegexSearch::new("🦇x").unwrap();
         let start = Point::new(Line(0), Column(0));
@@ -1395,9 +1413,9 @@ mod tests {
     fn wide_without_spacer() {
         let size = TermSize::new(2, 2);
         let mut term = Term::new(Config::default(), &size, ());
-        term.grid[Line(0)][Column(0)].c = 'x';
-        term.grid[Line(0)][Column(1)].c = '字';
-        term.grid[Line(0)][Column(1)].flags = Flags::WIDE_CHAR;
+        term.grid.screen_mut()[Line(0)][Column(0)].c = 'x';
+        term.grid.screen_mut()[Line(0)][Column(1)].c = '字';
+        term.grid.screen_mut()[Line(0)][Column(1)].flags = Flags::WIDE_CHAR;
 
         let mut regex = RegexSearch::new("test").unwrap();
 
@@ -1562,7 +1580,7 @@ mod tests {
     #[test]
     fn no_spacer_fullwidth_linewrap() {
         let mut term = mock_term("abY\nxab");
-        term.grid_mut()[Line(0)][Column(2)].c = '🦇';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = '🦇';
 
         let mut regex = RegexSearch::new("🦇x").unwrap();
         let start = Point::new(Line(0), Column(0));
@@ -1603,7 +1621,7 @@ mod tests {
     /// ```
     fn wrapped_wide_term() -> Term<VoidListener> {
         let mut term = mock_term("abc\r\nab \n字c\r\nabc");
-        term.grid[Line(1)][Column(2)].flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+        term.grid.screen_mut()[Line(1)][Column(2)].flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
         term
     }
 
@@ -1874,34 +1892,44 @@ mod tests {
         term.grid.scroll_up(&(Line(0)..Line(screen_lines as i32)), history);
         assert_eq!(term.total_lines(), lines);
 
+        // feathercritty (compact history): lines can be in history, written through
+        // `Grid::update_line`.
         let line = |n: usize| Line(n as i32 - history as i32);
         for n in 0..lines {
-            for column in 0..columns {
-                let c = if (n + column) % 2 == 0 { 'a' } else { 'b' };
-                term.grid[line(n)][Column(column)] = Cell::default();
-                term.grid[line(n)][Column(column)].c = c;
-            }
+            term.grid.update_line(line(n), |row| {
+                for column in 0..columns {
+                    let c = if (n + column) % 2 == 0 { 'a' } else { 'b' };
+                    row[Column(column)] = Cell::default();
+                    row[Column(column)].c = c;
+                }
+            });
         }
         if plain_wide {
-            term.grid[line(0)][Column(0)].c = '字';
-            term.grid[line(0)][Column(0)].flags.insert(Flags::WIDE_CHAR);
-            term.grid[line(0)][Column(1)].c = ' ';
-            term.grid[line(0)][Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+            term.grid.update_line(line(0), |row| {
+                row[Column(0)].c = '字';
+                row[Column(0)].flags.insert(Flags::WIDE_CHAR);
+                row[Column(1)].c = ' ';
+                row[Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+            });
         }
         for (n, boundary) in boundaries.iter().enumerate() {
             if *boundary == Boundary2::None {
                 continue;
             }
 
-            let cell = &mut term.grid[line(n)][Column(columns - 1)];
-            cell.c = ' ';
-            cell.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+            term.grid.update_line(line(n), |row| {
+                let cell = &mut row[Column(columns - 1)];
+                cell.c = ' ';
+                cell.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+            });
 
             if *boundary == Boundary2::Wide {
-                term.grid[line(n + 1)][Column(0)].c = '字';
-                term.grid[line(n + 1)][Column(0)].flags.insert(Flags::WIDE_CHAR);
-                term.grid[line(n + 1)][Column(1)].c = ' ';
-                term.grid[line(n + 1)][Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+                term.grid.update_line(line(n + 1), |row| {
+                    row[Column(0)].c = '字';
+                    row[Column(0)].flags.insert(Flags::WIDE_CHAR);
+                    row[Column(1)].c = ' ';
+                    row[Column(1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+                });
             }
         }
 
@@ -1993,8 +2021,9 @@ mod tests {
         for (i, (text, flags)) in rows.iter().enumerate() {
             let line = Line(14 + i as i32);
             for (column, c) in text.chars().enumerate() {
-                term.grid[line][Column(column)].c = c;
-                term.grid[line][Column(column)].flags = Flags::from_bits_truncate(flags[column]);
+                term.grid.screen_mut()[line][Column(column)].c = c;
+                term.grid.screen_mut()[line][Column(column)].flags =
+                    Flags::from_bits_truncate(flags[column]);
             }
         }
         term
@@ -2027,15 +2056,19 @@ mod tests {
         let size = TermSize::new(2, 2);
         let mut term = Term::new(Config::default(), &size, VoidListener);
         term.grid.scroll_up(&(Line(0)..Line(2)), 1);
+        // feathercritty (compact history): line -1 is in history, written through
+        // `Grid::update_line`.
         for (line, text) in [(-1, "a "), (0, " a"), (1, "a ")] {
-            for (column, c) in text.chars().enumerate() {
-                term.grid[Line(line)][Column(column)] = Cell::default();
-                term.grid[Line(line)][Column(column)].c = c;
-            }
+            term.grid.update_line(Line(line), |row| {
+                for (column, c) in text.chars().enumerate() {
+                    row[Column(column)] = Cell::default();
+                    row[Column(column)].c = c;
+                }
+            });
         }
-        term.grid[Line(-1)][Column(1)]
-            .flags
-            .insert(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+        term.grid.update_line(Line(-1), |row| {
+            row[Column(1)].flags.insert(Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE);
+        });
         term
     }
 
@@ -2180,20 +2213,24 @@ mod tests {
         for (n, (text, flags)) in rows.iter().enumerate() {
             let line = Line(n as i32 - history as i32);
             assert_eq!(text.chars().count(), columns);
-            for (column, (c, flag)) in text.chars().zip(flags.chars()).enumerate() {
-                let cell = &mut term.grid[line][Column(column)];
-                *cell = Cell::default();
-                cell.c = c;
-                cell.flags = match flag {
-                    '.' => Flags::empty(),
-                    'r' => Flags::WRAPLINE,
-                    'W' => Flags::WIDE_CHAR,
-                    's' => Flags::WIDE_CHAR_SPACER,
-                    'S' => Flags::WIDE_CHAR_SPACER | Flags::WRAPLINE,
-                    'L' => Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE,
-                    _ => unreachable!(),
-                };
-            }
+            // feathercritty (compact history): lines can be in history, written through
+            // `Grid::update_line`.
+            term.grid.update_line(line, |row| {
+                for (column, (c, flag)) in text.chars().zip(flags.chars()).enumerate() {
+                    let cell = &mut row[Column(column)];
+                    *cell = Cell::default();
+                    cell.c = c;
+                    cell.flags = match flag {
+                        '.' => Flags::empty(),
+                        'r' => Flags::WRAPLINE,
+                        'W' => Flags::WIDE_CHAR,
+                        's' => Flags::WIDE_CHAR_SPACER,
+                        'S' => Flags::WIDE_CHAR_SPACER | Flags::WRAPLINE,
+                        'L' => Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE,
+                        _ => unreachable!(),
+                    };
+                }
+            });
         }
         term
     }

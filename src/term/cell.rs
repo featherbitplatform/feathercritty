@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -220,6 +222,10 @@ impl Cell {
         self.extra.as_ref()?.hyperlink.clone()
     }
 }
+
+/// feathercritty: lets `History` store `Cell` rows (phase 1 needs only the default header
+/// bits; a later phase adds the row encoding here).
+impl grid::HistoryCell for Cell {}
 
 impl GridCell for Cell {
     #[inline]

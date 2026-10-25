@@ -9,7 +9,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::k;
+use super::{cell_at, k, row_at};
 use k::event::VoidListener;
 use k::grid::{Dimensions, Scroll};
 use k::index::{Boundary, Column, Direction, Line, Point, Side as KSide};
@@ -275,7 +275,7 @@ impl Side {
         let mut rows = Vec::with_capacity(grid.total_lines());
         let mut index = 0;
         for line in grid.topmost_line().0..=grid.bottommost_line().0 {
-            let row = &grid[Line(line)];
+            let row = row_at(grid, Line(line));
             let mut out = Vec::with_capacity(columns);
             for column in 0..columns {
                 out.push(cell_p(&row[Column(column)], &mut ids, Some(index)));
@@ -365,7 +365,7 @@ impl Side {
     fn completion_right(&self, p: Point) -> Vec<Point> {
         let grid = self.term.grid();
         let last = Point::new(grid.bottommost_line(), grid.last_column());
-        let flags = grid[p].flags;
+        let flags = cell_at(grid, p).flags;
         let count = if flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
             2
         } else if flags.contains(Flags::WIDE_CHAR) && p.column < grid.last_column() {
@@ -395,14 +395,14 @@ impl Side {
         let before = |p: Point| (p > first).then(|| p.sub(grid, Boundary::Grid, 1));
         let mut cells = Vec::new();
         let mut wide = p;
-        if grid[p].flags.contains(Flags::WIDE_CHAR_SPACER) {
+        if cell_at(grid, p).flags.contains(Flags::WIDE_CHAR_SPACER) {
             let Some(w) = before(p) else { return cells };
             cells.push(w);
             wide = w;
         }
-        if grid[wide].flags.contains(Flags::WIDE_CHAR) {
+        if cell_at(grid, wide).flags.contains(Flags::WIDE_CHAR) {
             if let Some(s) = before(wide) {
-                if grid[s].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                if cell_at(grid, s).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
                     cells.push(s);
                 }
             }
@@ -473,9 +473,9 @@ impl Side {
         let mut text = String::new();
         let mut point = start;
         loop {
-            let cell = &grid[point];
+            let cell = cell_at(grid, point);
             let skip = if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && point < last {
-                text.push(grid[point.add(grid, Boundary::Grid, 1)].c);
+                text.push(cell_at(grid, point.add(grid, Boundary::Grid, 1)).c);
                 3
             } else {
                 text.push(cell.c);
@@ -507,14 +507,14 @@ impl Side {
         let mut text = Vec::new();
         let mut point = end;
         loop {
-            let cell = &grid[point];
+            let cell = cell_at(grid, point);
             let mut skip = 1;
             if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && point > first {
                 let wide = point.sub(grid, Boundary::Grid, 1);
-                text.push(grid[wide].c);
+                text.push(cell_at(grid, wide).c);
                 skip = 2;
                 if wide > first
-                    && grid[wide.sub(grid, Boundary::Grid, 1)]
+                    && cell_at(grid, wide.sub(grid, Boundary::Grid, 1))
                         .flags
                         .contains(Flags::LEADING_WIDE_CHAR_SPACER)
                 {
@@ -547,7 +547,8 @@ impl Side {
             return Err(format!("match start {start:?} after its end {end:?}"));
         }
         for line in start.line.0..end.line.0 {
-            if !grid[Line(line)][grid.last_column()].flags.contains(Flags::WRAPLINE) {
+            let last = Point::new(Line(line), grid.last_column());
+            if !cell_at(grid, last).flags.contains(Flags::WRAPLINE) {
                 return Err(format!("match crosses the unwrapped end of line {line}"));
             }
         }
@@ -661,14 +662,9 @@ impl Side {
             };
             cursor = moved;
             out.push(("vi_motion", QAns::Point(pt(cursor.point))));
-            // Workaround: some 0.26.0 motions can leave the grid (`Middle` on a one-line screen
-            // without history, `Right` from a stray `LEADING_WIDE_CHAR_SPACER` on the bottom
-            // line), and motions from there read rows outside it, so the chain stops. Remove
-            // this once upstream keeps motions inside the grid.
-            let line = cursor.point.line;
-            if line < self.term.topmost_line() || line > self.term.bottommost_line() {
-                break;
-            }
+            // 0.26.0's motions could leave the grid and the chain stopped there; both crates
+            // now keep the cursor in the grid (the oracle through `tests/oracle/PATCHES.md`
+            // patch 2), so every motion of the chain is compared.
         }
         let moved = self.term.grid().display_offset();
         if moved != offset {

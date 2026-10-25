@@ -51,8 +51,9 @@ windows-sys = { version = "0.59.0", features = [
 
 [dev-dependencies]
 serde_json = "1.0.0"
-# The unmodified upstream release, the oracle of tests/differential.rs.
-alacritty_terminal = "=0.26.0"
+# The oracle of tests/differential.rs: the published 0.26.0 source with the patches listed in
+# tests/oracle/PATCHES.md (checked by tests/oracle_pristine.rs).
+alacritty_terminal = { path = "tests/oracle" }
 # ChaCha keeps generated test cases identical on every platform.
 rand = "0.8"
 rand_chacha = "0.3"

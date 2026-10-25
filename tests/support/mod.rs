@@ -1,8 +1,24 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
-//! Shared support for the differential tests: one step list drives feathercritty and unmodified
-//! `alacritty_terminal` (the oracle, a crates.io dev-dependency pinned with `=`) side by side, and
-//! their states are compared through a crate-neutral projection after every step.
+//! Shared support for the differential tests: one step list drives feathercritty and
+//! `alacritty_terminal` 0.26.0 (the oracle) side by side, and their states are compared through a
+//! crate-neutral projection after every step.
+//!
+//! # The oracle
+//!
+//! The oracle is the published `alacritty_terminal` 0.26.0 source vendored at `tests/oracle/`
+//! (a path dev-dependency) with exactly the patches `tests/oracle/PATCHES.md` lists, both of them
+//! fork behavior changes the oracle could not otherwise model:
+//! 1. the `Row` `occ` invariant (`Row::grow`, `Row::append`): without it, what a reset row looks
+//!    like depends on which row is recycled, and upstream recycled rows through hidden cache rows
+//!    the fork's grid no longer has;
+//! 2. reads of lines outside the grid are "no row": they read as a default cell (vi motions), add
+//!    nothing (`line_to_string`'s line above the topmost line), and vi motions keep the cursor in
+//!    the grid. 0.26.0 read whatever row its ring held there.
+//!
+//! `tests/oracle_pristine.rs` checks that the vendored source is the published one except for
+//! those hunks. Fork changes 1 and 5 stay unpatched in the oracle and are modeled by the harness
+//! (below).
 //!
 //! # What is compared
 //!
@@ -28,12 +44,16 @@
 //! # Moving the oracle to a newer upstream release
 //!
 //! When feathercritty merges a new upstream `alacritty_terminal` release X.Y.Z:
-//! 1. Bump the dev-dependency `alacritty_terminal = "=X.Y.Z"` in `Cargo.toml` to the release the
-//!    fork is now based on, and update `Cargo.lock`.
+//! 1. Re-vendor the oracle (`tests/oracle/PATCHES.md`, "Moving to a new upstream release"): replace
+//!    `tests/oracle/src`, `Cargo.toml` and `LICENSE-APACHE` with the published X.Y.Z crate's,
+//!    re-apply `PATCHES.diff` (drop a patch if the release fixes it the same way), run
+//!    `tests/oracle/refresh.py` and update `Cargo.lock`.
 //! 2. `term_impl.rs` must compile against both crates. It uses this upstream API: `Term::new`,
 //!    `Config` (`scrolling_history`, `kitty_keyboard`), `term::test::TermSize`, `Term::resize`,
 //!    `scroll_display(Scroll::Delta)`, `set_options`, the public `Term::selection` field,
-//!    `Selection::new/update/to_range`, `grid()` with `Grid` indexing by `Line`/`Column`,
+//!    `Selection::new/update/to_range`, `grid()` with `Grid` indexing by `Line`/`Column` on the
+//!    oracle side (`ac::cell_at`/`row_at`; feathercritty reads through `Grid::cell` and
+//!    `RowReader`, `fc::cell_at`/`row_at`),
 //!    `topmost_line`/`bottommost_line`/`history_size`/`display_offset`, the public
 //!    `Grid::cursor`/`saved_cursor` fields, `Cell` (`c`, `fg`, `bg`, `flags`, `zerowidth()`,
 //!    `underline_color()`, `hyperlink()`), `TermMode::bits`, `RegexSearch`, `RegexIter`,

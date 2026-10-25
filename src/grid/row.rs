@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 //! Defines the Row type which makes up lines in the grid.
 
 use std::cmp::{max, min};
@@ -12,7 +14,12 @@ use crate::index::Column;
 use crate::term::cell::ResetDiscriminant;
 
 /// A row in the grid.
-#[derive(Default, Clone, Debug)]
+///
+/// feathercritty: upstream derived `Default` and `Clone`. They are written out so that
+/// `Row::default()` (an empty row, no allocation) needs no `T: Default`, and so that
+/// `clone_from` reuses the target's allocation (`History::push_newest` and `History::read` copy
+/// rows into existing ones). When merging upstream: keep both in step with the fields.
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Row<T> {
     inner: Vec<T>,
@@ -22,6 +29,26 @@ pub struct Row<T> {
     /// This is the upper bound on the number of elements in the row, which have been modified
     /// since the last reset. All cells after this point are guaranteed to be equal.
     pub(crate) occ: usize,
+}
+
+impl<T> Default for Row<T> {
+    #[inline]
+    fn default() -> Self {
+        Row { inner: Vec::new(), occ: 0 }
+    }
+}
+
+impl<T: Clone> Clone for Row<T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Row { inner: self.inner.clone(), occ: self.occ }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.inner.clone_from(&source.inner);
+        self.occ = source.occ;
+    }
 }
 
 impl<T: PartialEq> PartialEq for Row<T> {
@@ -62,6 +89,14 @@ impl<T: Default> Row<T> {
             return;
         }
 
+        // feathercritty: upstream padded with default cells and left `occ` alone, so cells from
+        // `occ` on were no longer all equal (a reset tail followed by default padding), and a
+        // later `reset` left the old tail in place whenever the template matched the padding.
+        // What a reset row looked like then depended on which row was recycled. Raising `occ`
+        // to the old length keeps the invariant. The differential test's oracle carries the
+        // same fix (`tests/oracle/PATCHES.md`). When merging upstream: drop this if upstream
+        // fixed it; re-run `grid::row` tests.
+        self.occ = max(self.occ, self.inner.len());
         self.inner.resize_with(columns, T::default);
     }
 
@@ -138,7 +173,12 @@ impl<T> Row<T> {
     where
         T: GridCell,
     {
-        self.occ += vec.len();
+        // feathercritty: upstream added `vec.len()` to `occ`, which leaves the appended cells
+        // beyond `occ` whenever `occ` was below the old length (the same broken invariant as in
+        // `grow`). Every appended cell is now inside `occ`. The oracle carries the same fix.
+        if !vec.is_empty() {
+            self.occ = self.inner.len() + vec.len();
+        }
         self.inner.append(vec);
     }
 
@@ -289,5 +329,98 @@ impl<T> IndexMut<RangeToInclusive<Column>> for Row<T> {
     fn index_mut(&mut self, index: RangeToInclusive<Column>) -> &mut [T] {
         self.occ = max(self.occ, *index.end + 1);
         &mut self.inner[..=(index.end.0)]
+    }
+}
+
+/// feathercritty: the `occ` invariant ("all cells from `occ` on are equal") for every `Row`
+/// mutator; `grow` broke it upstream (fork change, see `Row::grow`).
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::term::cell::Cell;
+    use crate::vte::ansi::{Color, NamedColor};
+
+    fn assert_occ_invariant(row: &Row<Cell>) {
+        let tail = &row.inner[row.occ.min(row.inner.len())..];
+        assert!(tail.windows(2).all(|pair| pair[0] == pair[1]), "cells from occ on differ");
+    }
+
+    fn red() -> Cell {
+        Cell::from(Color::Named(NamedColor::Red))
+    }
+
+    fn text(c: char) -> Cell {
+        Cell { c, ..Cell::default() }
+    }
+
+    /// A row of `len` cells reset with a red background (`occ` 0, every cell red).
+    fn red_row(len: usize) -> Row<Cell> {
+        let mut row = Row::new(len);
+        row.reset(&red());
+        row
+    }
+
+    #[test]
+    fn grow_raises_occ_to_old_len() {
+        let mut row = red_row(3);
+        row.grow(5);
+        assert_eq!(row.occ, 3);
+        assert_occ_invariant(&row);
+
+        // A later reset with the default template now clears the red cells as well.
+        row.reset(&Cell::default());
+        assert!(row.inner.iter().all(|cell| *cell == Cell::default()));
+    }
+
+    #[test]
+    fn shrink_keeps_occ_invariant() {
+        let mut row = red_row(5);
+        row[Column(3)] = text('x');
+        row.shrink(2);
+        assert_occ_invariant(&row);
+    }
+
+    #[test]
+    fn reset_keeps_occ_invariant() {
+        let mut row = red_row(4);
+        row[Column(1)] = text('x');
+        row.reset(&Cell::default());
+        assert_eq!(row.occ, 0);
+        assert_occ_invariant(&row);
+    }
+
+    #[test]
+    fn append_keeps_occ_invariant() {
+        let mut row = red_row(3);
+        row.append(&mut vec![text('a'), text('b')]);
+        assert_occ_invariant(&row);
+    }
+
+    #[test]
+    fn append_front_keeps_occ_invariant() {
+        let mut row = red_row(3);
+        row.append_front(vec![text('a'), text('b')]);
+        assert_occ_invariant(&row);
+    }
+
+    #[test]
+    fn front_split_off_keeps_occ_invariant() {
+        let mut row = red_row(5);
+        row[Column(3)] = text('x');
+        let _ = row.front_split_off(2);
+        assert_occ_invariant(&row);
+    }
+
+    #[test]
+    fn index_mut_writes_keep_occ_invariant() {
+        let mut row = red_row(6);
+        row[Column(2)] = text('x');
+        assert_occ_invariant(&row);
+        row[Column(0)..Column(4)][3] = text('y');
+        assert_occ_invariant(&row);
+        row[..Column(5)][4] = text('z');
+        assert_occ_invariant(&row);
+        row[..=Column(5)][5] = text('w');
+        assert_occ_invariant(&row);
     }
 }
