@@ -309,18 +309,19 @@ fn oracle_skips_searches_that_miss_their_end() {
 #[test]
 fn search_soak_regressions() {
     let random = [
-        1_000_017, // a match around the buffer's end (start after end) is real
-        5_000_017, // 0.26.0's match ending in a stale spacer's completion is kept
-        2_001_369, // a leftward match's second search reads past its origin, as 0.26.0's
-        2_008_270, // a rightward origin on a bottom-line stale spacer stays in the grid
-        2_013_725, // 0.26.0's match running around the buffer is outside the range
-        2_024_013, // the harness's range uses feathercritty's origin for that spacer
-        814,       // 0.26.0 answers from below the grid for that origin: not compared
-        2_003_541, // a match through lines outside a wrapping range (DIFF_TINY=1)
-        3_001_698, // the iterator stops where 0.26.0's does
-        5_104_388, // a match is never rewritten into text the pattern does not match
-        7_000_448, // the same, for a match running around the buffer
-        7_025_823, // 0.26.0 goes on from inside the range's far end; so does the iteration
+        1_000_017,  // a match around the buffer's end (start after end) is real
+        5_000_017,  // 0.26.0's match ending in a stale spacer's completion is kept
+        2_001_369,  // a leftward match's second search reads past its origin, as 0.26.0's
+        2_008_270,  // a rightward origin on a bottom-line stale spacer stays in the grid
+        2_013_725,  // 0.26.0's match running around the buffer is outside the range
+        2_024_013,  // the harness's range uses feathercritty's origin for that spacer
+        814,        // 0.26.0 answers from below the grid for that origin: not compared
+        2_003_541,  // a match through lines outside a wrapping range (DIFF_TINY=1)
+        3_001_698,  // the iterator stops where 0.26.0's does
+        10_009_868, // the fork may answer with a match only 0.26.0's two searches read so
+        5_104_388,  // a match is never rewritten into text the pattern does not match
+        7_000_448,  // the same, for a match running around the buffer
+        7_025_823,  // 0.26.0 goes on from inside the range's far end; so does the iteration
     ];
     for seed in random {
         let case = r#gen::random_case(seed, DEFAULT_STEPS);
@@ -335,6 +336,73 @@ fn search_soak_regressions() {
     }
 }
 
+/// How `compare_on_grid` classified a search.
+enum GridOutcome {
+    /// 0.26.0 answered in range, and feathercritty gave the same answer.
+    Equal,
+    /// 0.26.0 cannot answer (or its oracle search timed out); feathercritty's answer passed its
+    /// own check.
+    Off { timed_out: bool },
+}
+
+/// Compare `search_next` on two sides holding the same grid, as `run` does: equal answers where
+/// 0.26.0 answers in range, otherwise feathercritty's answer checked against 0.26.0's own
+/// iteration (`check_search_walked`). The oracle runs on a thread with a timeout.
+fn compare_on_grid(
+    a: &support::fc::Side,
+    b: &support::ac::Side,
+    search: &support::project::SearchQ,
+) -> Result<GridOutcome, String> {
+    use support::project::QAns;
+
+    let max_lines = search.max_lines;
+    let fork = a
+        .search_detached(search, max_lines, std::time::Duration::from_secs(30))
+        .ok_or("feathercritty did not return")?;
+    let timeout = std::time::Duration::from_secs(5);
+    let (oracle, walked, timed_out) = match b.search_timed(search, max_lines, true, timeout) {
+        Some((oracle, walked)) => (oracle, walked, false),
+        None => (QAns::NoTermination, None, true),
+    };
+    if !b.oracle_search_is_off(search, &oracle) {
+        return if fork == oracle {
+            Ok(GridOutcome::Equal)
+        } else {
+            Err(format!("fork {fork:?}, 0.26.0 {oracle:?}"))
+        };
+    }
+    a.check_search_walked(search, max_lines, &fork, walked.as_deref())
+        .map_err(|why| format!("{why}; fork {fork:?}, 0.26.0 {oracle:?}, walked {walked:?}"))?;
+    Ok(GridOutcome::Off { timed_out })
+}
+
+/// Grids from `search_grid_probe` runs at higher counts that once failed. Grid 133174
+/// (`DIFF_SEEDS=40000`): stale leading spacers at line ends only; 0.26.0's unbounded rightward
+/// search never returns, and feathercritty answers with the in-range match `(2,0)..=(2,2)`
+/// that 0.26.0's iteration yields, read by its two searches differently from either single
+/// reading the old check knew.
+#[test]
+fn search_grid_regressions() {
+    use support::project::SearchQ;
+    use support::{Pt, ac, fc};
+
+    let rows: Vec<(String, String)> = [("abx", "..r"), (" b ", "..L"), ("x  ", "..L")]
+        .iter()
+        .map(|(t, f)| (t.to_string(), f.to_string()))
+        .collect();
+    let search = SearchQ {
+        pattern: "[^ ]+ ?".to_owned(),
+        origin: Pt::new(2, 2),
+        right: true,
+        side_right: true,
+        max_lines: None,
+        unmoved: None,
+    };
+    let (a, b) = (fc::Side::from_rows(&rows), ac::Side::from_rows(&rows));
+    let outcome = compare_on_grid(&a, &b, &search).unwrap_or_else(|why| panic!("{why}"));
+    assert!(matches!(outcome, GridOutcome::Off { .. }));
+}
+
 /// Hand-built small grids with wide characters, wide characters without their spacer, and
 /// leading spacers (wrapped and stale), written straight into both crates, and searched with
 /// `search_next` from random origins. As in `run`: where 0.26.0 cannot answer (it does not
@@ -346,7 +414,7 @@ fn search_soak_regressions() {
 #[test]
 fn search_grid_probe() {
     use rand::{Rng, SeedableRng};
-    use support::project::{QAns, SearchQ};
+    use support::project::SearchQ;
     use support::{Pt, ac, fc};
 
     let grids = support::seed_count(300) * 5;
@@ -406,25 +474,13 @@ fn search_grid_probe() {
                 max_lines,
                 unmoved: None,
             };
-            let timeout = std::time::Duration::from_secs(5);
-            let fork = a
-                .search_detached(&search, max_lines, std::time::Duration::from_secs(30))
-                .unwrap_or_else(|| panic!("feathercritty did not return: {rows:?} {search:?}"));
-            let oracle = b.search_timed(&search, max_lines, true, timeout);
-            let oracle = oracle.unwrap_or_else(|| {
-                hangs += 1;
-                QAns::NoTermination
-            });
-            if b.oracle_search_is_off(&search, &oracle) {
-                if let Err(why) = a.check_search(&search, max_lines, &fork) {
-                    panic!(
-                        "grid {grid} {rows:?}: {search:?}: {why}; fork {fork:?}, 0.26.0 {oracle:?}"
-                    );
-                }
-                off += 1;
-            } else {
-                assert_eq!(fork, oracle, "grid {grid} {rows:?}: {search:?}");
-                equal += 1;
+            match compare_on_grid(&a, &b, &search) {
+                Ok(GridOutcome::Equal) => equal += 1,
+                Ok(GridOutcome::Off { timed_out }) => {
+                    off += 1;
+                    hangs += usize::from(timed_out);
+                },
+                Err(why) => panic!("grid {grid} {rows:?}: {search:?}: {why}"),
             }
         }
     }

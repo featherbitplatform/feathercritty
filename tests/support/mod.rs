@@ -417,7 +417,10 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
             assert_eq!((qa[first + k].0, qb[first + k].0), ("search_next", "search_next"));
             let (fork, oracle) = (&qa[first + k].1, &qb[first + k].1);
             if b.oracle_search_is_off(search, oracle) {
-                if let Err(why) = a.check_search(search, search.max_lines, fork) {
+                let walked = b.walk(k);
+                if let Err(why) =
+                    a.check_search_walked(search, search.max_lines, fork, walked.as_deref())
+                {
                     let diff = format!(
                         "search_next where 0.26.0 cannot answer (fork change 5): feathercritty \
                          {fork:?} fails its own check: {why}\n0.26.0 {oracle:?}\nsearch {search:?}"

@@ -4,7 +4,8 @@
 //! `k` = feathercritty) and `ac::imp` (with `k` = `alacritty_terminal` 0.26.0); both crates
 //! expose the same API here.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -51,11 +52,17 @@ const MOTIONS: [ViMotion; VI_MOTIONS] = [
     ViMotion::ParagraphDown,
 ];
 
+/// The matches 0.26.0's iterator yielded in one probed search (`search_terminates`).
+pub type Walk = Vec<(Pt, Pt)>;
+
 /// One terminal and its parser.
 pub struct Side {
     pub term: Term<VoidListener>,
     parser: Processor,
     kitty: bool,
+    /// The matches 0.26.0's iterator yielded in each probed `search` since the last `queries`
+    /// (`search_terminates`), `None` where it was not walked; see `check_search_walked`.
+    walks: RefCell<Vec<Option<Walk>>>,
 }
 
 fn sel_ty(ty: SelTy) -> SelectionType {
@@ -190,32 +197,44 @@ fn search_terminates(
     direction: Direction,
     side: KSide,
     max_lines: Option<usize>,
-) -> bool {
+) -> (bool, Option<Walk>) {
     // feathercritty's searches always return (fork change 5: its iteration ends where 0.26.0's
     // would repeat forever), and `check_search` checks its answers, so its side does not walk the
     // iterator here. Its `RegexIter` yields 0.26.0's matches, repeats included, until its cycle
     // check notices the repeat, which can take more than the limit below.
     if !ORACLE {
-        return true;
+        return (true, None);
     }
 
-    // On the oracle side, searches 0.26.0 cannot run sensibly are answered "does not terminate"
-    // without running them: an origin that leaves the grid (`origin_leaves_grid`; walking the
-    // iterator here from feathercritty's origin can take very long on a large history, and
-    // 0.26.0's own search reads outside the grid anyway), and ranges whose end the searches can
-    // step over (`first_search_misses_end`).
-    if ORACLE && origin_leaves_grid(term, origin, direction) {
-        return false;
-    }
+    // On the oracle side, searches 0.26.0 cannot run sensibly are answered "does not terminate":
+    // - an origin that leaves the grid (`origin_leaves_grid`): 0.26.0's own search reads outside
+    //   the grid. Its iterator is still walked, from feathercritty's in-grid origin
+    //   (`search_bounds`), so feathercritty's answer can be checked against the matches 0.26.0's
+    //   code yields from there (`search_grid_regressions`);
+    // - ranges whose end the searches can step over (`first_search_misses_end`), without running
+    //   them: a single 0.26.0 search there can run forever.
+    let leaves_grid = origin_leaves_grid(term, origin, direction);
     let (origin, start, end, _) = search_bounds(term, origin, direction, max_lines);
-    if ORACLE && first_search_misses_end(term, end, direction) {
-        return false;
+    if first_search_misses_end(term, end, direction) {
+        return (false, None);
     }
 
+    // The walk also records every match 0.26.0 yields: where its answer is off, feathercritty may
+    // answer with one of them (fork change 5, `check_search_walked`). Each step depends only on
+    // its origin, and the next origin only on the match, so a repeated match means the iteration
+    // cycles forever: the walk stops there, with every match before the repeat recorded. The
+    // limit covers every origin once.
     let limit = term.total_lines() * term.columns() + 2;
+    let mut walked = Vec::new();
+    let mut seen = HashSet::new();
     let mut matches = RegexIter::new(start, end, direction, term, regex);
     for _ in 0..limit {
-        let Some(found) = matches.next() else { return true };
+        let Some(found) = matches.next() else { return (!leaves_grid, Some(walked)) };
+        let found_pt = (pt(*found.start()), pt(*found.end()));
+        if !seen.insert(found_pt) {
+            return (false, Some(walked));
+        }
+        walked.push(found_pt);
         let point = match side {
             KSide::Right => *found.end(),
             KSide::Left => *found.start(),
@@ -233,10 +252,10 @@ fn search_terminates(
             },
         };
         if stop {
-            return true;
+            return (!leaves_grid, Some(walked));
         }
     }
-    false
+    (false, Some(walked))
 }
 
 /// Whether 0.26.0's searches towards `end` (the first search of every `RegexIter` step) can step
@@ -321,7 +340,12 @@ impl Side {
             ..Config::default()
         };
         let size = TermSize::new(start.columns, start.lines);
-        Self { term: new_term(config, &size), parser: Processor::new(), kitty: start.kitty }
+        Self {
+            term: new_term(config, &size),
+            parser: Processor::new(),
+            kitty: start.kitty,
+            walks: RefCell::default(),
+        }
     }
 
     /// Clamp a step or query point into the grid.
@@ -426,11 +450,19 @@ impl Side {
         let term = &self.term;
         let direction = if search.right { Direction::Right } else { Direction::Left };
         let (origin, side) = (self.point(search.origin), side(search.side_right));
+        // One entry per probed search, even if the search panics, so `walk(k)` stays aligned.
+        if probe {
+            self.walks.borrow_mut().push(None);
+        }
         guarded(|| match RegexSearch::new(&search.pattern) {
             Ok(mut regex) => {
-                if probe && !search_terminates(term, &mut regex, origin, direction, side, max_lines)
-                {
-                    return QAns::NoTermination;
+                if probe {
+                    let (terminates, walked) =
+                        search_terminates(term, &mut regex, origin, direction, side, max_lines);
+                    *self.walks.borrow_mut().last_mut().unwrap() = walked;
+                    if !terminates {
+                        return QAns::NoTermination;
+                    }
                 }
                 let found = term.search_next(&mut regex, origin, direction, side, max_lines);
                 QAns::Match(found.map(|m| (pt(*m.start()), pt(*m.end()))))
@@ -451,7 +483,7 @@ impl Side {
         max_lines: Option<usize>,
         timeout: Duration,
     ) -> Option<QAns> {
-        self.search_timed(search, max_lines, false, timeout)
+        self.search_timed(search, max_lines, false, timeout).map(|(answer, _)| answer)
     }
 
     /// `search` with `probe` on another thread, as `search_detached` runs it: `None` if it has not
@@ -464,18 +496,25 @@ impl Side {
         max_lines: Option<usize>,
         probe: bool,
         timeout: Duration,
-    ) -> Option<QAns> {
+    ) -> Option<(QAns, Option<Walk>)> {
         let grid = self.term.grid().clone();
         let size = TermSize::new(grid.columns(), grid.screen_lines());
         let mut term = Term::new(Config::default(), &size, VoidListener);
         *term.grid_mut() = grid;
-        let side = Side { term, parser: Processor::new(), kitty: false };
+        let side = Side { term, parser: Processor::new(), kitty: false, walks: RefCell::default() };
         let search = search.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(side.search(&search, max_lines, probe));
+            let answer = side.search(&search, max_lines, probe);
+            let walked = side.walks.borrow_mut().pop().flatten();
+            let _ = tx.send((answer, walked));
         });
         rx.recv_timeout(timeout).ok()
+    }
+
+    /// The matches 0.26.0's iterator yielded in the `k`th probed search of the last `queries`.
+    pub fn walk(&self, k: usize) -> Option<Walk> {
+        self.walks.borrow().get(k).cloned().flatten()
     }
 
     /// The cells after `p` that a rightward search reads or steps over together with it, as
@@ -733,22 +772,54 @@ impl Side {
     /// Check a `search_next` answer without an oracle (used on the feathercritty side where
     /// 0.26.0 cannot answer, fork change 5): it must have terminated, and a match must lie in
     /// the searched range (`match_in_range`) and be a real match of the pattern. `Match(None)` is
-    /// accepted (absence is not checked).
+    /// accepted (absence is not checked). `check_search_walked` is stricter where 0.26.0's
+    /// iteration could be walked.
     pub fn check_search(
         &self,
         search: &SearchQ,
         max_lines: Option<usize>,
         answer: &QAns,
     ) -> Result<(), String> {
-        match answer {
-            QAns::Match(None) => Ok(()),
-            QAns::Match(Some((start, end))) => {
-                if !self.match_in_range(search, max_lines, *start, *end) {
+        self.check_search_walked(search, max_lines, answer, None)
+    }
+
+    /// `check_search`, given the matches 0.26.0's own iteration yielded for this search
+    /// (`walked`, from `search_terminates` on the oracle side). Fork change 5 answers, where
+    /// 0.26.0 has no in-range answer, with the last in-range match that iteration produced, or
+    /// `None`. So with `walked`:
+    /// - a match must lie in the range and be one of `walked` (exactly; the text is 0.26.0's
+    ///   reading, which can differ from `read` when its two searches read a stale spacer or a wide
+    ///   char without its spacer differently: soak seed 10009868, `search_grid_probe` grid 133174);
+    /// - `None` is accepted only when no match in `walked` lies in the range.
+    ///
+    /// Without `walked` (0.26.0's iteration was not walked: `origin_leaves_grid`,
+    /// `first_search_misses_end`, or a window moved for 0.26.0), it is `check_search`.
+    pub fn check_search_walked(
+        &self,
+        search: &SearchQ,
+        max_lines: Option<usize>,
+        answer: &QAns,
+        walked: Option<&[(Pt, Pt)]>,
+    ) -> Result<(), String> {
+        let in_range =
+            |&(start, end): &(Pt, Pt)| self.match_in_range(search, max_lines, start, end);
+        match (answer, walked) {
+            (QAns::Match(None), None) => Ok(()),
+            (QAns::Match(None), Some(walked)) => match walked.iter().find(|m| in_range(m)) {
+                Some(m) => Err(format!("no match, but 0.26.0's iteration yielded {m:?} in range")),
+                None => Ok(()),
+            },
+            (QAns::Match(Some(m)), walked) => {
+                if !in_range(m) {
                     return Err("the match lies outside the searched range".to_owned());
                 }
-                self.is_real_match(&search.pattern, *start, *end)
+                match walked {
+                    Some(walked) if walked.contains(m) => Ok(()),
+                    Some(_) => Err("the match is not one 0.26.0's iteration yielded".to_owned()),
+                    None => self.is_real_match(&search.pattern, m.0, m.1),
+                }
             },
-            other => Err(format!("expected a search result, got {other:?}")),
+            (other, _) => Err(format!("expected a search result, got {other:?}")),
         }
     }
 
@@ -772,6 +843,7 @@ impl Side {
 
     pub fn queries(&mut self, plan: &QueryPlan) -> Vec<(&'static str, QAns)> {
         let mut out = Vec::new();
+        self.walks.borrow_mut().clear();
 
         let saved = self.term.selection.take();
         for &(ty, start, end) in &plan.selections {
