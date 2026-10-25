@@ -134,6 +134,16 @@ impl LazyDfa {
     }
 }
 
+/// Whether a regex search stops when a fullwidth skip jumps over its `end` (feathercritty, not
+/// in upstream; see `Term::regex_search_internal`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadPastEnd {
+    /// Stop there, reading the skipped character whole (the glyph completion).
+    No,
+    /// Read on as upstream does, for at most one more lap of the buffer.
+    Lap,
+}
+
 impl<T> Term<T> {
     /// Get next search match in the specified direction.
     ///
@@ -259,8 +269,11 @@ impl<T> Term<T> {
         end: Point,
     ) -> Option<Match> {
         // Find start and end of match.
-        let match_start = self.regex_search(start, end, &mut regex.left_fdfa)?;
-        let match_end = self.regex_search(match_start, start, &mut regex.left_rdfa)?;
+        // feathercritty: the second search reads past a skipped `start` as upstream does
+        // (`ReadPastEnd::Lap`, see `regex_search_internal`); upstream passed no such argument.
+        let match_start = self.regex_search(start, end, &mut regex.left_fdfa, ReadPastEnd::No)?;
+        let match_end =
+            self.regex_search(match_start, start, &mut regex.left_rdfa, ReadPastEnd::Lap)?;
 
         // feathercritty: as in `regex_search_right`, a search from `end` to itself whose first
         // fullwidth skip leaves `end` (a wide char's spacer) reads on around the buffer, and
@@ -294,8 +307,11 @@ impl<T> Term<T> {
         end: Point,
     ) -> Option<Match> {
         // Find start and end of match.
-        let match_end = self.regex_search(start, end, &mut regex.right_fdfa)?;
-        let match_start = self.regex_search(match_end, start, &mut regex.right_rdfa)?;
+        // feathercritty: `ReadPastEnd::No`, see `regex_search_internal`; upstream passed no such
+        // argument.
+        let match_end = self.regex_search(start, end, &mut regex.right_fdfa, ReadPastEnd::No)?;
+        let match_start =
+            self.regex_search(match_end, start, &mut regex.right_rdfa, ReadPastEnd::No)?;
 
         // feathercritty: upstream returns whatever the search found, even past `end`. A search
         // from `end` to itself (the last search of every rightward `RegexIter`) on a leading
@@ -326,8 +342,14 @@ impl<T> Term<T> {
     /// Find the next regex match.
     ///
     /// This will always return the side of the first match which is farthest from the start point.
-    fn regex_search(&self, start: Point, end: Point, regex: &mut LazyDfa) -> Option<Point> {
-        match self.regex_search_internal(start, end, regex) {
+    fn regex_search(
+        &self,
+        start: Point,
+        end: Point,
+        regex: &mut LazyDfa,
+        read_past_end: ReadPastEnd,
+    ) -> Option<Point> {
+        match self.regex_search_internal(start, end, regex, read_past_end) {
             Ok(regex_match) => regex_match,
             Err(err) => {
                 warn!("Regex exceeded complexity limit");
@@ -345,6 +367,7 @@ impl<T> Term<T> {
         start: Point,
         end: Point,
         regex: &mut LazyDfa,
+        read_past_end: ReadPastEnd,
     ) -> Result<Option<Point>, Box<dyn Error>> {
         let topmost_line = self.topmost_line();
         let screen_lines = self.screen_lines() as i32;
@@ -377,7 +400,22 @@ impl<T> Term<T> {
         // skip jumps over `end` (start on a wrapped wide char's spacer or leading spacer, end on
         // the wide char) never stops. We stop once the skipped cells contain `end`, as in the loop
         // below.
-        let mut done = self.skips_over(start, iter.point(), end, regex.direction);
+        //
+        // With `ReadPastEnd::Lap` (the second search of `regex_search_left`, back to its origin)
+        // a skip over `end` does not stop the search the first time: upstream reads on there, and
+        // its match can end past the origin. Next to a stale leading spacer (one whose next line
+        // does not start with a wide char) this is common: going left the spacer reads as a
+        // blank, going right it reads the next cell in its place and lands on the cell after
+        // it, so the second search has read one character fewer than the first one when it
+        // passes the origin, and upstream completes the match by reading on. Stopping there
+        // dropped matches 0.26.0 returns inside the range (differential soak seed 2001369,
+        // `stale_spacer_second_search_reads_past_origin`). Reading on is bounded by one more
+        // lap (`steps_left`), and a second skip over `end` stops it, so where upstream reads
+        // forever we stop; `RegexIter::next` cuts a match ending past its range.
+        // When merging upstream: keep this with the skip checks; re-run that test.
+        let skipped_end = self.skips_over(start, iter.point(), end, regex.direction);
+        let mut read_past = skipped_end && read_past_end == ReadPastEnd::Lap;
+        let mut done = skipped_end && !read_past;
 
         // feathercritty: upstream has no bound on the number of cells it visits, so any way of
         // missing `end` (see the fullwidth skip below; a stale leading spacer, one whose next
@@ -390,8 +428,10 @@ impl<T> Term<T> {
         // the `continue 'outer` retry after an empty match feeds the same character again
         // without advancing, at most once per character, so it does not decrement.
         // When merging upstream: keep this bound unless upstream bounds the loop itself.
+        let lap = self.total_lines() * self.columns();
         let mut steps_left = match self.search_distance(start, end, regex.direction) {
-            0 => self.total_lines() * self.columns(),
+            _ if read_past => lap,
+            0 => lap,
             distance => distance,
         };
         let mut last_wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
@@ -510,7 +550,16 @@ impl<T> Term<T> {
             self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
 
             c = cell.c;
-            done |= self.skips_over(skip_from, iter.point(), end, regex.direction);
+            // feathercritty: with `ReadPastEnd::Lap`, the first skip over `end` starts one more
+            // lap instead of stopping (see `read_past` above).
+            if self.skips_over(skip_from, iter.point(), end, regex.direction) {
+                if read_past_end == ReadPastEnd::Lap && !read_past {
+                    read_past = true;
+                    steps_left = lap;
+                } else {
+                    done = true;
+                }
+            }
             let wrapped = iter.cell().flags.contains(Flags::WRAPLINE);
 
             last_point = mem::replace(&mut point, iter.point());
@@ -2405,6 +2454,38 @@ mod tests {
             RegexIter::new(start, end, Direction::Right, &term, &mut regex).take(10).collect();
         let first = Point::new(Line(-1), Column(1));
         assert_eq!(matches, [first..=first, match_start..=match_end]);
+    }
+
+    #[test]
+    fn stale_spacer_second_search_reads_past_origin() {
+        // Differential soak seed 2001369 (`random_streams`, step 26): line 0 ends in a stale
+        // leading spacer, line 1 is blank. Going left from (1,0), the first search reads (1,0)
+        // and the spacer as two blanks and finds "  " starting on the spacer. The second search,
+        // back right to (1,0), reads (1,0) in the spacer's place and lands on (1,1), past its
+        // end, so it has read one blank. 0.26.0 reads on to (1,2), completes the match there
+        // and returns (0,7)..=(1,2); stopping at the skipped end dropped the match and ended
+        // the iteration.
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("G⚡ 文 �� ", ".WsWs..L"),
+            ("        ", "........"),
+            ("        ", "........"),
+            ("        ", "........"),
+            ("        ", "........"),
+            ("        ", "........"),
+            ("single'[", ".......r"),
+            ("��생 本 th", "..WsWs.r"),
+            ("e       ", "........"),
+        ]);
+        let origin = Point::new(Line(0), Column(7));
+
+        let result = terminates("leftward search_next over a stale spacer", move || {
+            let mut regex = RegexSearch::new("  ").unwrap();
+            term.search_next(&mut regex, origin, Direction::Left, Side::Left, Some(3))
+        });
+        let match_start = Point::new(Line(0), Column(7));
+        let match_end = Point::new(Line(1), Column(2));
+        assert_eq!(result, Some(match_start..=match_end));
     }
 
     #[test]
