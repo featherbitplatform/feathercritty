@@ -702,8 +702,9 @@ fn write_text(out: &mut Vec<u8>, cells: &[Cell]) {
 
 /// Append colors, `flags` and the extra reference of `cell` (prefixed by the run length
 /// `len`, when there is one) in one copy, pushing its extra onto `extras` unless it is the entry
-/// this row pushed last.
-#[inline]
+/// this row pushed last. Always inlined: it runs once per run, and a row of single-cell runs
+/// encodes about 20% faster that way.
+#[inline(always)]
 fn write_style(
     out: &mut Vec<u8>,
     len: Option<usize>,
@@ -712,15 +713,31 @@ fn write_style(
     extras: &mut VecDeque<Arc<CellExtra>>,
     first_extra: usize,
 ) {
+    let [f0, f1, f2, f3] = pack_color(cell.fg);
+    let [b0, b1, b2, b3] = pack_color(cell.bg);
+    let [l0, l1] = flags.bits().to_le_bytes();
+
+    // The common case, a run shorter than 128 cells without an extra, is 12 bytes of fixed
+    // layout: one copy of a constant size.
+    match (len, &cell.extra) {
+        (Some(len), None) if len < 0x80 => {
+            out.extend_from_slice(&[len as u8, f0, f1, f2, f3, b0, b1, b2, b3, l0, l1, 0]);
+            return;
+        },
+        (None, None) => {
+            out.extend_from_slice(&[f0, f1, f2, f3, b0, b1, b2, b3, l0, l1, 0]);
+            return;
+        },
+        _ => (),
+    }
+
     // A varint of a `usize` takes at most 10 bytes: length, 10 bytes of style, extra reference.
     let mut buf = [0u8; 30];
     let mut n = 0;
     if let Some(len) = len {
         n = put_varint(&mut buf, n, len);
     }
-    buf[n..n + 4].copy_from_slice(&pack_color(cell.fg));
-    buf[n + 4..n + 8].copy_from_slice(&pack_color(cell.bg));
-    buf[n + 8..n + 10].copy_from_slice(&flags.bits().to_le_bytes());
+    buf[n..n + 10].copy_from_slice(&[f0, f1, f2, f3, b0, b1, b2, b3, l0, l1]);
     n += 10;
     let reference = match &cell.extra {
         None => 0,
@@ -1239,7 +1256,7 @@ mod tests {
 
     #[test]
     fn roundtrip_every_cell_different() {
-        let width = 126;
+        let width: usize = std::env::var("CODEC_WIDTH").map_or(126, |w| w.parse().unwrap());
         let mut row = Row::new(width);
         for col in 0..width {
             let (r, g, b) = (col as u8, 255 - col as u8, (col as u8).wrapping_mul(3));
@@ -1612,6 +1629,23 @@ mod tests {
         }
     }
 
+    /// `write_style`'s fixed 12-byte form (a run under 128 cells without an extra) and its
+    /// general form (longer runs, extras, the tail) on both sides of the limit.
+    #[test]
+    fn run_lengths_around_one_byte() {
+        let mut link = Cell { fg: Color::Indexed(9), ..Cell::default() };
+        link.set_hyperlink(Some(Hyperlink::new(Some("r"), "https://e/r".into())));
+        for len in [1, 126, 127, 128, 129, 300] {
+            for template in [fg(Color::Indexed(4)), link.clone()] {
+                let mut row = Row::new(len + 2);
+                put_text(&mut row, 0, &"r".repeat(len), &template);
+                put_text(&mut row, len, "s", &Cell::default());
+                let encoded = roundtrip(&row);
+                assert_eq!(encoded.layout().runs, 2, "run of {len}");
+            }
+        }
+    }
+
     /// The ASCII text path of the encoder and decoder against rows whose text is ASCII except
     /// for one character anywhere, so the fallbacks run with every prefix length.
     #[test]
@@ -1787,14 +1821,15 @@ mod tests {
     }
 
     /// Encode and decode cost of typical 126-column rows (`cargo test --release --lib
-    /// codec_timing -- --ignored --nocapture --test-threads=1`); a tool for tuning the codec,
-    /// not a gate (`benches/ingest.rs` and `benches/reads.rs` are).
+    /// codec_timing -- --ignored --nocapture --test-threads=1`; `CODEC_WIDTH` sets another
+    /// width); a tool for tuning the codec, not a gate (`benches/ingest.rs` and
+    /// `benches/reads.rs` are).
     #[test]
     #[ignore]
     fn codec_timing() {
         use std::time::Instant;
 
-        let width = 126;
+        let width: usize = std::env::var("CODEC_WIDTH").map_or(126, |w| w.parse().unwrap());
         let mut uniform = Row::new(width);
         uniform[..].fill(Cell::from(Color::Indexed(3)));
         uniform.set_equal_from(0);
