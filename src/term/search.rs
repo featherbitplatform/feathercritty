@@ -302,25 +302,22 @@ impl<T> Term<T> {
         // spacer skips onto the next line first and reads on around the buffer, so a rightward
         // `search_next` limited to a line ending in a leading spacer returned a match from the
         // next line. We keep upstream's glyph completion: the character at `end` is read whole,
-        // so a match may end on the spacer of a wide char that wrapped after `end`
-        // (`expand_wide`). A match ending further than that is outside the range, and we
-        // return none. When `end` is a stale leading spacer (its next line does not start with a
-        // wide char), that completion lands on an unrelated cell of the next line, so a match
-        // ending there is reported at `end` instead. Both searches run as upstream runs them,
-        // so whether there is a match stays upstream's; only its position changes.
+        // so a match may end where the search lands after reading it (`glyph_end`): on the
+        // spacer of a wide char that wrapped after `end`, or, when `end` is a stale leading
+        // spacer (its next line does not start with a wide char), on the second cell of the next
+        // line, as upstream reads it. A match ending further than that, or starting after `end`,
+        // is outside the range, and we return none. Both searches run as upstream runs them, so
+        // whether there is a match stays upstream's, and a match upstream returns inside that
+        // completion is returned unchanged (`stale_spacer_end_keeps_upstream_match`; reporting it
+        // at the stale spacer instead broke parity and made `search_next` skip it).
         // When merging upstream: if upstream bounds its matches by `end` itself, drop this.
         let to_end = self.search_distance(start, end, Direction::Right);
         let to_match = self.search_distance(start, match_end, Direction::Right);
-        if to_match > to_end {
-            let glyph_end = self.glyph_end(end);
-            if to_match > self.search_distance(start, glyph_end, Direction::Right)
-                || self.search_distance(start, match_start, Direction::Right) > to_end
-            {
-                return None;
-            }
-            if self.stale_spacer_end(end) {
-                return Some(match_start..=end);
-            }
+        if to_match > to_end
+            && (to_match > self.search_distance(start, self.glyph_end(end), Direction::Right)
+                || self.search_distance(start, match_start, Direction::Right) > to_end)
+        {
+            return None;
         }
 
         Some(match_start..=match_end)
@@ -619,22 +616,6 @@ impl<T> Term<T> {
                 <= self.search_distance(*m.start(), *m.end(), Direction::Right)
         };
         within(*a.start(), b) || within(*b.start(), a)
-    }
-
-    /// Whether `end` is a stale leading spacer: its next line does not start with a wide char
-    /// (a resize or an erase left it behind).
-    ///
-    /// feathercritty: not in upstream; see `regex_search_right`.
-    fn stale_spacer_end(&self, end: Point) -> bool {
-        // feathercritty (compact history): both points can be in history, read through
-        // `Grid::cell`.
-        self.grid.cell(end).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
-            && (end.line >= self.bottommost_line()
-                || !self
-                    .grid
-                    .cell(Point::new(end.line + 1, Column(0)))
-                    .flags
-                    .contains(Flags::WIDE_CHAR))
     }
 
     /// Advance a grid iterator over fullwidth characters.
@@ -2370,10 +2351,10 @@ mod tests {
     #[test]
     fn range_ending_on_stale_leading_spacer() {
         // Differential soak seed 543: a rightward search limited to line 1, which ends in a stale
-        // leading spacer. Reading on as if a wide char wrapped there returned a match ending on
-        // line 2's second cell. The search still reads the cell after the spacer (line 2's first
-        // cell) in its place as upstream does, but a match ending there is reported at the
-        // spacer, and one that lies entirely on line 2 is not returned.
+        // leading spacer. The search reads the cell after the spacer (line 2's first cell) in
+        // its place and lands on line 2's second cell, as upstream does, so "b +" ends there
+        // (0.26.0 returns the same match). A match that lies entirely on line 2 (0.26.0 returns
+        // the blank at (2,1)) is outside the range and not returned.
         #[rustfmt::skip]
         let term = term_from_rows(0, &[
             ("abc", "..."),
@@ -2386,12 +2367,44 @@ mod tests {
         let mut regex = RegexSearch::new("b +").unwrap();
         let result = term.search_next(&mut regex, origin, Direction::Right, Side::Left, Some(0));
         let match_start = Point::new(Line(1), Column(1));
-        let match_end = Point::new(Line(1), Column(2));
+        let match_end = Point::new(Line(2), Column(1));
         assert_eq!(result, Some(match_start..=match_end));
 
         let mut regex = RegexSearch::new(" ").unwrap();
         let result = term.search_next(&mut regex, origin, Direction::Right, Side::Left, Some(0));
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn stale_spacer_end_keeps_upstream_match() {
+        // Differential soak seed 5000017 (`random_streams`, step 172): a rightward search limited
+        // to line -1, which ends in a stale leading spacer (line 0 starts with a blank and holds
+        // a stray spacer). Reading the spacer, the search reads line 0's first cell in its place
+        // and lands on its second cell, so the blank match at the spacer ends on (0,1). 0.26.0
+        // returns that match and stops there; reporting it at the spacer instead made
+        // `search_next` skip it (its end then lay before the origin) and return the first match
+        // of the line.
+        #[rustfmt::skip]
+        let term = term_from_rows(1, &[
+            ("Y foo_barZ ", "..........L"),
+            ("           ", ".s........."),
+        ]);
+        let origin = Point::new(Line(0), Column(0));
+
+        let mut regex = RegexSearch::new(" ").unwrap();
+        let result = term.search_next(&mut regex, origin, Direction::Right, Side::Right, Some(0));
+        let match_start = Point::new(Line(-1), Column(10));
+        let match_end = Point::new(Line(0), Column(1));
+        assert_eq!(result, Some(match_start..=match_end));
+
+        // The iterator over the line returns both blanks and stops at the spacer's completion.
+        let start = Point::new(Line(-1), Column(0));
+        let end = Point::new(Line(-1), Column(10));
+        let mut regex = RegexSearch::new(" ").unwrap();
+        let matches: Vec<_> =
+            RegexIter::new(start, end, Direction::Right, &term, &mut regex).take(10).collect();
+        let first = Point::new(Line(-1), Column(1));
+        assert_eq!(matches, [first..=first, match_start..=match_end]);
     }
 
     #[test]
