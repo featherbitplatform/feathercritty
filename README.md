@@ -52,7 +52,7 @@ With an empty title stack the original line panics (`Vec::remove(0)` on an empty
 ### 4. Packaging
 
 - The package is named `feathercritty`; the doc test and `tests/ref.rs` use the new name. Authors and license are unchanged; `repository` and `homepage` point here, and `publish = false` keeps the crate off crates.io.
-- Version scheme: `<alacritty_terminal version>+fbterm.<n>`, currently `0.26.0+fbterm.3`. The build metadata (`+fbterm.n`) counts this fork's revisions on top of one upstream release and starts again at 1 when `main` moves to a new upstream release. Cargo ignores build metadata when comparing versions, which does not matter for a git dependency pinned by `rev`.
+- Version scheme: `<alacritty_terminal version>+fbterm.<n>`, currently `0.26.0+fbterm.4`. The build metadata (`+fbterm.n`) counts this fork's revisions on top of one upstream release and starts again at 1 when `main` moves to a new upstream release. Cargo ignores build metadata when comparing versions, which does not matter for a git dependency pinned by `rev`.
 - The manifest no longer inherits `edition` and `rust-version` from the Alacritty workspace (both set to the workspace's values, 2024 and 1.85.0), and `readme` points to this file.
 - `LICENSE-APACHE` is a copy of the upstream file instead of a symlink into the Alacritty workspace. The Alacritty workspace's `rustfmt.toml` (nightly options) and the `Cargo.lock` shipped with the published 0.26.0 crate are included so the crate formats and builds on its own.
 - `src/lib.rs` allows `clippy::question_mark`: clippy releases newer than the upstream code flag three matches in `src/tty/unix.rs`, and the crate denies `clippy::all`. Allowing the lint keeps the upstream code unchanged.
@@ -82,13 +82,69 @@ The trigger is a leading spacer.
     - **`regex_search_right` and `regex_search_left`.** They return no match whose far end lies beyond that completion; `regex_search_right` also returns none that starts beyond the range. When the end is a stale leading spacer, `regex_search_right` reports a match ending on its completion cell as ending at the spacer itself (`stale_spacer_end`). The second search, back to `start`, may still complete the character at `start`, up to two cells past it, as 0.26.0 does.
     - **Leftward `RegexIter::next`.** It cuts a match whose right end lies beyond the start of a bounded range back to that start. A match that cannot be cut without turning it around ends the iteration.
     - **Text and decisions.** Both searches always read the text as 0.26.0 does, so whether there is a match stays 0.26.0's; only where it is reported changes, and only for matches 0.26.0 would have returned outside the range.
-  - **Unchanged results.** Where 0.26.0 terminates with matches inside the range, it runs the same code and gives the same results; the bounds and checks are not reached there. The differential test against 0.26.0 (on `feature/compact-history`) checks this.
+  - **Unchanged results.** Where 0.26.0 terminates with matches inside the range, it runs the same code and gives the same results; the bounds and checks are not reached there. The differential test against 0.26.0 (`tests/differential.rs`, with the oracle described under Development) checks this.
 - Tests: `wrapped_wide_*`, `stale_leading_spacer_*`, `stale_spacer_*`, `range_ending_on_*` and `empty_pattern_terminates`. They run with a timeout, so a regression fails instead of hanging. They include the grids from the differential soak and an exhaustive run over 2- to 4-column grids with wrapped and stale leading spacers, with and without scrollback. The exhaustive run also checks that every match lies in its range (allowing only the glyph completion at each end) and that `RegexIter` never repeats a match, and going right never returns one overlapping the previous one.
 - When merging upstream: re-run those tests with this change removed. If upstream fixed the end-cell skip, bounds the loops itself and keeps matches in range, and they pass, drop this change and its helpers. If `skip_fullwidth`, `expand_wide` or `RegexIter` changed, check that the `// feathercritty:` comments still describe the code. Keep the hard bounds unless upstream has its own.
 - Not changed:
   - On 2-column grids, the right step from column 0 over a leading spacer to column 1 also looks like a line break to `regex_search_internal`'s line-break check, which resets the match. This is 0.26.0 behavior, and it does not hang.
   - A stale leading spacer is read as 0.26.0 reads it. Going right, the search reads the next cell in its place and skips the cell after that; going left, it reads a blank.
   - Going right past a stale leading spacer, the two searches can disagree. The first one reads the next line's first cell in place of the spacer; the second one, reading back from where the first one stopped, reads the cell after it. The match then fails and the iteration ends there, so later matches in the range are not returned. This is 0.26.0 behavior.
+
+### 6. Screen and history split (explicit history reads)
+
+`0.26.0+fbterm.4`. Phase 1 of the compact scrollback work: the grid keeps the visible screen and the scrollback in two containers, and every read of scrollback goes through an explicit API. The scrollback is still dense (a `VecDeque` of `Row`s) in this release, so memory use and speed are about what 0.26.0 had (ingest within about 4%, see the benchmark note below); the point is the API, which lets a later release store history compactly without changing callers.
+
+**API**
+- `Grid<T>` is `{ screen: Screen<T>, history: History<T> }`. `Grid::screen()` and `Grid::screen_mut()` return the screen, a handle over upstream's `Storage` ring that implements `Index`/`IndexMut` for `Line` and `Point` with upstream's `debug_assert!` range checks. The `max_scroll_limit` field is now `history.limit()`.
+- **`Grid` itself no longer implements `Index`/`IndexMut`.** Indexing is screen-only (`grid.screen()[line]`, lines `0..screen_lines`). History lines (negative `Line`) are read through:
+  - `RowReader<T>`: `RowReader::new()` and `reader.row(&grid, line) -> &Row<T>` for a whole row of screen or history. Keep one reader and reuse it; a later release decodes history rows into its scratch row.
+  - `Grid::cell(point) -> T` (an owned cell), `Grid::wraps(line) -> bool` and `Grid::is_clear(line) -> bool`, for single reads that work for screen and history lines.
+- `GridIterator` yields `Indexed<T>` by value (it used to borrow `&T` from the grid). `GridIterator::cell(&self) -> &T` borrows the current cell without cloning; `advance`/`retreat` (`pub(crate)`) step without producing an item.
+- `History<T>` (`src/grid/history.rs`, new) owns the scrollback: `new`, `len`, `is_empty`, `limit`, `set_limit`, `push_newest(&Row)`, `pop_newest`, `pop_oldest`, `read`, `update`, `wraps`, `is_clear`, `clear`. Cells stored in it implement `HistoryCell` (implemented for `Cell` in `src/term/cell.rs`).
+- The only write to history outside scrolling and resizing is the one in `Term::input` (`Grid::update_history_row`).
+- Temporary: `History::push_newest_recycle` (`pub(crate)`) swaps the departing screen row for a recycled one in `scroll_up`, as upstream's ring rotation did. A later release replaces it with `push_newest` plus an in-place reset.
+- serde form is unchanged: the same fields as upstream (`raw.inner` from the bottom line up, `zero` 0, `len`, `visible_lines`, the scroll limit), through private proxy structs. Deserialization splits at the grid's `lines`, because old reference files carry a stale `visible_lines`. `tests/ref/` data is unchanged.
+
+**Merging a new upstream release.** Upstream code that indexes the grid (`self.grid[point]`, `grid[line]`, `grid.raw`-style access) will not compile after a merge. Classify each site:
+- *Screen*: the line is always `0..screen_lines` (handler writes, cursor, the visible region). Use `grid.screen()` / `grid.screen_mut()`.
+- *History-capable*: the line can be negative (selection text, search, vi motions, anything that follows a point or a neighbouring line). Use `Grid::cell`, `Grid::wraps`, `Grid::is_clear`, a `RowReader`, or `GridIterator`.
+
+The sites classified as history-capable in 0.26.0: `Term::line_to_string`, `Term::expand_wide`, the vi cursor in `RenderableCursor`, in `search.rs` `regex_search_internal`, `glyph_end`, `stale_spacer_end`, `skip_fullwidth`, `bracket_search`, `inline_search_right`, `line_search_left`/`line_search_right`, in `vi_mode.rs` `ParagraphUp`/`ParagraphDown` and `semantic` (`expand_semantic`, `is_space`, `is_wrap`), and every `GridIterator` user (`display_iter`, `clear_viewport`, the regex, bracket, semantic and inline searches). Everything else is screen.
+
+**Behavior changes made with it** (both are also patched into the differential test's oracle, see Development)
+1. *`Row` `occ` invariant* (`src/grid/row.rs`, `Row::grow` and `Row::append`). Upstream documents that all cells after `occ` are equal, and `Row::reset` relies on it, but `grow` padded with default cells without raising `occ`, and `append` did `occ += n` even when `occ` was below the old length. A reset could then leave stale cells behind, and what a recycled row looked like depended on which physical row the ring had recycled.
+   - Before: `grow` left `occ` alone; `append` set `occ += vec.len()`.
+   - After: `grow` first sets `occ = max(occ, len)`; `append` sets `occ = len + vec.len()` when `vec` is not empty.
+2. *Reads outside the grid are "no row"*. 0.26.0 read lines just outside `topmost_line()..=bottommost_line()` in a few places: debug builds failed a `debug_assert!`, release builds read whichever row the ring held there (a cache row or a wrapped-around screen row).
+   - `Term::line_to_string`. Before: a selected line ending in a leading wide-char spacer appended `grid[line - 1][Column(0)].c`, even on the topmost line. After: it adds nothing above the topmost line.
+   - Vi motions. Before: the cursor could leave the grid (`Middle` on a one-line screen without history, `Right`/`Last` across a wrap or leading spacer on the bottom line). After: `ViModeCursor::motion` clamps the point into the grid (`grid_clamp(term, Boundary::Grid)`).
+   - Iterators and readers. Before: undefined (see above). After: `Grid::cell` and `GridIterator::cell` return a default cell, `Grid::wraps` returns false, `Grid::is_clear` returns true. `RowReader::row` and the `History` methods keep a `debug_assert!` (a caller bug) and in release return default cells of the grid's width, a no-op, false and true.
+
+**Other changes**
+- `Storage::initialize` grows by exactly the rows needed (upstream added at least 1000 at a time, a history cache); it keeps upstream's hidden rows beyond `len`, which `scroll_up` recycles, and adds a small spare-row pool.
+- `Grid` equality compares content, including history.
+- `Grid::scroll_up` moves the departing rows into history, then rotates and resets as upstream did.
+- `resize.rs`: `grow_lines` moves popped history rows onto the new top rows and removes only the rows `scroll_up` pushed; it clamps the display offset unconditionally (upstream's `decrease_scroll_limit` always clamped). Column reflow collects screen and history into one `Vec` and splits it back. Every container call that differs from upstream carries a `// feathercritty:` comment, so the algorithm text can be diffed against upstream.
+
+**Changed upstream files, and what to watch when merging**
+- `src/grid/mod.rs`: `Grid` fields, `Index`/`IndexMut` removed, `scroll_up`/`scroll_down`/`clear_viewport`/`reset`/`update_history`/`clear_history`/`initialize_all`, `GridIterator`, serde, `PartialEq`. Re-read every upstream change to these and to anything that touched `raw` or `max_scroll_limit`; classify new grid reads as screen or history.
+- `src/grid/resize.rs`: `grow_lines`, `shrink_lines`, the reflow container calls. Diff the algorithm against upstream; only the marked container calls differ.
+- `src/grid/row.rs`: `grow`, `append`, manual `Default` (no `T: Default` bound) and `Clone` (allocation-reusing `clone_from`). Check new `Row` mutators keep the `occ` invariant.
+- `src/grid/storage.rs`: `initialize`, spare pool, `from_rows`, struct literals gained `spare`. Check changes to the hidden-row recycling.
+- `src/grid/tests.rs`: tests rewritten for the split (list below). Keep upstream's new tests if they only touch the screen; port the others to `screen()` or `History`.
+- `src/term/mod.rs`: handler writes through `screen_mut()`, `line_to_string` (shared `RowReader`, topmost guard), `expand_wide`, `RenderableCursor`, `Term::input`'s history write, `mock_term`. New code that indexes the grid must be classified.
+- `src/term/search.rs`: grid access only (plus the change-5 logic): iterator stepping, `Grid::wraps`/`cell`. Check that the `// feathercritty:` comments still describe the code.
+- `src/term/cell.rs`: `impl HistoryCell for Cell`. If `Cell` gains a field, keep `row_wraps` in step.
+- `src/vi_mode.rs`: `Grid::cell`/`is_clear` reads, the motion clamp. New motions that look at neighbouring lines need a classification.
+- `tests/ref.rs`: the failure printout reads through `RowReader`.
+- New: `src/grid/history.rs`, `tests/oracle/`, `tests/oracle_pristine.rs`, `tests/support/`, `tests/differential.rs`, `benches/`, `examples/memory.rs`.
+
+**Replaced tests** (old to new)
+- `storage.rs`: `grow_after_zero` to `grow_after_zero_adds_exact_rows`; `grow_before_zero` to `grow_before_zero_adds_exact_rows`; `initialize` to `initialize_adds_exact_rows`. The other storage tests are upstream's; only their struct literals gained `spare`.
+- `grid/tests.rs`: `scroll_down_with_history` pushes with `history.push_newest` instead of the removed `increase_scroll_limit`; `test_iter` uses owned items.
+- New tests cover the split (`scroll_up_*`, `grow_lines_*`, `shrink_lines_*`, `row_reader_and_cell_read_screen_and_history`, `reads_outside_the_grid_are_no_row`, `iterator_*`, `serde_keeps_upstream_format`, and others) and the `occ` fix (`grow_raises_occ_to_old_len`, `append_keeps_occ_invariant`).
+
+**Benchmarks.** `cargo bench` (`benches/`, `benches/BASELINE.md`) compares against the oracle. The spec gate for resizing the screen by lines only is absolute, not a ratio: at most 50 microseconds per step of up to 10 lines and 1 ms per 37 to 1 to 37 pair, with a full 10,000-line history. Upstream does O(1) counter updates there; the fork moves the rows between the two containers (about 0.08 microseconds per small step), so the old ratio row (about 1.9) is informational only.
 
 ## Development
 
@@ -100,6 +156,14 @@ cargo test --no-default-features
 ```
 
 CI runs the same on Linux, macOS and Windows.
+
+### The differential test's oracle
+
+`tests/differential.rs` compares feathercritty with 0.26.0 on generated byte streams. Since `0.26.0+fbterm.4` the comparison crate is the vendored, patched 0.26.0 source in `tests/oracle/`, a path dev-dependency named `alacritty_terminal`, instead of the crates.io release:
+- The oracle is the published 0.26.0 `src/`, `Cargo.toml` and `LICENSE-APACHE` plus exactly the patches listed in `tests/oracle/PATCHES.md` (the `occ` fix and the "no row" reads of change 6; changes 1 and 5 are modeled by the harness, not patched).
+- `tests/oracle_pristine.rs` checks it offline: it applies `PATCHES.diff` in reverse and compares SHA-256 values with `MANIFEST`, so the vendored files are provably 0.26.0 plus the patches.
+- Vendored files are exempt from the fork notice line (unmodified ones are byte-identical to upstream; patched ones carry a "Patched by the featherbit authors" line). `PATCHES.diff` and `MANIFEST` are data and carry none.
+- To move the oracle to a new upstream release, follow "Moving to a new upstream release" in `tests/oracle/PATCHES.md` and "Moving the oracle to a newer upstream release" in `tests/support/mod.rs`.
 
 ## Updating from upstream
 
@@ -129,7 +193,7 @@ The `upstream` branch and the release base are produced with `git subtree split`
 3. Adopt upstream changes on `main` by merging, never by rebasing: featherbit terminal pins commits of `main`, and they must stay reachable.
 
    - A single upstream fix: `git cherry-pick -x <sha from upstream>`.
-   - A new release: `git merge alacritty_terminal_vX.Y.Z`, resolve conflicts (usually `Cargo.toml` and `Cargo.lock`), drop changes that upstream now carries, set the version to `X.Y.Z+fbterm.1`, and update the change list above.
+   - A new release: `git merge alacritty_terminal_vX.Y.Z`, resolve conflicts (usually `Cargo.toml` and `Cargo.lock`), drop changes that upstream now carries, set the version to `X.Y.Z+fbterm.1`, re-vendor the oracle, and update the change list above.
 
 4. Run the checks under [Development](#development), push `main`, and bump the `rev` in featherbit terminal.
 

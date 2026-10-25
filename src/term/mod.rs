@@ -16,7 +16,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
-use crate::grid::{Dimensions, Grid, GridIterator, Scroll};
+use crate::grid::{Dimensions, Grid, GridIterator, RowReader, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
 use crate::term::cell::{Cell, Flags, LineLength};
@@ -534,16 +534,26 @@ impl<T> Term<T> {
 
         let mut res = String::new();
 
+        // feathercritty: one reader for every `line_to_string` call (see there).
+        let mut reader = RowReader::new();
+
         match self.selection.as_ref() {
             Some(Selection { ty: SelectionType::Block, .. }) => {
                 for line in (start.line.0..end.line.0).map(Line::from) {
                     res += self
-                        .line_to_string(line, start.column..end.column, start.column.0 != 0)
+                        .line_to_string(
+                            &mut reader,
+                            line,
+                            start.column..end.column,
+                            start.column.0 != 0,
+                        )
                         .trim_end();
                     res += "\n";
                 }
 
-                res += self.line_to_string(end.line, start.column..end.column, true).trim_end();
+                res += self
+                    .line_to_string(&mut reader, end.line, start.column..end.column, true)
+                    .trim_end();
             },
             Some(Selection { ty: SelectionType::Lines, .. }) => {
                 res = self.bounds_to_string(start, end) + "\n";
@@ -560,26 +570,35 @@ impl<T> Term<T> {
     pub fn bounds_to_string(&self, start: Point, end: Point) -> String {
         let mut res = String::new();
 
+        // feathercritty: one reader for every `line_to_string` call (see there).
+        let mut reader = RowReader::new();
+
         for line in (start.line.0..=end.line.0).map(Line::from) {
             let start_col = if line == start.line { start.column } else { Column(0) };
             let end_col = if line == end.line { end.column } else { self.last_column() };
 
-            res += &self.line_to_string(line, start_col..end_col, line == end.line);
+            res += &self.line_to_string(&mut reader, line, start_col..end_col, line == end.line);
         }
 
         res.strip_suffix('\n').map(str::to_owned).unwrap_or(res)
     }
 
     /// Convert a single line in the grid to a String.
+    ///
+    /// feathercritty: upstream indexed `self.grid[line]`; the line can be a history line, so the
+    /// row is read through `reader` (a copy for history rows, the row itself on the screen).
+    /// The caller keeps one reader across lines so the copies reuse one allocation. If upstream
+    /// adds a grid read here, read it from `grid_line` or `self.grid.cell`.
     fn line_to_string(
         &self,
+        reader: &mut RowReader<Cell>,
         line: Line,
         mut cols: Range<Column>,
         include_wrapped_wide: bool,
     ) -> String {
         let mut text = String::new();
 
-        let grid_line = &self.grid[line];
+        let grid_line = reader.row(&self.grid, line);
         let line_length = cmp::min(grid_line.line_length(), cols.end + 1);
 
         // Include wide char when trailing spacer is selected.
@@ -615,20 +634,29 @@ impl<T> Term<T> {
             }
         }
 
+        // feathercritty: upstream read `self.grid[line]` again here; it is `grid_line`.
         if cols.end >= self.columns() - 1
-            && (line_length.0 == 0
-                || !self.grid[line][line_length - 1].flags.contains(Flags::WRAPLINE))
+            && (line_length.0 == 0 || !grid_line[line_length - 1].flags.contains(Flags::WRAPLINE))
         {
             text.push('\n');
         }
 
         // If wide char is not part of the selection, but leading spacer is, include it.
+        //
+        // feathercritty: upstream read `self.grid[line - 1i32][Column(0)]` (the line above, as
+        // 0.26.0 does), which can be a history line: read through `Grid::cell`. On the topmost
+        // line that line does not exist ("no row"); upstream's indexing then failed a
+        // `debug_assert!` in debug builds and read whichever row its ring held in release
+        // builds. Here that case adds nothing (a fork behavior change, also applied to the
+        // differential test's oracle, `tests/oracle/PATCHES.md`). When merging upstream: keep
+        // the topmost-line condition while this reads the line above.
         if line_length == self.columns()
             && line_length.0 >= 2
             && grid_line[line_length - 1].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
             && include_wrapped_wide
+            && line > self.grid.topmost_line()
         {
-            text.push(self.grid[line - 1i32][Column(0)].c);
+            text.push(self.grid.cell(Point::new(line - 1i32, Column(0))).c);
         }
 
         text
@@ -907,7 +935,9 @@ impl<T> Term<T> {
 
     /// Jump to the end of a wide cell.
     pub fn expand_wide(&self, mut point: Point, direction: Direction) -> Point {
-        let flags = self.grid[point.line][point.column].flags;
+        // feathercritty: upstream indexed `self.grid[...]` here and for `prev` below; both can be
+        // history points, so they read through `Grid::cell`.
+        let flags = self.grid.cell(point).flags;
 
         match direction {
             Direction::Right if flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) => {
@@ -923,7 +953,7 @@ impl<T> Term<T> {
                 }
 
                 let prev = point.sub(self, Boundary::Grid, 1);
-                if self.grid[prev].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                if self.grid.cell(prev).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
                     point = prev;
                 }
             },
@@ -1003,16 +1033,32 @@ impl<T> Term<T> {
             // Remove wide char and spacer.
             let wide = cursor_cell.flags.contains(Flags::WIDE_CHAR);
             let point = self.grid.cursor.point;
+            // feathercritty: upstream indexed `self.grid[...]` for these writes; the cursor line is
+            // on the screen, the line above it can be the newest history row.
             if wide && point.column < self.last_column() {
-                self.grid[point.line][point.column + 1].flags.remove(Flags::WIDE_CHAR_SPACER);
+                self.grid.screen_mut()[point.line][point.column + 1]
+                    .flags
+                    .remove(Flags::WIDE_CHAR_SPACER);
             } else if point.column > 0 {
-                self.grid[point.line][point.column - 1].clear_wide();
+                self.grid.screen_mut()[point.line][point.column - 1].clear_wide();
             }
 
             // Remove leading spacers.
+            //
+            // feathercritty: the one write into history (design spec 5.5). With the cursor on
+            // line 0 the line above is history line -1, changed through `History::update`.
             if point.column <= 1 && point.line != self.topmost_line() {
                 let column = self.last_column();
-                self.grid[point.line - 1i32][column].flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                let line = point.line - 1i32;
+                if line.0 >= 0 {
+                    self.grid.screen_mut()[line][column]
+                        .flags
+                        .remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                } else {
+                    self.grid.update_history_row(line, |row| {
+                        row[column].flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+                    });
+                }
             }
 
             cursor_cell = self.grid.cursor_cell();
@@ -1083,12 +1129,13 @@ impl<T: EventListener> Handler for Term<T> {
             }
 
             // Put zerowidth characters over first fullwidth character cell.
+            // feathercritty: upstream `self.grid[line]`; the cursor line is on the screen.
             let line = self.grid.cursor.point.line;
-            if self.grid[line][column].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            if self.grid.screen()[line][column].flags.contains(Flags::WIDE_CHAR_SPACER) {
                 column.0 = column.saturating_sub(1);
             }
 
-            self.grid[line][column].push_zerowidth(c);
+            self.grid.screen_mut()[line][column].push_zerowidth(c);
             return;
         }
 
@@ -1102,7 +1149,8 @@ impl<T: EventListener> Handler for Term<T> {
         if self.mode.contains(TermMode::INSERT) && self.grid.cursor.point.column + width < columns {
             let line = self.grid.cursor.point.line;
             let col = self.grid.cursor.point.column;
-            let row = &mut self.grid[line][..];
+            // feathercritty: upstream `self.grid[line]`; the cursor line is on the screen.
+            let row = &mut self.grid.screen_mut()[line][..];
 
             for col in (col.0..(columns - width)).rev() {
                 row.swap(col + width, col);
@@ -1151,7 +1199,8 @@ impl<T: EventListener> Handler for Term<T> {
 
         for line in (0..self.screen_lines()).map(Line::from) {
             for column in 0..self.columns() {
-                let cell = &mut self.grid[line][Column(column)];
+                // feathercritty: upstream `self.grid[line]`; screen lines only.
+                let cell = &mut self.grid.screen_mut()[line][Column(column)];
                 *cell = Cell::default();
                 cell.c = 'E';
             }
@@ -1206,7 +1255,8 @@ impl<T: EventListener> Handler for Term<T> {
         let line = cursor.point.line;
         self.damage.damage_line(line.0 as usize, 0, self.columns() - 1);
 
-        let row = &mut self.grid[line][..];
+        // feathercritty: upstream `self.grid[line]`; the cursor line is on the screen.
+        let row = &mut self.grid.screen_mut()[line][..];
 
         for offset in (0..num_cells).rev() {
             row.swap(destination + offset, source.0 + offset);
@@ -1536,7 +1586,8 @@ impl<T: EventListener> Handler for Term<T> {
         let bg = self.grid.cursor.template.bg;
         let line = cursor.point.line;
         self.damage.damage_line(line.0 as usize, start.0, end.0);
-        let row = &mut self.grid[line];
+        // feathercritty: upstream `self.grid[line]`; the cursor line is on the screen.
+        let row = &mut self.grid.screen_mut()[line];
         for cell in &mut row[start..end] {
             *cell = bg.into();
         }
@@ -1557,7 +1608,8 @@ impl<T: EventListener> Handler for Term<T> {
 
         let line = cursor.point.line;
         self.damage.damage_line(line.0 as usize, 0, self.columns() - 1);
-        let row = &mut self.grid[line][..];
+        // feathercritty: upstream `self.grid[line]`; the cursor line is on the screen.
+        let row = &mut self.grid.screen_mut()[line][..];
 
         for offset in 0..num_cells {
             row.swap(start + offset, end + offset);
@@ -1656,7 +1708,8 @@ impl<T: EventListener> Handler for Term<T> {
 
         self.damage.damage_line(point.line.0 as usize, left.0, right.0 - 1);
 
-        let row = &mut self.grid[point.line];
+        // feathercritty: upstream `self.grid[point.line]`; the cursor line is on the screen.
+        let row = &mut self.grid.screen_mut()[point.line];
         for cell in &mut row[left..right] {
             *cell = bg.into();
         }
@@ -1773,7 +1826,8 @@ impl<T: EventListener> Handler for Term<T> {
 
                 // Clear up to the current column in the current line.
                 let end = cmp::min(cursor.column + 1, Column(self.columns()));
-                for cell in &mut self.grid[cursor.line][..end] {
+                // feathercritty: upstream `self.grid[cursor.line]`; the cursor is on the screen.
+                for cell in &mut self.grid.screen_mut()[cursor.line][..end] {
                     *cell = bg.into();
                 }
 
@@ -1782,7 +1836,8 @@ impl<T: EventListener> Handler for Term<T> {
             },
             ansi::ClearMode::Below => {
                 let cursor = self.grid.cursor.point;
-                for cell in &mut self.grid[cursor.line][cursor.column..] {
+                // feathercritty: upstream `self.grid[cursor.line]`; the cursor is on the screen.
+                for cell in &mut self.grid.screen_mut()[cursor.line][cursor.column..] {
                     *cell = bg.into();
                 }
 
@@ -2380,7 +2435,8 @@ impl RenderableCursor {
         // Cursor position.
         let vi_mode = term.mode().contains(TermMode::VI);
         let mut point = if vi_mode { term.vi_mode_cursor.point } else { term.grid.cursor.point };
-        if term.grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) {
+        // feathercritty: upstream `term.grid[point]`; the vi cursor can be in history.
+        if term.grid.cell(point).flags.contains(Flags::WIDE_CHAR_SPACER) {
             point.column -= 1;
         }
 
@@ -2487,21 +2543,25 @@ pub mod test {
         let mut term = Term::new(Config::default(), &size, VoidListener);
 
         // Fill terminal with content.
+        //
+        // feathercritty: upstream `term.grid[line]`; a mock terminal has no history, every
+        // line is a screen line.
+        let screen = term.grid.screen_mut();
         for (line, text) in lines.iter().enumerate() {
             let line = Line(line as i32);
             if !text.ends_with('\r') && line + 1 != lines.len() {
-                term.grid[line][Column(num_cols - 1)].flags.insert(Flags::WRAPLINE);
+                screen[line][Column(num_cols - 1)].flags.insert(Flags::WRAPLINE);
             }
 
             let mut index = 0;
             for c in text.chars().take_while(|c| *c != '\r') {
-                term.grid[line][Column(index)].c = c;
+                screen[line][Column(index)].c = c;
 
                 // Handle fullwidth characters.
                 let width = c.width().unwrap();
                 if width == 2 {
-                    term.grid[line][Column(index)].flags.insert(Flags::WIDE_CHAR);
-                    term.grid[line][Column(index + 1)].flags.insert(Flags::WIDE_CHAR_SPACER);
+                    screen[line][Column(index)].flags.insert(Flags::WIDE_CHAR);
+                    screen[line][Column(index + 1)].flags.insert(Flags::WIDE_CHAR_SPACER);
                 }
 
                 index += width;
@@ -2512,6 +2572,8 @@ pub mod test {
     }
 }
 
+// feathercritty: upstream's tests indexed `Grid` directly; screen writes go through
+// `Grid::screen_mut()`/`screen()`, history writes through `Grid::update_line`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2592,18 +2654,18 @@ mod tests {
                 continue;
             }
 
-            grid[Line(i)][Column(0)].c = '"';
+            grid.screen_mut()[Line(i)][Column(0)].c = '"';
 
             for j in 1..4 {
-                grid[Line(i)][Column(j)].c = 'a';
+                grid.screen_mut()[Line(i)][Column(j)].c = 'a';
             }
 
-            grid[Line(i)][Column(4)].c = '"';
+            grid.screen_mut()[Line(i)][Column(4)].c = '"';
         }
-        grid[Line(2)][Column(0)].c = ' ';
-        grid[Line(2)][Column(4)].c = ' ';
-        grid[Line(2)][Column(4)].flags.insert(Flags::WRAPLINE);
-        grid[Line(3)][Column(0)].c = ' ';
+        grid.screen_mut()[Line(2)][Column(0)].c = ' ';
+        grid.screen_mut()[Line(2)][Column(4)].c = ' ';
+        grid.screen_mut()[Line(2)][Column(4)].flags.insert(Flags::WRAPLINE);
+        grid.screen_mut()[Line(3)][Column(0)].c = ' ';
 
         // Multiple lines contain an empty line.
         term.selection = Some(Selection::new(
@@ -2635,13 +2697,13 @@ mod tests {
         let mut grid: Grid<Cell> = Grid::new(3, 5, 0);
         for i in 0..5 {
             for j in 0..2 {
-                grid[Line(j)][Column(i)].c = 'a';
+                grid.screen_mut()[Line(j)][Column(i)].c = 'a';
             }
         }
-        grid[Line(0)][Column(0)].c = '"';
-        grid[Line(0)][Column(3)].c = '"';
-        grid[Line(1)][Column(2)].c = '"';
-        grid[Line(0)][Column(4)].flags.insert(Flags::WRAPLINE);
+        grid.screen_mut()[Line(0)][Column(0)].c = '"';
+        grid.screen_mut()[Line(0)][Column(3)].c = '"';
+        grid.screen_mut()[Line(1)][Column(2)].c = '"';
+        grid.screen_mut()[Line(0)][Column(4)].flags.insert(Flags::WRAPLINE);
 
         let mut escape_chars = String::from("\"");
 
@@ -2682,10 +2744,10 @@ mod tests {
         let mut term = Term::new(Config::default(), &size, VoidListener);
         let mut grid: Grid<Cell> = Grid::new(1, 5, 0);
         for i in 0..5 {
-            grid[Line(0)][Column(i)].c = 'a';
+            grid.screen_mut()[Line(0)][Column(i)].c = 'a';
         }
-        grid[Line(0)][Column(0)].c = '"';
-        grid[Line(0)][Column(3)].c = '"';
+        grid.screen_mut()[Line(0)][Column(0)].c = '"';
+        grid.screen_mut()[Line(0)][Column(3)].c = '"';
 
         mem::swap(&mut term.grid, &mut grid);
 
@@ -2703,17 +2765,17 @@ mod tests {
         let mut term = Term::new(Config::default(), &size, VoidListener);
         let grid = term.grid_mut();
         for i in 1..4 {
-            grid[Line(i)][Column(0)].c = '"';
+            grid.screen_mut()[Line(i)][Column(0)].c = '"';
 
             for j in 1..4 {
-                grid[Line(i)][Column(j)].c = 'a';
+                grid.screen_mut()[Line(i)][Column(j)].c = 'a';
             }
 
-            grid[Line(i)][Column(4)].c = '"';
+            grid.screen_mut()[Line(i)][Column(4)].c = '"';
         }
-        grid[Line(2)][Column(2)].c = ' ';
-        grid[Line(2)][Column(4)].flags.insert(Flags::WRAPLINE);
-        grid[Line(3)][Column(4)].c = ' ';
+        grid.screen_mut()[Line(2)][Column(2)].c = ' ';
+        grid.screen_mut()[Line(2)][Column(4)].flags.insert(Flags::WRAPLINE);
+        grid.screen_mut()[Line(3)][Column(4)].c = ' ';
 
         term.selection = Some(Selection::new(
             SelectionType::Block,
@@ -2762,7 +2824,7 @@ mod tests {
         term.configure_charset(CharsetIndex::G0, StandardCharset::SpecialCharacterAndLineDrawing);
         term.input('a');
 
-        assert_eq!(term.grid()[cursor].c, '▒');
+        assert_eq!(term.grid().screen()[cursor].c, '▒');
     }
 
     #[test]

@@ -1,6 +1,13 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
 //! Grid resize and reflow.
+//!
+//! feathercritty: the algorithms are upstream's, line for line; only the containers differ
+//! since the grid holds its screen and its history apart (`Grid` in `mod.rs`). Every container
+//! call that differs from upstream is marked `// feathercritty:` so this file can be diffed
+//! against upstream's when merging; port upstream changes onto these containers. Phase 1 of the
+//! compact history work: the column reflow still collects every row into one dense `Vec`
+//! (`take_all_rows`) and splits the result back (`replace_all_rows`).
 
 use std::cmp::{Ordering, max, min};
 use std::mem;
@@ -10,6 +17,35 @@ use crate::term::cell::{Flags, ResetDiscriminant};
 
 use crate::grid::row::Row;
 use crate::grid::{Dimensions, Grid, GridCell};
+
+impl<T> Grid<T> {
+    /// Remove every row, screen and history, in upstream's `Storage::take_all` order: the
+    /// bottom screen line first, up to line 0, then the history from the newest row to the
+    /// oldest (feathercritty).
+    fn take_all_rows(&mut self) -> Vec<Row<T>> {
+        let mut rows = self.screen.raw.take_all();
+        rows.reserve(self.history.len());
+        let mut row = Row::default();
+        while self.history.pop_newest(&mut row) {
+            rows.push(mem::take(&mut row));
+        }
+        rows
+    }
+
+    /// Store `rows`, ordered as `take_all_rows` returns them, as the new content: the first
+    /// `self.lines` rows become the screen, the rest the history (feathercritty: replaces
+    /// upstream's `Storage::replace_inner`). The reflow always leaves at least `self.lines`
+    /// rows and at most `history.limit()` more.
+    fn replace_all_rows(&mut self, mut rows: Vec<Row<T>>) {
+        debug_assert!(rows.len() >= self.lines);
+        let history = rows.split_off(self.lines);
+        for row in history.into_iter().rev() {
+            self.history.push_newest_owned(row);
+        }
+        self.screen.raw.replace_inner(rows);
+        debug_assert_eq!(self.screen.raw.len(), self.lines);
+    }
+}
 
 impl<T: GridCell + Default + PartialEq> Grid<T> {
     /// Resize the grid's width and/or height.
@@ -49,12 +85,29 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     {
         let lines_added = target - self.lines;
 
-        // Need to resize before updating buffer.
-        self.raw.grow_visible_lines(target);
-        self.lines = target;
-
+        // feathercritty: `history_size` and `from_history` are computed before growing the
+        // screen (upstream: after, with the same values, since its growth kept the history size).
         let history_size = self.history_size();
         let from_history = min(history_size, lines_added);
+
+        // Need to resize before updating buffer.
+        //
+        // feathercritty: upstream grew its ring by `lines_added` rows at the oldest end, which
+        // moved the `from_history` newest history rows onto the screen's new top lines and left
+        // blank rows above them (on the screen when history ran short, in history otherwise).
+        // The screen ring grows by `lines_added` top rows (its hidden rows or spares, stale
+        // content included, as upstream's cache rows were) and the newest history rows replace
+        // the lowest of them, giving the same screen; the replaced rows become spares. The stale
+        // rows left above only ever reach history through `scroll_up` below and are removed
+        // again, as upstream's were.
+        self.screen.raw.grow_visible_lines(target);
+        self.lines = target;
+        let mut row = Row::default();
+        for line in (lines_added - from_history..lines_added).rev().map(|line| Line(line as i32)) {
+            self.history.pop_newest(&mut row);
+            let spare = mem::replace(&mut self.screen[line], mem::take(&mut row));
+            self.screen.raw.give_spare(spare);
+        }
 
         // Move existing lines up for every line that couldn't be pulled from history.
         if from_history != lines_added {
@@ -71,7 +124,19 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.cursor.point.line += from_history;
 
         self.display_offset = self.display_offset.saturating_sub(lines_added);
-        self.decrease_scroll_limit(lines_added);
+
+        // feathercritty: upstream removed `lines_added` rows from the oldest end of history:
+        // the blank rows its growth had added there. Here the history already lost the
+        // `from_history` rows it gave to the screen; what is left to remove are the blank rows
+        // `scroll_up` above pushed (as upstream, all of them).
+        self.decrease_scroll_limit(lines_added - from_history);
+
+        // feathercritty: upstream's `decrease_scroll_limit(lines_added)` always removed rows
+        // (unless history and its limit were 0, where the display offset is 0 anyway), so it
+        // always clamped the display offset to the history size. The call above may remove
+        // nothing, so clamp here; the offset can exceed the history size, since `scroll_up`
+        // with fixed lines at the top moves it without adding history.
+        self.display_offset = min(self.display_offset, self.history_size());
     }
 
     /// Remove lines from the visible area.
@@ -98,8 +163,10 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // Clamp saved cursor, since only primary cursor is scrolled into viewport.
         self.saved_cursor.point.line = min(self.saved_cursor.point.line, Line(target as i32 - 1));
 
-        self.raw.rotate((self.lines - target) as isize);
-        self.raw.shrink_visible_lines(target);
+        // feathercritty: `self.raw` became `self.screen.raw`; the bottom `lines - target` rows
+        // become hidden rows of the screen ring, as upstream's did.
+        self.screen.raw.rotate((self.lines - target) as isize);
+        self.screen.raw.shrink_visible_lines(target);
         self.lines = target;
     }
 
@@ -113,7 +180,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         self.columns = columns;
 
-        let mut reversed: Vec<Row<T>> = Vec::with_capacity(self.raw.len());
+        // feathercritty: upstream `self.raw.len()`.
+        let mut reversed: Vec<Row<T>> = Vec::with_capacity(self.total_lines());
         let mut cursor_line_delta = 0;
 
         // Remove the linewrap special case, by moving the cursor outside of the grid.
@@ -122,7 +190,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             self.cursor.point.column += 1;
         }
 
-        let mut rows = self.raw.take_all();
+        // feathercritty: upstream `self.raw.take_all()`.
+        let mut rows = self.take_all_rows();
 
         for (i, mut row) in rows.drain(..).enumerate().rev() {
             // Check if reflowing should be performed.
@@ -241,7 +310,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             new_raw.push(row);
         }
 
-        self.raw.replace_inner(new_raw);
+        // feathercritty: upstream `self.raw.replace_inner(new_raw)`.
+        self.replace_all_rows(new_raw);
 
         // Clamp display offset in case lines above it got merged.
         self.display_offset = min(self.display_offset, self.history_size());
@@ -257,10 +327,11 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             self.cursor.point.column += 1;
         }
 
-        let mut new_raw = Vec::with_capacity(self.raw.len());
+        // feathercritty: upstream `self.raw.len()` and `self.raw.take_all()`.
+        let mut new_raw = Vec::with_capacity(self.total_lines());
         let mut buffered: Option<Vec<T>> = None;
 
-        let mut rows = self.raw.take_all();
+        let mut rows = self.take_all_rows();
         for (i, mut row) in rows.drain(..).enumerate().rev() {
             // Append lines left over from the previous row.
             if let Some(buffered) = buffered.take() {
@@ -371,8 +442,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
 
         // Reverse iterator and use it as the new grid storage.
         let mut reversed: Vec<Row<T>> = new_raw.drain(..).rev().collect();
-        reversed.truncate(self.max_scroll_limit + self.lines);
-        self.raw.replace_inner(reversed);
+        // feathercritty: upstream `self.max_scroll_limit` and `self.raw.replace_inner(reversed)`.
+        reversed.truncate(self.history.limit() + self.lines);
+        self.replace_all_rows(reversed);
 
         // Clamp display offset in case some lines went off.
         self.display_offset = min(self.display_offset, self.history_size());
@@ -381,7 +453,10 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         if !reflow {
             self.cursor.point.column = min(self.cursor.point.column, Column(columns - 1));
         } else if self.cursor.point.column == columns
-            && !self[self.cursor.point.line][Column(columns - 1)].flags().contains(Flags::WRAPLINE)
+            // feathercritty: upstream `self[...]`; the cursor is on the screen.
+            && !self.screen[self.cursor.point.line][Column(columns - 1)]
+                .flags()
+                .contains(Flags::WRAPLINE)
         {
             self.cursor.input_needs_wrap = true;
             self.cursor.point.column -= 1;

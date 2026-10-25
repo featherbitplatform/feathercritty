@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 use std::cmp::min;
 
 #[cfg(feature = "serde")]
@@ -160,11 +162,14 @@ impl ViModeCursor {
             ViMotion::ParagraphUp => {
                 // Skip empty lines until we find the next paragraph,
                 // then skip over the paragraph until we reach the next empty line.
+                //
+                // feathercritty: upstream read `term.grid()[line].is_clear()`; the lines can be
+                // in history, read through `Grid::is_clear` (here and in `ParagraphDown`).
                 let topmost_line = term.topmost_line();
                 self.point.line = (*topmost_line..*self.point.line)
                     .rev()
-                    .skip_while(|line| term.grid()[Line(*line)].is_clear())
-                    .find(|line| term.grid()[Line(*line)].is_clear())
+                    .skip_while(|line| term.grid().is_clear(Line(*line)))
+                    .find(|line| term.grid().is_clear(Line(*line)))
                     .map_or(topmost_line, Line);
                 self.point.column = Column(0);
             },
@@ -173,12 +178,20 @@ impl ViModeCursor {
                 // then skip over the paragraph until we reach the next empty line.
                 let bottommost_line = term.bottommost_line();
                 self.point.line = (*self.point.line..*bottommost_line)
-                    .skip_while(|line| term.grid()[Line(*line)].is_clear())
-                    .find(|line| term.grid()[Line(*line)].is_clear())
+                    .skip_while(|line| term.grid().is_clear(Line(*line)))
+                    .find(|line| term.grid().is_clear(Line(*line)))
                     .map_or(bottommost_line, Line);
                 self.point.column = Column(0);
             },
         }
+
+        // feathercritty: upstream could leave the grid here (`Middle` on a one-line screen
+        // without history, `Right` or `Last` across a `WRAPLINE` or leading spacer on the
+        // bottommost line), and later motions then read rows outside it. The cursor is kept in
+        // the grid; reads outside it are "no row" (`Grid::cell`). A fork behavior change, also
+        // applied to the differential test's oracle (`tests/oracle/PATCHES.md`). When merging
+        // upstream: keep the clamp unless upstream keeps motions in the grid itself.
+        self.point = self.point.grid_clamp(term, Boundary::Grid);
 
         term.scroll_to_point(self.point);
 
@@ -280,7 +293,9 @@ fn semantic<T: EventListener>(
     // Expand semantically based on movement direction.
     let expand_semantic = |point: Point| {
         // Do not expand when currently on a semantic escape char.
-        let cell = &term.grid()[point];
+        //
+        // feathercritty: upstream `&term.grid()[point]`; `point` can be in history.
+        let cell = term.grid().cell(point);
         if term.semantic_escape_chars().contains(cell.c)
             && !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
         {
@@ -391,14 +406,18 @@ fn advance<T>(term: &Term<T>, point: Point, direction: Direction) -> Point {
 
 /// Check if cell at point contains whitespace.
 fn is_space<T>(term: &Term<T>, point: Point) -> bool {
-    let cell = &term.grid()[point.line][point.column];
+    // feathercritty: upstream `&term.grid()[point.line][point.column]`; `point` can be in
+    // history.
+    let cell = term.grid().cell(point);
     !cell.flags().intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
         && (cell.c == ' ' || cell.c == '\t')
 }
 
 /// Check if the cell at a point contains the WRAPLINE flag.
 fn is_wrap<T>(term: &Term<T>, point: Point) -> bool {
-    term.grid()[point].flags.contains(Flags::WRAPLINE)
+    // feathercritty: upstream `term.grid()[point]`; `point` can be in history (any column, so
+    // this reads the cell rather than `Grid::wraps`).
+    term.grid().cell(point).flags.contains(Flags::WRAPLINE)
 }
 
 /// Check if point is at screen boundary.
@@ -409,6 +428,8 @@ fn is_boundary<T>(term: &Term<T>, point: Point, direction: Direction) -> bool {
             && direction == Direction::Right)
 }
 
+// feathercritty: upstream's tests indexed `Grid` directly; screen writes go through
+// `Grid::screen_mut()`/`screen()`, history writes through `Grid::update_line`.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -446,12 +467,12 @@ mod tests {
     #[test]
     fn simple_wide() {
         let mut term = term();
-        term.grid_mut()[Line(0)][Column(0)].c = 'a';
-        term.grid_mut()[Line(0)][Column(1)].c = '汉';
-        term.grid_mut()[Line(0)][Column(1)].flags.insert(Flags::WIDE_CHAR);
-        term.grid_mut()[Line(0)][Column(2)].c = ' ';
-        term.grid_mut()[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR_SPACER);
-        term.grid_mut()[Line(0)][Column(3)].c = 'a';
+        term.grid_mut().screen_mut()[Line(0)][Column(0)].c = 'a';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].c = '汉';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].flags.insert(Flags::WIDE_CHAR);
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR_SPACER);
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].c = 'a';
 
         let mut cursor = ViModeCursor::new(Point::new(Line(0), Column(1)));
         cursor = cursor.motion(&mut term, ViMotion::Right);
@@ -478,14 +499,14 @@ mod tests {
     #[test]
     fn motion_first_occupied() {
         let mut term = term();
-        term.grid_mut()[Line(0)][Column(0)].c = ' ';
-        term.grid_mut()[Line(0)][Column(1)].c = 'x';
-        term.grid_mut()[Line(0)][Column(2)].c = ' ';
-        term.grid_mut()[Line(0)][Column(3)].c = 'y';
-        term.grid_mut()[Line(0)][Column(19)].flags.insert(Flags::WRAPLINE);
-        term.grid_mut()[Line(1)][Column(19)].flags.insert(Flags::WRAPLINE);
-        term.grid_mut()[Line(2)][Column(0)].c = 'z';
-        term.grid_mut()[Line(2)][Column(1)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(0)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].c = 'y';
+        term.grid_mut().screen_mut()[Line(0)][Column(19)].flags.insert(Flags::WRAPLINE);
+        term.grid_mut().screen_mut()[Line(1)][Column(19)].flags.insert(Flags::WRAPLINE);
+        term.grid_mut().screen_mut()[Line(2)][Column(0)].c = 'z';
+        term.grid_mut().screen_mut()[Line(2)][Column(1)].c = ' ';
 
         let mut cursor = ViModeCursor::new(Point::new(Line(2), Column(1)));
 
@@ -515,9 +536,9 @@ mod tests {
     #[test]
     fn motion_bracket() {
         let mut term = term();
-        term.grid_mut()[Line(0)][Column(0)].c = '(';
-        term.grid_mut()[Line(0)][Column(1)].c = 'x';
-        term.grid_mut()[Line(0)][Column(2)].c = ')';
+        term.grid_mut().screen_mut()[Line(0)][Column(0)].c = '(';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = ')';
 
         let mut cursor = ViModeCursor::new(Point::new(Line(0), Column(0)));
 
@@ -531,22 +552,22 @@ mod tests {
     fn motion_semantic_term() -> Term<VoidListener> {
         let mut term = term();
 
-        term.grid_mut()[Line(0)][Column(0)].c = 'x';
-        term.grid_mut()[Line(0)][Column(1)].c = ' ';
-        term.grid_mut()[Line(0)][Column(2)].c = 'x';
-        term.grid_mut()[Line(0)][Column(3)].c = 'x';
-        term.grid_mut()[Line(0)][Column(4)].c = ' ';
-        term.grid_mut()[Line(0)][Column(5)].c = ' ';
-        term.grid_mut()[Line(0)][Column(6)].c = ':';
-        term.grid_mut()[Line(0)][Column(7)].c = ' ';
-        term.grid_mut()[Line(0)][Column(8)].c = 'x';
-        term.grid_mut()[Line(0)][Column(9)].c = ':';
-        term.grid_mut()[Line(0)][Column(10)].c = 'x';
-        term.grid_mut()[Line(0)][Column(11)].c = ' ';
-        term.grid_mut()[Line(0)][Column(12)].c = ' ';
-        term.grid_mut()[Line(0)][Column(13)].c = ':';
-        term.grid_mut()[Line(0)][Column(14)].c = ' ';
-        term.grid_mut()[Line(0)][Column(15)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(0)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(4)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(5)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(6)].c = ':';
+        term.grid_mut().screen_mut()[Line(0)][Column(7)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(8)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(9)].c = ':';
+        term.grid_mut().screen_mut()[Line(0)][Column(10)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(11)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(12)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(13)].c = ':';
+        term.grid_mut().screen_mut()[Line(0)][Column(14)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(15)].c = 'x';
 
         term
     }
@@ -690,14 +711,14 @@ mod tests {
     #[test]
     fn semantic_wide() {
         let mut term = term();
-        term.grid_mut()[Line(0)][Column(0)].c = 'a';
-        term.grid_mut()[Line(0)][Column(1)].c = ' ';
-        term.grid_mut()[Line(0)][Column(2)].c = '汉';
-        term.grid_mut()[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR);
-        term.grid_mut()[Line(0)][Column(3)].c = ' ';
-        term.grid_mut()[Line(0)][Column(3)].flags.insert(Flags::WIDE_CHAR_SPACER);
-        term.grid_mut()[Line(0)][Column(4)].c = ' ';
-        term.grid_mut()[Line(0)][Column(5)].c = 'a';
+        term.grid_mut().screen_mut()[Line(0)][Column(0)].c = 'a';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = '汉';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR);
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].flags.insert(Flags::WIDE_CHAR_SPACER);
+        term.grid_mut().screen_mut()[Line(0)][Column(4)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(5)].c = 'a';
 
         let mut cursor = ViModeCursor::new(Point::new(Line(0), Column(2)));
         cursor = cursor.motion(&mut term, ViMotion::SemanticRight);
@@ -711,12 +732,12 @@ mod tests {
     #[test]
     fn motion_word() {
         let mut term = term();
-        term.grid_mut()[Line(0)][Column(0)].c = 'a';
-        term.grid_mut()[Line(0)][Column(1)].c = ';';
-        term.grid_mut()[Line(0)][Column(2)].c = ' ';
-        term.grid_mut()[Line(0)][Column(3)].c = ' ';
-        term.grid_mut()[Line(0)][Column(4)].c = 'a';
-        term.grid_mut()[Line(0)][Column(5)].c = ';';
+        term.grid_mut().screen_mut()[Line(0)][Column(0)].c = 'a';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].c = ';';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(4)].c = 'a';
+        term.grid_mut().screen_mut()[Line(0)][Column(5)].c = ';';
 
         let mut cursor = ViModeCursor::new(Point::new(Line(0), Column(0)));
 
@@ -766,14 +787,14 @@ mod tests {
     #[test]
     fn word_wide() {
         let mut term = term();
-        term.grid_mut()[Line(0)][Column(0)].c = 'a';
-        term.grid_mut()[Line(0)][Column(1)].c = ' ';
-        term.grid_mut()[Line(0)][Column(2)].c = '汉';
-        term.grid_mut()[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR);
-        term.grid_mut()[Line(0)][Column(3)].c = ' ';
-        term.grid_mut()[Line(0)][Column(3)].flags.insert(Flags::WIDE_CHAR_SPACER);
-        term.grid_mut()[Line(0)][Column(4)].c = ' ';
-        term.grid_mut()[Line(0)][Column(5)].c = 'a';
+        term.grid_mut().screen_mut()[Line(0)][Column(0)].c = 'a';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = '汉';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR);
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].flags.insert(Flags::WIDE_CHAR_SPACER);
+        term.grid_mut().screen_mut()[Line(0)][Column(4)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(5)].c = 'a';
 
         let mut cursor = ViModeCursor::new(Point::new(Line(0), Column(2)));
         cursor = cursor.motion(&mut term, ViMotion::WordRight);
@@ -857,14 +878,14 @@ mod tests {
     fn wide_semantic_char() {
         let mut term = term();
         term.set_semantic_escape_chars("－");
-        term.grid_mut()[Line(0)][Column(0)].c = 'x';
-        term.grid_mut()[Line(0)][Column(1)].c = 'x';
-        term.grid_mut()[Line(0)][Column(2)].c = '－';
-        term.grid_mut()[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR);
-        term.grid_mut()[Line(0)][Column(3)].c = ' ';
-        term.grid_mut()[Line(0)][Column(3)].flags.insert(Flags::WIDE_CHAR_SPACER);
-        term.grid_mut()[Line(0)][Column(4)].c = 'x';
-        term.grid_mut()[Line(0)][Column(5)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(0)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(1)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].c = '－';
+        term.grid_mut().screen_mut()[Line(0)][Column(2)].flags.insert(Flags::WIDE_CHAR);
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].c = ' ';
+        term.grid_mut().screen_mut()[Line(0)][Column(3)].flags.insert(Flags::WIDE_CHAR_SPACER);
+        term.grid_mut().screen_mut()[Line(0)][Column(4)].c = 'x';
+        term.grid_mut().screen_mut()[Line(0)][Column(5)].c = 'x';
 
         // Test motion to the right.
 

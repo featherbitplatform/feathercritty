@@ -1,0 +1,110 @@
+--- a/src/grid/row.rs
++++ b/src/grid/row.rs
+@@ -1,3 +1,4 @@
++// Patched by the featherbit authors for the feathercritty differential test; see tests/oracle/PATCHES.md.
+ //! Defines the Row type which makes up lines in the grid.
+ 
+ use std::cmp::{max, min};
+@@ -62,6 +63,8 @@
+             return;
+         }
+ 
++        // PATCH 1 (occ): raise `occ` to the old length.
++        self.occ = max(self.occ, self.inner.len());
+         self.inner.resize_with(columns, T::default);
+     }
+ 
+@@ -138,7 +141,10 @@
+     where
+         T: GridCell,
+     {
+-        self.occ += vec.len();
++        // PATCH 1 (occ): every appended cell is inside `occ`.
++        if !vec.is_empty() {
++            self.occ = self.inner.len() + vec.len();
++        }
+         self.inner.append(vec);
+     }
+ 
+--- a/src/term/mod.rs
++++ b/src/term/mod.rs
+@@ -1,3 +1,4 @@
++// Patched by the featherbit authors for the feathercritty differential test; see tests/oracle/PATCHES.md.
+ //! Exports the `Term` type which is a high-level API for the Grid.
+ 
+ use std::ops::{Index, IndexMut, Range};
+@@ -625,6 +626,8 @@
+             && line_length.0 >= 2
+             && grid_line[line_length - 1].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+             && include_wrapped_wide
++            // PATCH 2 (no row): the line above the topmost line does not exist.
++            && line > self.grid.topmost_line()
+         {
+             text.push(self.grid[line - 1i32][Column(0)].c);
+         }
+@@ -899,7 +902,9 @@
+ 
+     /// Jump to the end of a wide cell.
+     pub fn expand_wide(&self, mut point: Point, direction: Direction) -> Point {
+-        let flags = self.grid[point.line][point.column].flags;
++        // PATCH 2 (no row): a line outside the grid reads as a default cell.
++        let no_row = point.line < self.topmost_line() || point.line > self.bottommost_line();
++        let flags = if no_row { Flags::empty() } else { self.grid[point.line][point.column].flags };
+ 
+         match direction {
+             Direction::Right if flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) => {
+--- a/src/vi_mode.rs
++++ b/src/vi_mode.rs
+@@ -1,3 +1,4 @@
++// Patched by the featherbit authors for the feathercritty differential test; see tests/oracle/PATCHES.md.
+ use std::cmp::min;
+ 
+ #[cfg(feature = "serde")]
+@@ -180,6 +181,9 @@
+             },
+         }
+ 
++        // PATCH 2 (no row): keep the cursor in the grid.
++        self.point = self.point.grid_clamp(term, Boundary::Grid);
++
+         term.scroll_to_point(self.point);
+ 
+         self
+@@ -280,7 +284,8 @@
+     // Expand semantically based on movement direction.
+     let expand_semantic = |point: Point| {
+         // Do not expand when currently on a semantic escape char.
+-        let cell = &term.grid()[point];
++        // PATCH 2 (no row)
++        let cell = &cell_at(term, point);
+         if term.semantic_escape_chars().contains(cell.c)
+             && !cell.flags.intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+         {
+@@ -391,14 +396,25 @@
+ 
+ /// Check if cell at point contains whitespace.
+ fn is_space<T>(term: &Term<T>, point: Point) -> bool {
+-    let cell = &term.grid()[point.line][point.column];
++    // PATCH 2 (no row)
++    let cell = &cell_at(term, point);
+     !cell.flags().intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+         && (cell.c == ' ' || cell.c == '\t')
+ }
+ 
+ /// Check if the cell at a point contains the WRAPLINE flag.
+ fn is_wrap<T>(term: &Term<T>, point: Point) -> bool {
+-    term.grid()[point].flags.contains(Flags::WRAPLINE)
++    // PATCH 2 (no row)
++    cell_at(term, point).flags.contains(Flags::WRAPLINE)
++}
++
++/// PATCH 2 (no row): the cell at `point`, or a default cell for a line outside the grid.
++fn cell_at<T>(term: &Term<T>, point: Point) -> crate::term::cell::Cell {
++    if point.line < term.topmost_line() || point.line > term.bottommost_line() {
++        crate::term::cell::Cell::default()
++    } else {
++        term.grid()[point].clone()
++    }
+ }
+ 
+ /// Check if point is at screen boundary.
