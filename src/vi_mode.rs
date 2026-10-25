@@ -428,6 +428,8 @@ fn is_boundary<T>(term: &Term<T>, point: Point, direction: Direction) -> bool {
             && direction == Direction::Right)
 }
 
+// feathercritty: upstream's tests indexed `Grid` directly; screen writes go through
+// `Grid::screen_mut()`/`screen()`, history writes through `Grid::update_line`.
 #[cfg(test)]
 mod tests {
     use super::*;

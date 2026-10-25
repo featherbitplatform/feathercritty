@@ -323,6 +323,10 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        // feathercritty: throughout, `self.raw` became `self.screen.raw` (or `self.screen` for
+        // indexing) and `self.max_scroll_limit` became `self.history.limit()`; the other changes
+        // are marked where they are.
+
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
             for i in (region.start.0..region.end.0).map(Line::from) {
@@ -381,10 +385,15 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             }
 
             // Rotate the entire line buffer upward.
+            //
+            // feathercritty: upstream rotated by `positions`; by `rotated` here (see there).
             self.screen.raw.rotate(-(rotated as isize));
             self.scrolled_lines = self.scrolled_lines.wrapping_add(positions as i64);
 
             // Swap the fixed lines at the bottom back into position.
+            //
+            // feathercritty: upstream swapped with `i - positions`, which for a count above the
+            // region's height reached into history; `rotated` keeps the swap on the screen.
             let screen_lines = self.screen_lines() as i32;
             for i in (region.end.0..screen_lines).rev().map(Line::from) {
                 self.screen.raw.swap(i, i - rotated);
@@ -397,6 +406,9 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         }
 
         // Ensure all new lines are fully cleared.
+        //
+        // feathercritty: upstream reset from `region.end - positions`, which for a count above
+        // the region's height included history lines; those rows are pushed below instead.
         for i in (region.end.0 - rotated as i32..region.end.0).map(Line::from) {
             self.screen[i].reset(&self.cursor.template);
         }
@@ -435,6 +447,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         self.scroll_up(&region, positions);
 
         // Reset rotated lines.
+        //
+        // feathercritty: upstream `self.raw[line]`; screen lines only.
         for line in (0..(self.lines - positions)).map(Line::from) {
             self.screen[line].reset(&self.cursor.template);
         }
@@ -485,6 +499,7 @@ impl<T> Grid<T> {
         debug_assert!(start < self.screen_lines() as i32);
         debug_assert!(end <= self.screen_lines() as i32);
 
+        // feathercritty: upstream `self.raw[line]`; screen lines only (checked above).
         for line in (start.0..end.0).map(Line::from) {
             self.screen[line].reset(&self.cursor.template);
         }
@@ -540,8 +555,13 @@ impl<T> Grid<T> {
 
     /// Iterate over all cells in the grid starting at a specific point.
     #[inline]
-    pub fn iter_from(&self, point: Point) -> GridIterator<'_, T> {
+    pub fn iter_from(&self, point: Point) -> GridIterator<'_, T>
+    where
+        T: Default,
+    {
         let end = Point::new(self.bottommost_line(), self.last_column());
+        // feathercritty: upstream built `GridIterator { grid, point, end }`; `new` also looks up
+        // the starting row and keeps a default cell for "no row" reads (hence `T: Default`).
         GridIterator::new(self, point, end)
     }
 
@@ -550,12 +570,16 @@ impl<T> Grid<T> {
     /// This is slightly more optimized than calling `Grid::iter_from` in combination with
     /// `Iterator::take_while`.
     #[inline]
-    pub fn display_iter(&self) -> GridIterator<'_, T> {
+    pub fn display_iter(&self) -> GridIterator<'_, T>
+    where
+        T: Default,
+    {
         let last_column = self.last_column();
         let start = Point::new(Line(-(self.display_offset() as i32) - 1), last_column);
         let end_line = min(start.line + self.screen_lines(), self.bottommost_line());
         let end = Point::new(end_line, last_column);
 
+        // feathercritty: upstream built the struct directly; see `iter_from`.
         GridIterator::new(self, start, end)
     }
 
@@ -567,6 +591,7 @@ impl<T> Grid<T> {
     #[inline]
     pub fn cursor_cell(&mut self) -> &mut T {
         let point = self.cursor.point;
+        // feathercritty: upstream `self[...]`; the cursor is always on the screen.
         &mut self.screen[point.line][point.column]
     }
 
@@ -895,11 +920,17 @@ pub struct GridIterator<'a, T> {
 
     /// The row `point` is on, `None` while `point` is outside the grid (feathercritty).
     row: Option<&'a Row<T>>,
+
+    /// The cell read at a point outside the grid, "no row" (feathercritty, see [`Grid::cell`]).
+    blank: T,
 }
 
 impl<'a, T> GridIterator<'a, T> {
-    fn new(grid: &'a Grid<T>, point: Point, end: Point) -> Self {
-        Self { grid, point, end, row: Self::row_at(grid, point.line) }
+    fn new(grid: &'a Grid<T>, point: Point, end: Point) -> Self
+    where
+        T: Default,
+    {
+        Self { grid, point, end, row: Self::row_at(grid, point.line), blank: T::default() }
     }
 
     /// Row `line` of `grid`, `None` outside the grid (feathercritty).
@@ -922,22 +953,25 @@ impl<'a, T> GridIterator<'a, T> {
 
     /// Cell at the current iterator position.
     ///
-    /// feathercritty: borrows from the iterator (upstream: `&'a T` from the grid). Panics outside
-    /// the grid, as upstream's indexing did in debug builds.
+    /// feathercritty: borrows from the iterator (upstream: `&'a T` from the grid). A position on
+    /// a line outside the grid is "no row" and reads as a default cell (upstream's indexing
+    /// failed a `debug_assert!` there in debug builds and read an arbitrary row in release
+    /// builds). Columns are not checked, as upstream.
     #[inline]
     pub fn cell(&self) -> &T {
-        let row = self.row.expect("GridIterator: position outside the grid");
-        &row[self.point.column]
+        match self.row {
+            Some(row) => &row[self.point.column],
+            None => &self.blank,
+        }
     }
-}
 
-impl<T: Clone> Iterator for GridIterator<'_, T> {
-    type Item = Indexed<T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
+    /// Move to the next cell without producing an item; `false` at the end, as `next` returning
+    /// `None` (feathercritty: lets hot loops read through `cell()` instead of cloning).
+    #[inline]
+    pub(crate) fn advance(&mut self) -> bool {
         // Stop once we've reached the end of the grid.
         if self.point >= self.end {
-            return None;
+            return false;
         }
 
         match self.point {
@@ -948,6 +982,45 @@ impl<T: Clone> Iterator for GridIterator<'_, T> {
                 self.row = Self::row_at(self.grid, self.point.line);
             },
             _ => self.point.column += Column(1),
+        }
+
+        true
+    }
+
+    /// Move to the previous cell without producing an item; `false` at the start, as `prev`
+    /// returning `None` (feathercritty, see `advance`).
+    #[inline]
+    pub(crate) fn retreat(&mut self) -> bool {
+        let topmost_line = self.grid.topmost_line();
+        let last_column = self.grid.last_column();
+
+        // Stop once we've reached the end of the grid.
+        if self.point <= Point::new(topmost_line, Column(0)) {
+            return false;
+        }
+
+        match self.point {
+            Point { column: Column(0), .. } => {
+                self.point.column = last_column;
+                self.point.line -= 1;
+                // feathercritty: look the new row up once.
+                self.row = Self::row_at(self.grid, self.point.line);
+            },
+            _ => self.point.column -= Column(1),
+        }
+
+        true
+    }
+}
+
+/// feathercritty: upstream's `next` and `prev` bodies moved into `advance` and `retreat`
+/// unchanged; these add the item, a clone of the cell.
+impl<T: Clone> Iterator for GridIterator<'_, T> {
+    type Item = Indexed<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if !self.advance() {
+            return None;
         }
 
         Some(Indexed { cell: self.cell().clone(), point: self.point })
@@ -979,22 +1052,8 @@ pub trait BidirectionalIterator: Iterator {
 
 impl<T: Clone> BidirectionalIterator for GridIterator<'_, T> {
     fn prev(&mut self) -> Option<Self::Item> {
-        let topmost_line = self.grid.topmost_line();
-        let last_column = self.grid.last_column();
-
-        // Stop once we've reached the end of the grid.
-        if self.point <= Point::new(topmost_line, Column(0)) {
+        if !self.retreat() {
             return None;
-        }
-
-        match self.point {
-            Point { column: Column(0), .. } => {
-                self.point.column = last_column;
-                self.point.line -= 1;
-                // feathercritty: look the new row up once.
-                self.row = Self::row_at(self.grid, self.point.line);
-            },
-            _ => self.point.column -= Column(1),
         }
 
         Some(Indexed { cell: self.cell().clone(), point: self.point })

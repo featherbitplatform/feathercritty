@@ -2,6 +2,15 @@
 
 # Benchmark baseline: feathercritty against alacritty_terminal 0.26.0
 
+> **Comparison crate since `75324a8`.** The numbers below were measured against the unpatched
+> crates.io `alacritty_terminal` 0.26.0. Since the grid split, the benchmarks compare against the
+> differential test's oracle instead: the same source vendored at `tests/oracle/` with two patches
+> (`tests/oracle/PATCHES.md`): the `Row` `occ` invariant and "no row" reads outside the grid. The
+> fork needed both, and the oracle carries them so the differential test can still require
+> equality. Neither touches a timed path measurably. The lines-only resize row is no longer
+> gated as a ratio (see `benches/reads.rs`). Regenerate this file when the next phase is
+> measured.
+
 The numbers later phases of the compact scrollback history work are gated against (design spec
 sections 6.3, 6.4, 6.5). Both columns run in the same binary; today the fork has no compact
 history, so ratios are noise around 1.0 and the memory gates (expected) fail.

@@ -11,7 +11,7 @@ use super::*;
 use crate::term::cell::Cell;
 
 /// Line `line` of `grid`, screen or history, as an owned row.
-fn row<T: Clone>(grid: &Grid<T>, line: i32) -> Row<T> {
+fn row<T: Clone + Default>(grid: &Grid<T>, line: i32) -> Row<T> {
     RowReader::new().row(grid, Line(line)).clone()
 }
 
@@ -639,4 +639,18 @@ fn serde_keeps_upstream_format() {
     let back: Grid<usize> = serde_json::from_value(json).unwrap();
     assert_eq!(back, grid);
     assert_eq!(contents(&back), vec![1, 2, 3]);
+}
+
+#[test]
+fn iterator_reads_outside_the_grid_as_no_row() {
+    let mut grid = Grid::<Cell>::new(2, 2, 3);
+    grid.screen_mut()[Line(0)][Column(0)] = cell('x');
+
+    let mut iter = grid.iter_from(Point::new(Line(5), Column(0)));
+    assert_eq!(iter.cell(), &Cell::default());
+    assert_eq!(iter.next(), None);
+
+    let mut above = grid.iter_from(Point::new(Line(-1), Column(1)));
+    assert_eq!(above.cell(), &Cell::default());
+    assert_eq!(above.next().map(|indexed| indexed.cell), Some(cell('x')));
 }

@@ -12,10 +12,26 @@ use regex_automata::nfa::thompson::Config as ThompsonConfig;
 use regex_automata::util::syntax::Config as SyntaxConfig;
 use regex_automata::{Anchored, Input, MatchKind};
 
-use crate::grid::{BidirectionalIterator, Dimensions, GridIterator, Indexed};
+use crate::grid::{BidirectionalIterator, Dimensions, GridIterator};
 use crate::index::{Boundary, Column, Direction, Point, Side};
 use crate::term::Term;
 use crate::term::cell::{Cell, Flags};
+
+/// What the regex search reads from a cell (feathercritty: upstream kept a `&Cell` borrowed from
+/// the grid; the grid iterator yields owned cells now, and copying these two fields is cheaper
+/// than cloning the cell).
+#[derive(Clone, Copy)]
+struct SearchCell {
+    c: char,
+    flags: Flags,
+}
+
+impl From<&Cell> for SearchCell {
+    #[inline]
+    fn from(cell: &Cell) -> Self {
+        Self { c: cell.c, flags: cell.flags }
+    }
+}
 
 /// Used to match equal brackets, when performing a bracket-pair selection.
 const BRACKET_PAIRS: [(char, char); 4] = [('(', ')'), ('[', ']'), ('{', '}'), ('<', '>')];
@@ -120,6 +136,10 @@ impl LazyDfa {
 
 impl<T> Term<T> {
     /// Get next search match in the specified direction.
+    ///
+    /// `origin` must lie in the grid (`topmost_line()..=bottommost_line()`, columns below
+    /// `columns()`). feathercritty: a line outside the grid reads as "no row" (default cells), so
+    /// the search returns instead of panicking, but its answer for such an origin is unspecified.
     pub fn search_next(
         &self,
         regex: &mut RegexSearch,
@@ -227,6 +247,11 @@ impl<T> Term<T> {
     /// Find the next regex match to the left of the origin point.
     ///
     /// The origin is always included in the regex.
+    ///
+    /// `start` and `end` must lie in the grid (`topmost_line()..=bottommost_line()`, columns below
+    /// `columns()`). feathercritty: a line outside the grid reads as
+    /// "no row" (default cells) instead of the arbitrary row upstream's release builds read, so
+    /// the search returns instead of panicking, but its answer for such points is unspecified.
     pub fn regex_search_left(
         &self,
         regex: &mut RegexSearch,
@@ -257,6 +282,11 @@ impl<T> Term<T> {
     /// Find the next regex match to the right of the origin point.
     ///
     /// The origin is always included in the regex.
+    ///
+    /// `start` and `end` must lie in the grid (`topmost_line()..=bottommost_line()`, columns below
+    /// `columns()`). feathercritty: a line outside the grid reads as
+    /// "no row" (default cells) instead of the arbitrary row upstream's release builds read, so
+    /// the search returns instead of panicking, but its answer for such points is unspecified.
     pub fn regex_search_right(
         &self,
         regex: &mut RegexSearch,
@@ -325,8 +355,11 @@ impl<T> Term<T> {
 
         // Advance the iterator.
         let next = match regex.direction {
-            Direction::Right => GridIterator::next,
-            Direction::Left => GridIterator::prev,
+            // feathercritty: upstream used `GridIterator::next`/`prev`, which yield a cell; the
+            // iterator now yields owned cells, so the loop steps without one and reads what it
+            // needs through `iter.cell()` (`SearchCell`).
+            Direction::Right => GridIterator::advance,
+            Direction::Left => GridIterator::retreat,
         };
 
         // Get start state for the DFA.
@@ -337,9 +370,9 @@ impl<T> Term<T> {
         let mut iter = self.grid.iter_from(start);
         let mut regex_match = None;
 
-        // feathercritty: upstream borrowed `cell` from the grid (`&Cell`); the iterator now
-        // yields owned cells and `iter.cell()` borrows from the iterator, so `cell` is a copy.
-        let mut cell = iter.cell().clone();
+        // feathercritty: upstream borrowed `cell` from the grid (`&Cell`); `iter.cell()` borrows
+        // from the iterator now, so `cell` keeps the two fields the search reads (`SearchCell`).
+        let mut cell = SearchCell::from(iter.cell());
         self.skip_fullwidth(&mut iter, &mut cell, regex.direction);
         let mut c = cell.c;
 
@@ -450,17 +483,15 @@ impl<T> Term<T> {
             }
 
             // Advance grid cell iterator.
-            let mut cell = match next(&mut iter) {
-                Some(Indexed { cell, .. }) => cell,
-                None => {
-                    // Wrap around to other end of the scrollback buffer.
-                    let line = topmost_line - point.line + screen_lines - 1;
-                    let start = Point::new(line, last_column - point.column);
-                    iter = self.grid.iter_from(start);
-                    // feathercritty: a copy, as for the first cell above.
-                    iter.cell().clone()
-                },
-            };
+            // feathercritty: `next` steps without producing a cell (see above); upstream took the
+            // cell from its result or, after wrapping, from `iter.cell()`. Both read it below.
+            if !next(&mut iter) {
+                // Wrap around to other end of the scrollback buffer.
+                let line = topmost_line - point.line + screen_lines - 1;
+                let start = Point::new(line, last_column - point.column);
+                iter = self.grid.iter_from(start);
+            }
+            let mut cell = SearchCell::from(iter.cell());
 
             // Check for completion before potentially skipping over fullwidth characters.
             done = iter.point() == end;
@@ -608,12 +639,12 @@ impl<T> Term<T> {
 
     /// Advance a grid iterator over fullwidth characters.
     ///
-    /// feathercritty: upstream took `cell: &mut &'a Cell` borrowed from the grid; the iterator
-    /// yields owned cells now, so `cell` is an owned copy, replaced the same way.
+    /// feathercritty: upstream took `cell: &mut &'a Cell` borrowed from the grid; `cell` is a
+    /// `SearchCell` now, replaced the same way, and the iterator steps without producing cells.
     fn skip_fullwidth(
         &self,
         iter: &mut GridIterator<'_, Cell>,
-        cell: &mut Cell,
+        cell: &mut SearchCell,
         direction: Direction,
     ) {
         match direction {
@@ -623,17 +654,17 @@ impl<T> Term<T> {
                 if cell.flags.contains(Flags::WIDE_CHAR)
                     && iter.point().column < self.last_column() =>
             {
-                iter.next();
+                iter.advance();
             },
             Direction::Right if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) => {
-                if let Some(Indexed { cell: new_cell, .. }) = iter.next() {
-                    *cell = new_cell;
+                if iter.advance() {
+                    *cell = SearchCell::from(iter.cell());
                 }
-                iter.next();
+                iter.advance();
             },
             Direction::Left if cell.flags.contains(Flags::WIDE_CHAR_SPACER) => {
-                if let Some(Indexed { cell: new_cell, .. }) = iter.prev() {
-                    *cell = new_cell;
+                if iter.retreat() {
+                    *cell = SearchCell::from(iter.cell());
                 }
 
                 // feathercritty: upstream `self.grid[prev]`; `prev` can be in history.
@@ -1027,6 +1058,8 @@ impl<T> RegexIter<'_, T> {
     }
 }
 
+// feathercritty: upstream's tests indexed `Grid` directly; screen writes go through
+// `Grid::screen_mut()`/`screen()`, history writes through `Grid::update_line`.
 #[cfg(test)]
 mod tests {
     use super::*;

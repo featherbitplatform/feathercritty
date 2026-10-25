@@ -1,8 +1,9 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
-//! Live bytes, peak bytes and allocation calls of feathercritty against unmodified
-//! `alacritty_terminal` 0.26.0 in the same process (design spec sections 6.3 last paragraph, 6.4
-//! resize row and 6.5), measured with a counting `#[global_allocator]` over `System`.
+//! Live bytes, peak bytes and allocation calls of feathercritty against `alacritty_terminal`
+//! 0.26.0 (the differential test's patched oracle, `tests/oracle/PATCHES.md`) in the same process
+//! (design spec sections 6.3 last paragraph, 6.4 resize row and 6.5), measured with a counting
+//! `#[global_allocator]` over `System`.
 //!
 //! Three tables:
 //!

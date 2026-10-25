@@ -2572,6 +2572,8 @@ pub mod test {
     }
 }
 
+// feathercritty: upstream's tests indexed `Grid` directly; screen writes go through
+// `Grid::screen_mut()`/`screen()`, history writes through `Grid::update_line`.
 #[cfg(test)]
 mod tests {
     use super::*;

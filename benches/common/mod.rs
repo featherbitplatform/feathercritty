@@ -1,8 +1,11 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
 //! Shared harness of the benchmarks (`benches/ingest.rs`, `benches/reads.rs`) and of
-//! `examples/memory.rs`: pre-generated workloads, a driver that runs feathercritty and unmodified
-//! `alacritty_terminal` 0.26.0 through the same code, and timing and table helpers.
+//! `examples/memory.rs`: pre-generated workloads, a driver that runs feathercritty and
+//! `alacritty_terminal` 0.26.0 through the same code, and timing and table helpers. The 0.26.0
+//! crate is the differential test's oracle (`tests/oracle/`): the published source with two small
+//! patches (`tests/oracle/PATCHES.md`: the `Row` `occ` invariant and "no row" reads outside the
+//! grid), neither of which changes what is measured here noticeably.
 //!
 //! # How both crates are driven
 //!
@@ -19,7 +22,7 @@
 //!
 //! # Moving the comparison to a new upstream release
 //!
-//! 1. Bump the dev-dependency `alacritty_terminal = "=X.Y.Z"` in `Cargo.toml`.
+//! 1. Re-vendor the oracle at `tests/oracle/` for X.Y.Z (see `tests/oracle/PATCHES.md`).
 //! 2. [`driver!`] uses `Term::new`, `Config::scrolling_history`, `term::test::TermSize`,
 //!    `Term::resize`, `Term::grid`, `Processor::advance`, `Selection::new/update`,
 //!    `Term::selection` (public field), `Term::selection_to_string`, `RegexSearch::new` and
@@ -462,6 +465,24 @@ pub fn table_row(
     println!(
         "{:<34} | {:>12.3} | {:>10.3} | {:>6.3} | {:>7.1}% | {}",
         label, ac.median, fc.median, ratio, spread, note
+    );
+    ok
+}
+
+/// Prints one row gated by an absolute bound instead of a ratio; returns whether the fork's
+/// median is at most `max_ms`. The ratio column is informational.
+pub fn table_row_abs(label: &str, ac: Stats, fc: Stats, max_ms: f64) -> bool {
+    let ratio = fc.median / ac.median;
+    let spread = ac.spread_pct().max(fc.spread_pct());
+    let ok = fc.median <= max_ms;
+    println!(
+        "{:<34} | {:>12.6} | {:>10.6} | {:>6.3} | {:>7.1}% | {} (fork <= {max_ms} ms)",
+        label,
+        ac.median,
+        fc.median,
+        ratio,
+        spread,
+        if ok { "pass" } else { "FAIL" }
     );
     ok
 }

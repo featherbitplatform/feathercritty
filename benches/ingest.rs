@@ -1,8 +1,9 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
 //! Ingest throughput of `Processor::advance` on a `Term` with a full 10,000-row history,
-//! feathercritty against unmodified `alacritty_terminal` 0.26.0 in the same binary (design spec
-//! section 6.3).
+//! feathercritty against `alacritty_terminal` 0.26.0 in the same binary (design spec section 6.3).
+//! The comparison crate is the differential test's oracle: the published 0.26.0 source with the
+//! two patches of `tests/oracle/PATCHES.md`, which do not change ingest timing measurably.
 //!
 //! Each row feeds a pre-generated buffer of at least 50 MB (see `common::workload_for`) to a
 //! fresh terminal whose history was filled first (untimed), at 126x37 and 200x60, and prints the
