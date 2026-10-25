@@ -48,15 +48,10 @@ jobs:
         env:
           DIFF_TINY: 1
       # Large histories (tests/large_history.rs, all #[ignore]). The 100,000-line comparison
-      # against 0.26.0 holds two full snapshots (a few GB), so it runs on Linux only; macOS runs
-      # the 1,000,000-line invariants; Windows runs neither. large_history_cost_table is manual.
-      - name: large history tests (release, Linux)
-        if: runner.os == 'Linux'
+      # against 0.26.0 holds two full snapshots (peak RSS measured at 3.9 GB), which fits the
+      # Linux and macOS runners; Windows runs neither. large_history_cost_table is manual.
+      - name: large history tests (release, Linux and macOS)
+        if: runner.os != 'Windows'
         run: >-
           cargo test --locked --release --test large_history -- --ignored --exact
           large_history_matches_oracle_at_100k large_history_invariants_at_1m
-      - name: large history invariants (release, macOS)
-        if: runner.os == 'macOS'
-        run: >-
-          cargo test --locked --release --test large_history -- --ignored --exact
-          large_history_invariants_at_1m
