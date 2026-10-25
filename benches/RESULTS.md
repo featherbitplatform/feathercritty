@@ -175,7 +175,7 @@ hyperlinks, a combining mark and an underline color: 0 allocations; reflow peak)
 
 ## Block size
 
-The history block size stays 64 KiB. The tuning pass (Task 16) measured 16 to 256 KiB (ingest
+The history block size stays 64 KiB. The tuning pass measured 16 to 256 KiB (ingest
 ratios, single sessions):
 
 | Block size | Dense 126x37 / 200x60 | Short 126x37 / 200x60 | Log lines memory |
@@ -251,8 +251,8 @@ row splits).
 In the correctness run (`large_history_matches_oracle_at_100k`, rich content: colors, bold, wide
 characters, hyperlinks, lines wider than 126 columns) single resizes of the 100,000-line history
 took 31.4 ms (126->100) and 37.0 ms (100->126) in the fork against 26.0 and 18.1 ms in 0.26.0, and
-the trim to 10,000 lines 0.5 ms against 30.4 ms. The first measurement of this table (Task 10,
-before the byte copy) had 100,000-line rewraps of 44 to 69 ms.
+the trim to 10,000 lines 0.5 ms against 30.4 ms. The first measurement of this table (before
+the byte copy) had 100,000-line rewraps of 44 to 69 ms.
 
 ## Baseline on identical code (formerly `benches/BASELINE.md`)
 
