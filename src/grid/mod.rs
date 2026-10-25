@@ -10,6 +10,7 @@ use crate::index::{Column, Line, Point};
 use crate::term::cell::{Flags, ResetDiscriminant};
 use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
+mod compact;
 mod history;
 pub mod resize;
 mod row;
@@ -17,8 +18,10 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
-// feathercritty: the history and its read API (see `history.rs`).
-pub use self::history::{History, HistoryCell, RowReader};
+// feathercritty: the history and its read API (see `history.rs`), and the trait for cells it
+// stores, next to their row codec (see `compact.rs`).
+pub use self::compact::HistoryCell;
+pub use self::history::{History, RowReader};
 pub use self::row::Row;
 use self::storage::Storage;
 

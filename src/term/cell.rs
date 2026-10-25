@@ -223,10 +223,6 @@ impl Cell {
     }
 }
 
-/// feathercritty: lets `History` store `Cell` rows (phase 1 needs only the default header
-/// bits; a later phase adds the row encoding here).
-impl grid::HistoryCell for Cell {}
-
 impl GridCell for Cell {
     #[inline]
     fn is_empty(&self) -> bool {

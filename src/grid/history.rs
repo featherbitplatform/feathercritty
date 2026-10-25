@@ -12,7 +12,8 @@
 //!   than `limit()` rows; pushing at the limit evicts the oldest row, a lower limit evicts at once.
 //! - [`RowReader`] reads any grid line as `&Row`: the screen row itself for lines `>= 0`, or a copy
 //!   of a history row in its own scratch row for lines `< 0`.
-//! - [`HistoryCell`] is what a cell type needs for the header bits (`wraps`, `is_clear`).
+//! - [`HistoryCell`] (in `compact.rs`, with the row codec) is what a cell type needs to be stored
+//!   here; phase 1 uses only its header bits (`wraps`).
 //!
 //! This is phase 1 of the compact history work (design spec section 5): history rows are still
 //! stored as dense `Row`s, in a `VecDeque`, so behavior is exactly upstream's. A later phase
@@ -28,25 +29,8 @@
 
 use std::collections::VecDeque;
 
-use crate::grid::{Dimensions, Grid, GridCell, Row};
+use crate::grid::{Dimensions, Grid, GridCell, HistoryCell, Row};
 use crate::index::Line;
-use crate::term::cell::Flags;
-
-/// A cell type the history can store.
-///
-/// Phase 1 stub: dense rows need nothing beyond the header bits below. The encoded store of a
-/// later phase moves this trait next to its row codec and adds the encoding, the decoding and
-/// the type of the shared extra data.
-pub trait HistoryCell: GridCell + Clone + Default {
-    /// Whether `row` continues on the next line: its last cell has `Flags::WRAPLINE`.
-    ///
-    /// Rows are always as wide as the grid, so this is upstream's
-    /// `grid[line][last_column].flags.contains(Flags::WRAPLINE)`.
-    #[inline]
-    fn row_wraps(row: &Row<Self>) -> bool {
-        row.last().is_some_and(|cell| cell.flags().contains(Flags::WRAPLINE))
-    }
-}
 
 /// The rows above the screen, at most `limit` of them.
 ///

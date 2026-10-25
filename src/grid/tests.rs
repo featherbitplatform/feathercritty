@@ -8,6 +8,9 @@
 
 use super::*;
 
+use std::collections::VecDeque;
+
+use crate::grid::compact::{self, RowHeader};
 use crate::term::cell::Cell;
 
 /// Line `line` of `grid`, screen or history, as an owned row.
@@ -33,7 +36,52 @@ impl GridCell for usize {
     }
 }
 
-impl HistoryCell for usize {}
+/// feathercritty: test-only record format for `usize` cells: the shared header (`P = W`, no runs,
+/// marks or extras), then each cell as a varint.
+impl HistoryCell for usize {
+    type Extra = ();
+
+    fn encode(row: &Row<Self>, out: &mut Vec<u8>, _extras: &mut VecDeque<()>) -> RowHeader {
+        let header = RowHeader {
+            width: row.len() as u32,
+            wraps: false,
+            clear: row.is_clear(),
+            extras: 0,
+            len: row.len() as u32,
+        };
+        compact::write_header(out, &header, 0, 0);
+        for &value in row {
+            compact::write_varint(out, value);
+        }
+        header
+    }
+
+    fn decode(bytes: &[u8], _extras: &[()], into: &mut Row<Self>) {
+        let mut reader = compact::RecordReader::new(bytes);
+        let width = reader.layout().header.width as usize;
+        for cell in compact::prepare_row(into, width) {
+            *cell = reader.varint();
+        }
+    }
+}
+
+#[test]
+fn usize_history_cell_roundtrip() {
+    let mut row = Row::new(5);
+    for (col, value) in [0, 1, 127, 128, usize::MAX].into_iter().enumerate() {
+        row[Column(col)] = value;
+    }
+    let mut out = vec![9];
+    let header = usize::encode(&row, &mut out, &mut VecDeque::new());
+    assert_eq!(compact::read_header(&out[1..]), header);
+    assert_eq!((header.width, header.clear, header.extras), (5, false, 0));
+
+    let mut into = Row::new(2);
+    usize::decode(&out[1..], &[], &mut into);
+    assert_eq!(into, row);
+    assert_eq!(into.occ, 5);
+    assert!(usize::encode(&Row::new(3), &mut out, &mut VecDeque::new()).clear);
+}
 
 // Scroll up moves lines upward.
 #[test]

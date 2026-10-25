@@ -320,9 +320,12 @@ impl<T> IndexMut<Line> for Storage<T> {
 // upstream's (struct literals gained the `spare` field).
 #[cfg(test)]
 mod tests {
-    use crate::grid::GridCell;
+    use std::collections::VecDeque;
+
+    use crate::grid::compact::{self, RowHeader};
     use crate::grid::row::Row;
     use crate::grid::storage::Storage;
+    use crate::grid::{GridCell, HistoryCell};
     use crate::index::{Column, Line};
     use crate::term::cell::Flags;
 
@@ -342,6 +345,55 @@ mod tests {
         fn flags_mut(&mut self) -> &mut Flags {
             unimplemented!();
         }
+    }
+
+    /// feathercritty: test-only record format for `char` cells: the shared header (`P = W`,
+    /// no runs, marks or extras), then the characters as UTF-8.
+    impl HistoryCell for char {
+        type Extra = ();
+
+        fn encode(row: &Row<Self>, out: &mut Vec<u8>, _extras: &mut VecDeque<()>) -> RowHeader {
+            let header = RowHeader {
+                width: row.len() as u32,
+                wraps: false,
+                clear: row.is_clear(),
+                extras: 0,
+                len: row.len() as u32,
+            };
+            compact::write_header(out, &header, 0, 0);
+            for &c in row {
+                out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+            }
+            header
+        }
+
+        fn decode(bytes: &[u8], _extras: &[()], into: &mut Row<Self>) {
+            let mut reader = compact::RecordReader::new(bytes);
+            let width = reader.layout().header.width as usize;
+            for cell in compact::prepare_row(into, width) {
+                *cell = reader.char();
+            }
+        }
+    }
+
+    #[test]
+    fn char_history_cell_roundtrip() {
+        let mut row = Row::new(4);
+        for (col, c) in ['a', '\t', '中', '😀'].into_iter().enumerate() {
+            row[Column(col)] = c;
+        }
+        let mut out = Vec::new();
+        let header = char::encode(&row, &mut out, &mut VecDeque::new());
+        assert_eq!(compact::read_header(&out), header);
+        assert_eq!((header.width, header.clear), (4, false));
+
+        let mut into = Row::default();
+        char::decode(&out, &[], &mut into);
+        assert_eq!(into, row);
+        assert_eq!(into.occ, 4);
+
+        let blank = Row::from_vec(vec![' ', '\t', ' '], 3);
+        assert!(char::encode(&blank, &mut out, &mut VecDeque::new()).clear);
     }
 
     #[test]
