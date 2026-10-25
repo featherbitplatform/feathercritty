@@ -4,7 +4,7 @@
 name = "feathercritty"
 # The alacritty_terminal release this fork is based on, plus the fork's own revision as build
 # metadata; see README.md.
-version = "0.26.0+fbterm.1"
+version = "0.26.0+fbterm.2"
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 license = "Apache-2.0"
 description = "Terminal emulation library for featherbit terminal, forked from alacritty_terminal"
