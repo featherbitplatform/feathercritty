@@ -1008,9 +1008,21 @@ impl<T> RegexIter<'_, T> {
         // `skip_fullwidth`, drop this.
         // If the match starts after the range's start in grid order (a range that wraps around
         // the buffer's top), cutting it would turn it around; we stop instead.
+        //
+        // The match runs right from its start, so it passes the range's start exactly when the
+        // start lies before its end going right from the match's start. Measuring only where its
+        // end lies (going left from the range's start) missed a match that runs right through
+        // the lines outside a range wrapping around the buffer's top and ends back inside the
+        // range (a search from a cell to itself reads a full lap;
+        // `left_match_past_range_start_wrapping`); both tests apply.
+        let (match_start, match_end) = (*regex_match.start(), *regex_match.end());
+        let passes_start = self.end_distance + 1 < self.term.total_lines() * self.term.columns()
+            && self.term.search_distance(match_start, match_end, Direction::Right)
+                > self.term.search_distance(match_start, self.start, Direction::Right);
         if self.direction == Direction::Left
-            && self.term.search_distance(self.start, *regex_match.end(), Direction::Left)
+            && (self.term.search_distance(self.start, match_end, Direction::Left)
                 > self.end_distance
+                || passes_start)
         {
             if *regex_match.start() > self.start {
                 self.done = true;
@@ -2522,6 +2534,52 @@ mod tests {
             let match_end = Point::new(Line(0), Column(6));
             assert_eq!(result, Some(match_start..=match_end), "{side:?}");
         }
+    }
+
+    #[test]
+    fn left_match_past_range_start_wrapping() {
+        // Differential soak seed 2003541 (`random_streams`, `DIFF_TINY=1`), shrunk: a leftward
+        // range from (1,1) up around the buffer's top to (6,0), so lines 2 to 5 lie outside it
+        // (apart from the leading spacer completing the wide char at its end). Line 1 holds a wide
+        // char followed by a plain blank instead of its spacer. After the first match the
+        // iterator searches from that wide char to itself: the second search (a full lap, as for
+        // any search from a cell to itself) reads right through lines 2 to 5, all wrapped, and
+        // ends on line 12. That end lies inside the range, so the cut at the range's start, which
+        // measured only how far the end lies from the start going left, did not apply, and the
+        // match (1,0)..=(12,0) covered lines outside the range. 0.26.0 returns it too, from the
+        // same reading.
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("x ", ".L"),
+            ("文 ", "W."),
+            ("👍 ", "WS"),
+            ("x ", ".L"),
+            ("👧 ", "WS"),
+            ("8 ", ".L"),
+            ("本 ", "WS"),
+            ("テ ", "WS"),
+            ("q ", ".L"),
+            ("⚡ ", "WS"),
+            ("xj", ".r"),
+            ("*)", ".r"),
+            ("x5", ".."),
+        ]);
+        let start = Point::new(Line(1), Column(1));
+        let end = Point::new(Line(6), Column(0));
+
+        let matches = terminates("leftward iterator over a wrapping range", move || {
+            let mut regex = RegexSearch::new("[^ ]+ ?").unwrap();
+            let iter = RegexIter::new(start, end, Direction::Left, &term, &mut regex);
+            iter.take(40).collect::<Vec<_>>()
+        });
+        // Every match runs right from its start without passing the range's start.
+        for m in &matches {
+            let (from, to) = (*m.start(), *m.end());
+            let in_range = (from.line <= Line(1) && to <= start)
+                || (from.line >= Line(5) && to.line >= Line(5) && from <= to);
+            assert!(in_range, "{m:?} in {matches:?}");
+        }
+        assert_eq!(matches[0], Point::new(Line(1), Column(0))..=start);
     }
 
     #[test]
