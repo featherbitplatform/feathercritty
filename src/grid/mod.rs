@@ -674,7 +674,12 @@ impl<T: HistoryCell> Grid<T> {
 
     /// Change history row `line` (`line < 0`) (feathercritty: the one history write, see
     /// `Term::input`; the row is decoded, changed and re-encoded, see `History::update`).
-    #[inline]
+    ///
+    /// Cold and never inlined: it runs only when a wide character is overwritten at the start of
+    /// the screen's first line, and inlined it made `Term::input`, the parser's hottest path,
+    /// measurably slower (about 1.5% on full-screen redraws).
+    #[cold]
+    #[inline(never)]
     pub(crate) fn update_history_row(&mut self, line: Line, f: impl FnOnce(&mut Row<T>)) {
         debug_assert!(line < 0 && line >= self.topmost_line());
         self.history.update((-line.0 - 1) as usize, f);

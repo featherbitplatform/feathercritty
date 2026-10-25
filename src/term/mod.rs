@@ -3429,6 +3429,32 @@ mod tests {
         assert_eq!(term.title, None);
     }
 
+    /// Overwriting a wide character at the start of the screen's first line clears the leading
+    /// spacer on the last cell of the line above, the newest history row (the one history
+    /// write, `Grid::update_history_row`).
+    #[test]
+    fn input_clears_leading_spacer_in_history() {
+        use crate::vte::ansi::Processor;
+
+        let size = TermSize::new(4, 2);
+        let config = Config { scrolling_history: 10, ..Config::default() };
+        let mut term = Term::new(config, &size, VoidListener);
+        let mut parser: Processor = Processor::new();
+        // "abc" and a wide character that does not fit: a leading spacer ends line 0 and the
+        // character wraps to line 1. A newline then scrolls line 0 into history.
+        parser.advance(&mut term, "abc\u{4e2d}\n".as_bytes());
+        assert_eq!(term.history_size(), 1);
+        let spacer = Point::new(Line(-1), Column(3));
+        assert!(term.grid.cell(spacer).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
+
+        // Overwrite the wide character, now at the top left of the screen.
+        parser.advance(&mut term, b"\x1b[1;1Hx");
+        assert_eq!(term.grid.screen()[Line(0)][Column(0)].c, 'x');
+        assert!(!term.grid.cell(spacer).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
+        assert!(term.grid.cell(spacer).flags.contains(Flags::WRAPLINE));
+        assert_eq!(term.grid.cell(Point::new(Line(-1), Column(0))).c, 'a');
+    }
+
     /// The text fast path (`plain_line_to_string`) gives exactly what reading the cells
     /// (`cells_line_to_string`) gives, for every history row that takes it, over random column
     /// ranges; rows with tabs, wide characters, zero-width characters, hyperlinks, colored and
