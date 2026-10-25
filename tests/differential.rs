@@ -10,7 +10,8 @@
 //! Knobs: `DIFF_SEEDS` (seeds per pass, default 300), `DIFF_STEPS` (steps per random seed,
 //! default 400), `DIFF_SEED` (replay one seed), `DIFF_TINY` (feathercritty's history uses
 //! 256-byte blocks instead of 64 KiB ones, so block boundaries, spare blocks and oversized rows
-//! are crossed constantly). A failure prints the seed, the `DIFF_STEPS` (and `DIFF_TINY`) value
+//! are crossed constantly, and its column reflow keeps a window of one dense row instead of
+//! `2 * lines + 2`). A failure prints the seed, the `DIFF_STEPS` (and `DIFF_TINY`) value
 //! the pass used and a minimized step list. Each pass prints coverage statistics (see them with
 //! `--nocapture`).
 //!

@@ -376,6 +376,13 @@ impl<T: HistoryCell> History<T> {
         self.position(i).is_none_or(|pos| read_header(self.record(self.index[pos])).clear)
     }
 
+    /// Blocks that still hold a buffer (tests: the old store's blocks are freed while a reflow
+    /// pops its rows).
+    #[cfg(test)]
+    pub(crate) fn blocks_held(&self) -> usize {
+        self.blocks.iter().filter(|block| block.bytes.capacity() > 0).count()
+    }
+
     /// Remove every row; the limit stays. Frees the index, the extras and every block but at
     /// most `MAX_SPARES` spares.
     pub fn clear(&mut self) {

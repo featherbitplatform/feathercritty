@@ -7,7 +7,9 @@
 //! cache rows were (the `Row` `occ` invariant makes the reset that follows complete). Changed:
 //! `initialize` grows by exactly the rows asked for instead of at least `MAX_CACHE_SIZE` (that
 //! batch was a cache for the history; the history's block pool avoids allocations now, see
-//! `history.rs`).
+//! `history.rs`). Removed: `replace_inner`, upstream's way to store a reflow's result; the
+//! streaming reflow builds the new screen ring with `from_rows` (`ReflowSink::finish` in
+//! `resize.rs`). If upstream adds a caller of `replace_inner`, use `from_rows` there.
 
 use std::mem;
 use std::mem::MaybeUninit;
@@ -86,8 +88,7 @@ impl<T> Storage<T> {
     }
 
     /// A ring of exactly `rows`, all visible, bottom line first (feathercritty: used when
-    /// deserializing a grid).
-    #[cfg(feature = "serde")]
+    /// deserializing a grid and at the end of a column reflow).
     pub fn from_rows(rows: Vec<Row<T>>) -> Storage<T> {
         let len = rows.len();
         Storage { inner: rows, zero: 0, visible_lines: len, len }
@@ -212,14 +213,6 @@ impl<T> Storage<T> {
     #[inline]
     pub fn rotate_down(&mut self, count: usize) {
         self.zero = (self.zero + count) % self.inner.len();
-    }
-
-    /// Update the raw storage buffer.
-    #[inline]
-    pub fn replace_inner(&mut self, vec: Vec<Row<T>>) {
-        self.len = vec.len();
-        self.inner = vec;
-        self.zero = 0;
     }
 
     /// Remove all rows from storage.

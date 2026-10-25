@@ -21,9 +21,9 @@ pub fn cell_at(
     grid.cell(point)
 }
 
-/// A new terminal; under `DIFF_TINY` its grid's history uses tiny blocks (see
-/// `support::tiny_blocks`). The grid is replaced right after `Term::new`, before anything is
-/// written, by one built with the same size and history limit.
+/// A new terminal; under `DIFF_TINY` its grid's history uses tiny blocks and its column reflow
+/// keeps a window of one dense row (see `support::tiny_blocks`). The grid is replaced right after
+/// `Term::new`, before anything is written, by one built with the same size and history limit.
 pub fn new_term(
     config: k::term::Config,
     size: &k::term::test::TermSize,
@@ -39,6 +39,7 @@ pub fn new_term(
             history,
             super::TINY_BLOCK_BYTES,
         );
+        term.grid_mut().set_reflow_window(1);
     }
     term
 }

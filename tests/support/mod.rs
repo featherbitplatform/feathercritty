@@ -486,7 +486,9 @@ fn env_u64(name: &str) -> Option<u64> {
 
 /// `DIFF_TINY`: when set (to anything but `0`), every feathercritty grid's history uses
 /// [`TINY_BLOCK_BYTES`]-byte blocks, so block boundaries, spares and oversized rows are crossed
-/// all the time.
+/// all the time, and its column reflow keeps a window of one dense row (`Grid::set_reflow_window`),
+/// so every row the reflow produces goes through the new history; the primary grid only, the
+/// alternate one has no history.
 pub fn tiny_blocks() -> bool {
     std::env::var("DIFF_TINY").is_ok_and(|value| value.trim() != "0")
 }

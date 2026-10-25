@@ -3,10 +3,12 @@
 //! Allocation checks for the history's block pool (design spec 5.3): once the history is full,
 //! scrolling more rows into it allocates nothing, because every evicted block becomes the next
 //! spare and the index, the extras queue and the encode buffer are at their high-water capacity.
+//! And the peak memory of a reflow (design spec 5.6): rows stream from the old store into a new
+//! one, so no dense copy of the history is ever held.
 //!
-//! A counting global allocator counts the allocations (and reallocations) made by the thread
-//! running a check, so the test harness's own threads do not interfere. It is the only `unsafe`
-//! code of the change, and it is test-only.
+//! A counting global allocator counts the allocations (and reallocations) and the live bytes of
+//! the thread running a check, so the test harness's own threads do not interfere. It is the only
+//! `unsafe` code of the change, and it is test-only.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell as StdCell;
@@ -22,13 +24,24 @@ thread_local! {
     /// Allocations made by this thread while `COUNTING` is set.
     static ALLOCATIONS: StdCell<usize> = const { StdCell::new(0) };
     static COUNTING: StdCell<bool> = const { StdCell::new(false) };
+    /// Bytes allocated minus bytes freed by this thread while `COUNTING` is set, and the
+    /// highest value it reached.
+    static LIVE: StdCell<isize> = const { StdCell::new(0) };
+    static PEAK: StdCell<isize> = const { StdCell::new(0) };
 }
 
-fn note_allocation() {
+/// Count an allocation (when `new` is set) and a change of `delta` live bytes.
+fn note_allocation(new: bool, delta: isize) {
     // `try_with`: the allocator also runs while thread-locals are being torn down.
     let _ = COUNTING.try_with(|counting| {
         if counting.get() {
-            let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            if new {
+                let _ = ALLOCATIONS.try_with(|count| count.set(count.get() + 1));
+            }
+            let _ = LIVE.try_with(|live| {
+                live.set(live.get() + delta);
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(live.get())));
+            });
         }
     });
 }
@@ -38,24 +51,25 @@ fn note_allocation() {
 // not allocate.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        note_allocation();
+        note_allocation(true, layout.size() as isize);
         // SAFETY: forwarded unchanged (see the impl).
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        note_allocation();
+        note_allocation(true, layout.size() as isize);
         // SAFETY: forwarded unchanged (see the impl).
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        note_allocation();
+        note_allocation(true, new_size as isize - layout.size() as isize);
         // SAFETY: forwarded unchanged (see the impl).
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        note_allocation(false, -(layout.size() as isize));
         // SAFETY: forwarded unchanged (see the impl).
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -71,6 +85,23 @@ fn allocations_in(f: impl FnOnce()) -> usize {
     f();
     COUNTING.with(|counting| counting.set(false));
     ALLOCATIONS.with(|count| count.get())
+}
+
+/// Start counting live bytes on this thread from 0.
+fn start_counting() {
+    LIVE.with(|live| live.set(0));
+    PEAK.with(|peak| peak.set(0));
+    COUNTING.with(|counting| counting.set(true));
+}
+
+/// Live bytes since `start_counting`, and the peak since the last `reset_peak`.
+fn live_and_peak() -> (isize, isize) {
+    (LIVE.with(StdCell::get), PEAK.with(StdCell::get))
+}
+
+/// Restart the peak from the current live bytes.
+fn reset_peak() {
+    PEAK.with(|peak| peak.set(LIVE.with(StdCell::get)));
 }
 
 /// Write row number `n` on the bottom line, alternating plain text and colored runs, then
@@ -125,4 +156,41 @@ fn steady_scroll_allocates_nothing() {
     // Tiny blocks: every row fits in a quarter block (narrow rows, at most 2 runs), so blocks
     // fill and are evicted constantly.
     check(8, 256);
+}
+
+/// A reflow streams the history: during 126->100->126 columns with a full 10,000-row history,
+/// the grid's peak live bytes stay below what the history rows alone take as dense rows, and the
+/// old store is released as the pass goes (design spec 5.6, 6.4).
+#[test]
+fn reflow_peak_below_dense() {
+    let (lines, columns, limit) = (37, 126, 10_000);
+    start_counting();
+    let mut grid = Grid::<Cell>::new(lines, columns, limit);
+    for n in 0..limit + 2 * lines {
+        scroll_one(&mut grid, n);
+    }
+    assert_eq!(grid.history_size(), limit);
+    let (before, _) = live_and_peak();
+
+    reset_peak();
+    grid.resize(true, lines, 100);
+    grid.resize(true, lines, columns);
+    let (after, peak) = live_and_peak();
+    COUNTING.with(|counting| counting.set(false));
+
+    let dense = limit * columns * std::mem::size_of::<Cell>();
+    let compact = before as usize;
+    println!("grid {before} B before, {after} B after, peak {peak} B; dense history {dense} B");
+    assert!((peak as usize) < dense, "peak {peak} B not below the dense history {dense} B");
+    // Old and new store side by side would be about twice the grid; streaming frees the old
+    // blocks as the new ones fill, so the peak stays well below that.
+    assert!(
+        (peak as usize) < compact + compact / 2,
+        "peak {peak} B: the old store was not released during the pass (grid {compact} B)"
+    );
+    // Nothing of the pass stays resident.
+    assert!(
+        (after as usize) < compact + compact / 4,
+        "{after} B after the resize, {compact} B before"
+    );
 }

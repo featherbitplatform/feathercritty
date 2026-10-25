@@ -155,6 +155,11 @@ pub struct Grid<T: HistoryCell> {
     /// Lines rotated into history since the grid was created (fbterm patch: lets a host keep
     /// positions stable while output scrolls).
     scrolled_lines: i64,
+
+    /// Rows the column reflow keeps dense, when a test sets it (feathercritty: a test hook, see
+    /// `set_reflow_window`; `None` is the default window of `resize.rs`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    reflow_window: Option<usize>,
 }
 
 /// The visible lines of a [`Grid`], indexed by `Line` (`0..screen_lines`) and `Point`.
@@ -231,7 +236,20 @@ impl<T: HistoryCell> Grid<T> {
             lines,
             columns,
             scrolled_lines: 0,
+            #[cfg(any(test, feature = "test-hooks"))]
+            reflow_window: None,
         }
+    }
+
+    /// Keep only `rows` rows dense during a column reflow instead of the default window
+    /// (feathercritty: a test hook, so tests can prove the reflow's result does not depend on the
+    /// window, design spec 5.6; the `test-hooks` feature exposes it outside the crate). Not a
+    /// stable API.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_reflow_window(&mut self, rows: usize) {
+        assert!(rows > 0, "the reflow window holds at least one row");
+        self.reflow_window = Some(rows);
     }
 
     /// Lines rotated into history since the grid was created (fbterm patch). A line at
@@ -843,6 +861,8 @@ mod serde_proxy {
                 lines,
                 display_offset,
                 scrolled_lines: 0,
+                #[cfg(any(test, feature = "test-hooks"))]
+                reflow_window: None,
             })
         }
     }
