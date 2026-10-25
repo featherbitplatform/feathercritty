@@ -1,15 +1,31 @@
 // Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
 //! Differential test (design spec 6.1): identical inputs go to feathercritty and to unmodified
-//! `alacritty_terminal` 0.26.0, and their states and query answers must match after every step.
+//! `alacritty_terminal` 0.26.0, and their states and query answers must match after every step
+//! and after a final synthetic exit from the alternate screen. What is compared, how both crates
+//! are driven, and how to move the oracle to a newer upstream release are documented in
+//! `tests/support/mod.rs`.
 //!
 //! Knobs: `DIFF_SEEDS` (seeds per pass, default 300), `DIFF_STEPS` (steps per random seed,
-//! default 400), `DIFF_SEED` (replay one seed). A failure prints the seed and a minimized step
-//! list.
+//! default 400), `DIFF_SEED` (replay one seed). A failure prints the seed, the `DIFF_STEPS` value
+//! the pass used and a minimized step list. Each pass prints coverage statistics (see them with
+//! `--nocapture`).
 //!
 //! The only intended behavioral difference, fork change 1 (kitty keyboard stack eviction), needs
 //! more than 4,096 pushes; the generator stays below 4,000, and
 //! `oracle_sees_fork_change_1` checks that the oracle does notice it.
+//!
+//! Known gaps, all from 0.26.0 bugs the harness steers around (see the comments at each
+//! workaround; remove them when upstream fixes the bug):
+//! - The primary screen's history is compared only while it is shown. Alternate screen periods are
+//!   kept short and every run ends by leaving the alternate screen, but a difference that appears
+//!   in the hidden history and is undone before the exit goes unseen.
+//! - Leftward searches whose window would end on a wrapped wide character get a window one or more
+//!   lines larger, so that exact end is never searched; searches whose match iterator cycles are
+//!   answered "does not terminate" without calling `search_next`.
+//! - Wide characters never meet a one-column grid.
+//! - Queries that panic in 0.26.0 are compared as "panicked", so whatever those functions would
+//!   have returned there is not checked.
 
 mod support;
 
@@ -21,7 +37,7 @@ use support::{Case, DEFAULT_SEEDS, DEFAULT_STEPS, Start, Step};
 fn random_streams() {
     let n = support::step_count(DEFAULT_STEPS);
     let seeds = support::seeds(support::seed_count(DEFAULT_SEEDS));
-    support::run_pass("random_streams", &seeds, |seed| r#gen::random_case(seed, n));
+    support::run_pass("random_streams", &seeds, Some(n), |seed| r#gen::random_case(seed, n));
 }
 
 /// The separate pass at a 100,000-line history limit, with floods of short lines so history
@@ -29,21 +45,63 @@ fn random_streams() {
 /// seeds and a quarter of the steps.
 #[test]
 fn large_history_limit() {
-    let n = support::step_count(DEFAULT_STEPS).div_ceil(4);
+    let knob = support::step_count(DEFAULT_STEPS);
+    let n = knob.div_ceil(4);
     let seeds = support::seeds(support::seed_count(DEFAULT_SEEDS).div_ceil(10));
-    support::run_pass("large_history_limit", &seeds, |seed| r#gen::large_case(seed, n));
+    support::run_pass("large_history_limit", &seeds, Some(knob), |seed| r#gen::large_case(seed, n));
 }
 
-/// Deterministic realistic streams: `ls` listings, git graphs, compiler diagnostics, CJK text
-/// and a full-screen program on the primary screen.
+/// A full history: limits from 500 to 10,000, floods of long wrapping lines (CJK included) past
+/// the limit, then resizes (reflow of thousands of wrapped rows) and limit changes while the
+/// history is full. A tenth of the seeds and a quarter of the steps, like the large pass.
 #[test]
-fn realistic_streams() {
-    let kinds = Realistic::ALL.len() as u64;
-    // Every seed runs one kind, so each kind gets a fifth of the seeds.
-    let seeds = support::seeds(support::seed_count(DEFAULT_SEEDS).div_ceil(5) * kinds);
-    support::run_pass("realistic_streams", &seeds, |seed| {
-        r#gen::realistic_case(Realistic::ALL[(seed % kinds) as usize], seed)
-    });
+fn full_history() {
+    let knob = support::step_count(DEFAULT_STEPS);
+    let n = knob.div_ceil(4);
+    let seeds = support::seeds(support::seed_count(DEFAULT_SEEDS).div_ceil(10));
+    let stats =
+        support::run_pass("full_history", &seeds, Some(knob), |seed| r#gen::full_case(seed, n));
+    // The pass exists to run at the limit: most cases must get there.
+    assert!(
+        seeds.len() < 5 || stats.reached_limit * 2 >= stats.cases,
+        "too few cases reached their history limit: {stats}"
+    );
+}
+
+fn realistic(test: &str, kind: Realistic) {
+    // A fifth of the seeds per kind.
+    let seeds = support::seeds(support::seed_count(DEFAULT_SEEDS).div_ceil(5));
+    support::run_pass(test, &seeds, None, |seed| r#gen::realistic_case(kind, seed));
+}
+
+/// Colored `ls -l` style listings.
+#[test]
+fn realistic_ls() {
+    realistic("realistic_ls", Realistic::Ls);
+}
+
+/// `git log --graph` style output.
+#[test]
+fn realistic_git_graph() {
+    realistic("realistic_git_graph", Realistic::GitGraph);
+}
+
+/// Compiler diagnostics with colors, carets and file links.
+#[test]
+fn realistic_diagnostics() {
+    realistic("realistic_diagnostics", Realistic::Diagnostics);
+}
+
+/// Mixed CJK and ASCII prose.
+#[test]
+fn realistic_cjk() {
+    realistic("realistic_cjk", Realistic::Cjk);
+}
+
+/// A full-screen program redrawing the primary screen.
+#[test]
+fn realistic_full_screen() {
+    realistic("realistic_full_screen", Realistic::FullScreen);
 }
 
 /// Every ref test recording replayed whole: once as recorded (its own size and history limit),
@@ -53,7 +111,7 @@ fn ref_recordings() {
     let names = r#gen::recordings();
     let count = names.len() as u64 * 2;
     let seeds = support::seeds(count);
-    support::run_pass("ref_recordings", &seeds, |seed| {
+    support::run_pass("ref_recordings", &seeds, None, |seed| {
         let name = &names[(seed % names.len() as u64) as usize];
         r#gen::recording_case(name, seed, seed >= names.len() as u64)
     });

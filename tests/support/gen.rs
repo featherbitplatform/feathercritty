@@ -28,13 +28,20 @@ pub struct GenCfg {
     pub start: Start,
     /// Upper bound for history limits chosen by `SetHistory` steps.
     pub max_history: usize,
+    /// Step kinds and their weights.
+    pub weights: &'static [(Kind, u32)],
     /// Add occasional floods of short lines (the large-history pass), so history grows far
     /// beyond what 400 ordinary steps produce.
     pub floods: bool,
+    /// The full-history pass: history limits stay at or above `FULL_MIN_HISTORY`, and
+    /// `history limit * columns` stays at or below this many cells so a debug run can compare
+    /// the whole history after every step.
+    pub cell_budget: Option<usize>,
     /// Emit wide characters. 0.26.0 cannot hold a wide character in a one-column grid (writing
     /// one indexes past the row and panics; resizing a grid that holds one to one column never
     /// returns), so runs with wide characters keep at least two columns and runs without them
-    /// may go down to one.
+    /// may go down to one. Workaround for that 0.26.0 bug; remove it (let every run use one
+    /// column) once upstream fixes it, so the oracle covers these inputs again.
     pub wide: bool,
 }
 
@@ -92,7 +99,14 @@ impl GenCfg {
             kitty: rng.gen_bool(0.5),
             query_seed: rng.r#gen(),
         };
-        Self { start, max_history: MAX_HISTORY, floods: false, wide }
+        Self {
+            start,
+            max_history: MAX_HISTORY,
+            weights: WEIGHTS,
+            floods: false,
+            cell_budget: None,
+            wide,
+        }
     }
 
     /// The separate pass at a 100,000-line history limit.
@@ -105,8 +119,56 @@ impl GenCfg {
             kitty: false,
             query_seed: rng.r#gen(),
         };
-        Self { start, max_history: LARGE_HISTORY, floods: true, wide: true }
+        Self {
+            start,
+            max_history: LARGE_HISTORY,
+            weights: WEIGHTS,
+            floods: true,
+            cell_budget: None,
+            wide: true,
+        }
     }
+}
+
+/// Lowest history limit of the full-history pass.
+pub const FULL_MIN_HISTORY: usize = 500;
+
+/// Cell budget of the full-history pass (see `GenCfg::cell_budget`).
+pub const FULL_CELLS: usize = 150_000;
+
+/// Widest grid the full-history pass allows for `limit`.
+fn full_max_columns(limit: usize) -> usize {
+    (FULL_CELLS / limit.max(1)).clamp(2, 120)
+}
+
+impl GenCfg {
+    /// The full-history pass: limits from 500 to 10,000, long wrapping lines that fill the
+    /// history past its limit, then resizes and limit changes while it is full.
+    pub fn full(seed: u64) -> Self {
+        let mut rng = rng(seed, 0);
+        let history = rng.gen_range(FULL_MIN_HISTORY..=MAX_HISTORY);
+        let start = Start {
+            lines: rng.gen_range(2..=30),
+            columns: rng.gen_range(2..=full_max_columns(history)),
+            history,
+            kitty: false,
+            query_seed: rng.r#gen(),
+        };
+        Self {
+            start,
+            max_history: MAX_HISTORY,
+            weights: FULL_WEIGHTS,
+            floods: false,
+            cell_budget: Some(FULL_CELLS),
+            wide: true,
+        }
+    }
+}
+
+/// A case for the full-history pass.
+pub fn full_case(seed: u64, n: usize) -> Case {
+    let cfg = GenCfg::full(seed);
+    Case { start: cfg.start, steps: steps(seed, n, &cfg) }
 }
 
 /// A random case for the main pass.
@@ -251,12 +313,17 @@ struct GenState {
     columns: usize,
     limit: usize,
     kitty_pushes: usize,
+    /// The alternate screen is up (as far as the generator knows), and the exit that matches
+    /// the sequence that entered it.
+    alt_exit: Option<&'static str>,
+    /// Steps left before the generator leaves the alternate screen again.
+    alt_left: usize,
 }
 
 /// The weighted step kinds. The weights follow the compact-history plan; `Modes` and
 /// `Selection` are additions.
-#[derive(Clone, Copy)]
-enum Kind {
+#[derive(Debug, Clone, Copy)]
+pub enum Kind {
     Text,
     Newline,
     Sgr,
@@ -279,9 +346,13 @@ enum Kind {
     Selection,
     /// Floods of short lines (large pass only).
     Flood,
+    /// Floods of long lines (60 to 300 characters, wide ones included) that wrap and fill the
+    /// history past its limit (full-history pass).
+    LongFlood,
 }
 
-const WEIGHTS: &[(Kind, u32)] = &[
+/// Weights of the main and large passes.
+pub const WEIGHTS: &[(Kind, u32)] = &[
     (Kind::Text, 30),
     (Kind::Newline, 15),
     (Kind::Sgr, 10),
@@ -301,13 +372,34 @@ const WEIGHTS: &[(Kind, u32)] = &[
     (Kind::Selection, 2),
 ];
 
-fn pick_kind<R: Rng>(rng: &mut R, floods: bool) -> Kind {
-    if floods && rng.gen_bool(0.05) {
+/// Weights of the full-history pass: long floods, resizes and limit changes on a full history;
+/// no RIS, `CSI 3 J` or alternate screen, which would empty it.
+pub const FULL_WEIGHTS: &[(Kind, u32)] = &[
+    (Kind::LongFlood, 12),
+    (Kind::Text, 15),
+    (Kind::Newline, 10),
+    (Kind::Sgr, 5),
+    (Kind::Osc8, 2),
+    (Kind::Erase, 3),
+    (Kind::InsertDelete, 2),
+    (Kind::Region, 3),
+    (Kind::ScrollUpDown, 2),
+    (Kind::TabAlign, 1),
+    (Kind::ViewScroll, 6),
+    (Kind::Resize, 15),
+    (Kind::History, 15),
+    (Kind::Modes, 2),
+    (Kind::Selection, 4),
+];
+
+fn pick_kind<R: Rng>(rng: &mut R, cfg: &GenCfg, alt: bool) -> Kind {
+    // Floods go to the primary screen only, where they grow the history.
+    if cfg.floods && !alt && rng.gen_bool(0.05) {
         return Kind::Flood;
     }
-    let total: u32 = WEIGHTS.iter().map(|(_, w)| w).sum();
+    let total: u32 = cfg.weights.iter().map(|(_, w)| w).sum();
     let mut pick = rng.gen_range(0..total);
-    for &(kind, weight) in WEIGHTS {
+    for &(kind, weight) in cfg.weights {
         if pick < weight {
             return kind;
         }
@@ -330,6 +422,36 @@ fn newline_bytes<R: Rng>(rng: &mut R, out: &mut Vec<u8>) {
     }
 }
 
+/// Long lines (60 to 300 characters, wide ones when `wide`) until the rows they wrap into
+/// exceed the history limit plus the screen, so the history ends up full and evicting.
+fn long_flood<R: Rng>(rng: &mut R, out: &mut Vec<u8>, st: &GenState, wide: bool) {
+    let target = st.limit + st.lines + rng.gen_range(0..=st.limit / 2);
+    let mut rows = 0;
+    let mut n = 0;
+    while rows < target {
+        let len = rng.gen_range(60..=300);
+        let mut width = 0;
+        let _ = write!(out, "{n}: ");
+        width += 3 + n.to_string().len();
+        if rng.gen_bool(0.2) {
+            let _ = write!(out, "\x1b[3{}m", rng.gen_range(1..8));
+        }
+        while width < len {
+            if wide && rng.gen_bool(0.25) {
+                out.extend_from_slice(CJK.choose(rng).unwrap().as_bytes());
+                width += 2;
+            } else {
+                out.extend_from_slice(WORDS.choose(rng).unwrap().as_bytes());
+                out.push(b' ');
+                width += 6;
+            }
+        }
+        out.extend_from_slice(b"\x1b[m\r\n");
+        rows += width.div_ceil(st.columns.max(1));
+        n += 1;
+    }
+}
+
 /// `gen::steps`: `n` steps from the weighted generator.
 pub fn steps(seed: u64, n: usize, cfg: &GenCfg) -> Vec<Step> {
     let mut rng = rng(seed, 1);
@@ -338,13 +460,32 @@ pub fn steps(seed: u64, n: usize, cfg: &GenCfg) -> Vec<Step> {
         columns: cfg.start.columns,
         limit: cfg.start.history,
         kitty_pushes: 0,
+        alt_exit: None,
+        alt_left: 0,
     };
     let mut steps = Vec::with_capacity(n);
 
     while steps.len() < n {
         let mut out = Vec::new();
         let (lines, columns) = (st.lines, st.columns);
-        match pick_kind(&mut rng, cfg.floods) {
+
+        // Alternate screen periods stay short: the primary screen's history is compared only
+        // while it is shown (0.26.0 has no getter for the inactive grid), so leave the
+        // alternate screen within a few steps of entering it.
+        if let Some(exit) = st.alt_exit {
+            if st.alt_left == 0 {
+                st.alt_exit = None;
+                steps.push(Step::Bytes(exit.as_bytes().to_vec()));
+                continue;
+            }
+            st.alt_left -= 1;
+        }
+
+        let mut kind = pick_kind(&mut rng, cfg, st.alt_exit.is_some());
+        if matches!(kind, Kind::LongFlood) && st.alt_exit.is_some() {
+            kind = Kind::Text;
+        }
+        match kind {
             Kind::Text => {
                 if rng.gen_bool(0.2) {
                     push_cup(&mut rng, &mut out, lines, columns);
@@ -424,12 +565,26 @@ pub fn steps(seed: u64, n: usize, cfg: &GenCfg) -> Vec<Step> {
                 };
                 out.extend_from_slice(s.as_bytes());
             },
-            Kind::AltScreen => {
-                let mode = ["1049", "47", "1047"].choose(&mut rng).unwrap();
-                let set = if rng.gen_bool(0.5) { 'h' } else { 'l' };
-                let _ = write!(out, "\x1b[?{mode}{set}");
+            Kind::AltScreen => match st.alt_exit.take() {
+                Some(exit) => out.extend_from_slice(exit.as_bytes()),
+                None => {
+                    let (enter, exit) = *[
+                        ("\x1b[?1049h", "\x1b[?1049l"),
+                        ("\x1b[?47h", "\x1b[?47l"),
+                        ("\x1b[?1047h", "\x1b[?1047l"),
+                    ]
+                    .choose(&mut rng)
+                    .unwrap();
+                    out.extend_from_slice(enter.as_bytes());
+                    st.alt_exit = Some(exit);
+                    st.alt_left = rng.gen_range(1..=5);
+                },
             },
-            Kind::Ris => out.extend_from_slice(b"\x1bc"),
+            Kind::Ris => {
+                // RIS leaves the alternate screen.
+                st.alt_exit = None;
+                out.extend_from_slice(b"\x1bc");
+            },
             Kind::ClearHistory => out.extend_from_slice(b"\x1b[3J"),
             Kind::ViewScroll => {
                 let span = (lines * 3) as i32;
@@ -445,6 +600,17 @@ pub fn steps(seed: u64, n: usize, cfg: &GenCfg) -> Vec<Step> {
                 }
                 newline_bytes(&mut rng, &mut out);
             },
+            Kind::Resize if cfg.cell_budget.is_some() => {
+                let (l, c) = match rng.gen_range(0..4) {
+                    0 => (lines, rng.gen_range(2..=full_max_columns(st.limit))),
+                    1 => (rng.gen_range(2..=30), columns),
+                    _ => (rng.gen_range(2..=30), rng.gen_range(2..=full_max_columns(st.limit))),
+                };
+                st.lines = l;
+                st.columns = c;
+                steps.push(Step::Resize { lines: l, columns: c });
+                continue;
+            },
             Kind::Resize => {
                 // Keep some resizes to one dimension.
                 let (l, c) = match rng.gen_range(0..4) {
@@ -455,6 +621,18 @@ pub fn steps(seed: u64, n: usize, cfg: &GenCfg) -> Vec<Step> {
                 st.lines = l;
                 st.columns = c;
                 steps.push(Step::Resize { lines: l, columns: c });
+                continue;
+            },
+            Kind::History if cfg.cell_budget.is_some() => {
+                // Shrink or grow the limit while the history is (usually) full.
+                let most = MAX_HISTORY.min(FULL_CELLS / st.columns).max(FULL_MIN_HISTORY);
+                let limit = if rng.gen_bool(0.5) {
+                    rng.gen_range(FULL_MIN_HISTORY..=st.limit.max(FULL_MIN_HISTORY))
+                } else {
+                    st.limit + rng.gen_range(1..=3_000)
+                };
+                st.limit = limit.clamp(FULL_MIN_HISTORY, most);
+                steps.push(Step::SetHistory(st.limit));
                 continue;
             },
             Kind::History => {
@@ -535,6 +713,7 @@ pub fn steps(seed: u64, n: usize, cfg: &GenCfg) -> Vec<Step> {
                     let _ = write!(out, "{i} x\r\n");
                 }
             },
+            Kind::LongFlood => long_flood(&mut rng, &mut out, &st, cfg.wide),
         }
         steps.push(Step::Bytes(out));
     }
