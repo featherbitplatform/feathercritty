@@ -161,6 +161,14 @@ pub trait HistoryCell: GridCell + Clone + Default + PartialEq {
     /// `header.extras` of them, at the back), and return its header.
     fn encode(row: &Row<Self>, out: &mut Vec<u8>, extras: &mut VecDeque<Self::Extra>) -> RowHeader;
 
+    /// An upper bound on the bytes `encode` appends to `out` for a row of `width` cells,
+    /// counting any bytes it writes past the record's end and cuts off again. `History` encodes
+    /// straight into a block when the block has that much room left; `None` (the default) means
+    /// no bound is known, and every record goes through a scratch buffer first.
+    fn max_record_bytes(_width: usize) -> Option<usize> {
+        None
+    }
+
     /// Decode the record at the start of `bytes` (bytes after it are ignored) into `into`,
     /// which is resized only when its width differs, and return the record's length in bytes.
     /// `extras` is the row's own slice of the queue `encode` pushed to. The decoded row's `occ`
@@ -914,6 +922,14 @@ impl HistoryCell for Cell {
         header
     }
 
+    /// Every count in a record is at most the width (or one more, for `E`), so each varint takes
+    /// at most 5 bytes: the header, at most 4 bytes of text per cell, a run (5 + 10 + 5 bytes) and
+    /// a mark (5 + 1) per cell, the tail (4 + 10 + 5), and the 30 bytes `put_fixed` may write past
+    /// the end before cutting them off.
+    fn max_record_bytes(width: usize) -> Option<usize> {
+        Some(MAX_HEADER_BYTES + width * (4 + 20 + 6) + 19 + 30)
+    }
+
     fn decode(bytes: &[u8], extras: &[Self::Extra], into: &mut Row<Self>) -> usize {
         decode_cell_row(bytes, extras, into)
     }
@@ -1401,7 +1417,15 @@ mod tests {
 
             let start = out.len();
             let first_extra = extras.len();
+            // The encoder stays within `max_record_bytes`, bytes it cuts off again included: a
+            // buffer with exactly that much room never reallocates.
+            let bound = Cell::max_record_bytes(width).unwrap();
+            let mut exact = Vec::with_capacity(bound);
+            let capacity = exact.capacity();
+            Cell::encode(&row, &mut exact, &mut VecDeque::new());
+            assert_eq!(exact.capacity(), capacity, "row {n}: encode exceeded max_record_bytes");
             let header = Cell::encode(&row, &mut out, &mut extras);
+            assert_eq!(&out[start..], &exact[..], "row {n}");
             assert_eq!(read_header(&out[start..]), header, "row {n}");
             assert_eq!(extras.len() - first_extra, header.extras as usize, "row {n}");
 
@@ -1435,7 +1459,7 @@ mod tests {
             let mut row = Row::new(width);
             for col in 0..stored {
                 let mut cell = Cell {
-                    c: if col % 3 == 0 { 'é' } else { 'a' },
+                    c: if col % 3 == 0 { '😀' } else { 'a' },
                     fg: Color::Indexed(col as u8),
                     flags: if col % 2 == 0 { Flags::WIDE_CHAR } else { Flags::WIDE_CHAR_SPACER },
                     ..Cell::default()
@@ -1449,6 +1473,8 @@ mod tests {
 
             let encoded = roundtrip(&row);
             let layout = encoded.layout();
+            let bound = Cell::max_record_bytes(width).unwrap();
+            assert!(encoded.bytes.len() + 30 <= bound, "stored {stored}: above max_record_bytes");
             assert_eq!(encoded.header.len as usize, stored, "stored {stored}");
             assert_eq!((layout.runs, layout.marks), (stored, stored), "stored {stored}");
             assert_eq!(encoded.header.extras as usize, stored + 1, "stored {stored}");

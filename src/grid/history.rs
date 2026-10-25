@@ -28,9 +28,13 @@
 //!   ("oversized"), which is never appended to and is freed with its row. Blocks sit in a
 //!   `VecDeque` in creation order; each knows how many index entries point into it (`live`). Blocks
 //!   are named by a wrapping `u32` sequence number: the front block is `front_seq`, the next one
-//!   `front_seq + 1`, and so on.
+//!   `front_seq + 1`, and so on. A row is encoded straight into the newest block when the block has
+//!   room for the largest record such a row can make (`HistoryCell::max_record_bytes`); otherwise,
+//!   near a block's end, into a reused scratch buffer and copied from there to wherever it fits.
 //! - **Index.** One 16-byte [`Entry`] per row, oldest first, in a `VecDeque`: the block's sequence
-//!   number, the record's offset and length in it, and the position of the row's first extra.
+//!   number, the record's offset and length in it, and the position of the row's first extra. It
+//!   grows by doubling but never past the limit, so a full history's index is exactly `limit`
+//!   entries.
 //! - **Extras.** The `T::Extra` values (for `Cell`, its `Arc<CellExtra>`) a row's record refers to
 //!   sit in one `VecDeque` shared by the whole history, in index order; positions are wrapping
 //!   `u32` counters (`extras_base` is the position of the queue's front). Row `k`'s extras are
@@ -98,6 +102,10 @@ pub(crate) const DEFAULT_BLOCK_BYTES: usize = 64 * 1024;
 
 /// Most spare blocks a history keeps for its next records.
 pub(crate) const MAX_SPARES: usize = 2;
+
+/// Index capacity a history starts with once it stores a row (it grows by doubling from there,
+/// up to the limit).
+const MIN_INDEX_CAPACITY: usize = 64;
 
 /// A byte block holding records back to back.
 struct Block {
@@ -233,10 +241,56 @@ impl<T: HistoryCell> History<T> {
         }
 
         let first_extra = self.extras_end();
-        self.encoded.clear();
-        T::encode(row, &mut self.encoded, &mut self.extras);
-        let entry = self.store(first_extra);
+        let entry = match self.encode_in_place(row, first_extra) {
+            Some(entry) => entry,
+            None => {
+                self.encoded.clear();
+                T::encode(row, &mut self.encoded, &mut self.extras);
+                self.store(first_extra)
+            },
+        };
+        self.reserve_index();
         self.index.push_back(entry);
+    }
+
+    /// Encode `row` straight into the newest block when that block surely has room for it
+    /// (`HistoryCell::max_record_bytes`), saving the copy from the scratch buffer; `None`, having
+    /// done nothing, when it may not. A record that turns out larger than a quarter block is
+    /// moved to a block of its own, as `store` would have placed it.
+    #[inline]
+    fn encode_in_place(&mut self, row: &Row<T>, first_extra: u32) -> Option<Entry> {
+        let bound = T::max_record_bytes(row.len())?;
+        let block_seq = self.front_seq.wrapping_add(self.blocks.len() as u32).wrapping_sub(1);
+        let block = self
+            .blocks
+            .back_mut()
+            .filter(|block| !block.oversized && self.block_bytes - block.bytes.len() >= bound)?;
+
+        let offset = block.bytes.len();
+        T::encode(row, &mut block.bytes, &mut self.extras);
+        debug_assert_eq!(block.bytes.capacity(), self.block_bytes, "a block reallocated");
+        let len = block.bytes.len() - offset;
+        if len > self.block_bytes / 4 {
+            self.encoded.clear();
+            self.encoded.extend_from_slice(&block.bytes[offset..]);
+            block.bytes.truncate(offset);
+            return Some(self.store(first_extra));
+        }
+
+        block.live += 1;
+        Some(Entry { block: block_seq, offset: offset as u32, len: len as u32, first_extra })
+    }
+
+    /// Make room for one more index entry. The index grows by doubling, as a `VecDeque` does,
+    /// but never past the limit, so a full history's index holds exactly `limit` entries (a
+    /// plain doubling would reach 16,384 entries, 256 KiB, for a limit of 10,000).
+    #[inline]
+    fn reserve_index(&mut self) {
+        let len = self.index.len();
+        if len == self.index.capacity() {
+            let target = (len * 2).max(MIN_INDEX_CAPACITY).min(self.limit).max(len + 1);
+            self.index.reserve_exact(target - len);
+        }
     }
 
     /// Remove the newest row into `into` (reusing its allocation when the width matches).
@@ -272,10 +326,17 @@ impl<T: HistoryCell> History<T> {
             }
         }
 
-        // The extras of the removed rows are those before the new oldest row's.
+        // The extras of the removed rows are those before the new oldest row's (usually none or
+        // a few, which popping one by one removes faster than a `drain`).
         let keep = self.index.front().map_or_else(|| self.extras_end(), |entry| entry.first_extra);
         let removed = keep.wrapping_sub(self.extras_base) as usize;
-        self.extras.drain(..removed);
+        if removed <= 8 {
+            for _ in 0..removed {
+                self.extras.pop_front();
+            }
+        } else {
+            self.extras.drain(..removed);
+        }
         self.extras_base = keep;
     }
 
@@ -1092,13 +1153,25 @@ mod tests {
     /// around its ring buffer many times).
     #[test]
     fn matches_dense_model() {
+        matches_dense_model_with(TINY, 12);
+    }
+
+    /// The same with 4 KiB blocks, where most rows are encoded straight into their block
+    /// (`encode_in_place`; with tiny blocks the bound never fits and every row goes through the
+    /// scratch buffer), and rows up to 160 cells, some of them oversized.
+    #[test]
+    fn matches_dense_model_in_place() {
+        matches_dense_model_with(4096, 160);
+    }
+
+    fn matches_dense_model_with(block_bytes: usize, max_width: usize) {
         let mut rng = ChaCha8Rng::seed_from_u64(0x5704e);
         let links = cell_links();
-        let mut history = History::<Cell>::with_block_size(60, TINY);
+        let mut history = History::<Cell>::with_block_size(60, block_bytes);
         let mut model: VecDeque<Row<Cell>> = VecDeque::new();
         let mut into = Row::default();
         for step in 0..20_000 {
-            let width = rng.gen_range(1..=12);
+            let width = rng.gen_range(1..=max_width);
             match rng.gen_range(0..100) {
                 0..=69 => {
                     let row = cell_row(&mut rng, &links, width);
@@ -1154,6 +1227,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `push_newest` encodes straight into the newest block when it has room for the largest
+    /// record of the row, through the scratch buffer when it has not (the record still lands in
+    /// that block when it fits), and moves a record that turns out oversized to its own block.
+    #[test]
+    fn encode_in_place_conditions() {
+        let bound = Cell::max_record_bytes(100).unwrap();
+        let block_bytes = 4 * 1024;
+        assert!(bound < block_bytes && bound > block_bytes / 2);
+        let mut history = History::<Cell>::with_block_size(100, block_bytes);
+        let mut row = Row::<Cell>::new(100);
+        row[Column(0)].c = 'a';
+
+        // The first row starts a block (scratch path, there is no block yet); the second goes
+        // in place, right behind it.
+        history.push_newest(&row);
+        history.push_newest(&row);
+        check_store(&history);
+        assert_eq!(history.blocks.len(), 1);
+        let (first, second) = (history.index[0], history.index[1]);
+        assert_eq!(second.offset, first.offset + first.len);
+        assert!(history.encoded.capacity() > 0, "the first row went through the scratch buffer");
+
+        // Fill the block until less than `bound` is left: the next small row takes the scratch
+        // path but still lands in the same block.
+        while block_bytes - history.blocks[0].bytes.len() >= bound {
+            history.push_newest(&row);
+        }
+        let used = history.blocks[0].bytes.len();
+        history.encoded = Vec::new();
+        history.push_newest(&row);
+        check_store(&history);
+        assert_eq!(history.blocks.len(), 1, "a small record still fits the block");
+        assert!(history.blocks[0].bytes.len() > used);
+        assert!(history.encoded.capacity() > 0, "it went through the scratch buffer");
+
+        // A record above a quarter block, encoded in place in a fresh block, moves to a block of
+        // its own: every cell a different color.
+        let mut history = History::<Cell>::with_block_size(100, block_bytes);
+        let mut small = Row::<Cell>::new(100);
+        small[Column(0)].c = 'b';
+        history.push_newest(&small);
+        let mut dense = Row::<Cell>::new(100);
+        for (col, cell) in dense[..].iter_mut().enumerate() {
+            cell.c = 'd';
+            cell.fg = crate::vte::ansi::Color::Indexed(col as u8);
+        }
+        history.push_newest(&dense);
+        history.push_newest(&small);
+        check_store(&history);
+        assert_eq!(history.blocks.len(), 3);
+        assert!(history.blocks[1].oversized);
+        assert!(history.index[1].len as usize > block_bytes / 4);
+        let mut into = Row::default();
+        history.read(1, &mut into);
+        assert_eq!(into, dense);
+        history.read(0, &mut into);
+        assert_eq!(into, small);
+        history.read(2, &mut into);
+        assert_eq!(into, small);
+    }
+
+    /// The index never holds more entries than the limit (no doubling past it), and a small
+    /// limit gets a small index.
+    #[test]
+    fn index_capacity_stops_at_limit() {
+        for limit in [1, 10, 64, 100, 10_000] {
+            let mut history = History::new(limit);
+            for value in 0..limit + limit / 5 + 3 {
+                history.push_newest(&wide(2, value));
+            }
+            assert_eq!(history.index.capacity(), limit, "limit {limit}");
+        }
+        let mut history = History::new(10_000);
+        history.push_newest(&wide(2, 1));
+        assert!(history.index.capacity() <= MIN_INDEX_CAPACITY);
     }
 
     #[test]
