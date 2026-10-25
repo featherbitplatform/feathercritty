@@ -1015,7 +1015,14 @@ impl<T> RegexIter<'_, T> {
         // the lines outside a range wrapping around the buffer's top and ends back inside the
         // range (a search from a cell to itself reads a full lap;
         // `left_match_past_range_start_wrapping`); both tests apply.
+        //
+        // A cut changes only the match returned, not where upstream stops: upstream stops when
+        // the match it found ends on `end` (below), and that is judged on the uncut end
+        // (`upstream_end`), so the iterator stops where 0.26.0's does. Going on after a cut match
+        // that ended on `end` changed `search_next`'s in-range answer
+        // (`left_cut_keeps_upstream_stop_at_end`).
         let (match_start, match_end) = (*regex_match.start(), *regex_match.end());
+        let upstream_end = match_end;
         let passes_start = self.end_distance + 1 < self.term.total_lines() * self.term.columns()
             && self.term.search_distance(match_start, match_end, Direction::Right)
                 > self.term.search_distance(match_start, self.start, Direction::Right);
@@ -1054,7 +1061,8 @@ impl<T> RegexIter<'_, T> {
             Direction::Left => false,
         };
 
-        if self.point == self.end || past_end {
+        // feathercritty: `upstream_end`, see the cut above; upstream checked `self.point` only.
+        if self.point == self.end || upstream_end == self.end || past_end {
             // Stop when the match terminates right on the end limit.
             self.done = true;
         } else {
@@ -2580,6 +2588,44 @@ mod tests {
             assert!(in_range, "{m:?} in {matches:?}");
         }
         assert_eq!(matches[0], Point::new(Line(1), Column(0))..=start);
+    }
+
+    #[test]
+    fn left_cut_keeps_upstream_stop_at_end() {
+        // Differential soak seed 3001698 (`random_streams`, step 381): a leftward range from
+        // (7,1) up around the buffer's top to (9,0), so line 8 lies outside it. After the match
+        // (7,0)..=(7,1), the search from the wide char at (7,0) (followed by a plain blank, not
+        // its spacer) to itself reads a full lap and returns (7,0)..=(9,0), through line 8.
+        // 0.26.0 stops there, because that match ends on the range's end, so `search_next` finds
+        // nothing past the origin and answers with the first match. Cutting the match at the
+        // range's start must not lose that stop: the iterator went on and `search_next`
+        // answered (0,0)..=(6,0) instead of 0.26.0's in-range answer.
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("🏽 ", "WS"),
+            ("中 ", "WS"),
+            ("e ", ".L"),
+            ("어 ", "WS"),
+            ("5i", ".r"),
+            ("Ж{", ".r"),
+            ("{ ", ".L"),
+            ("符 ", "W."),
+            ("中 ", "WS"),
+            ("  ", ".L"),
+            ("日 ", "WS"),
+            ("│｡", ".."),
+            ("  ", ".."),
+            ("  ", ".."),
+        ]);
+        let origin = Point::new(Line(4), Column(1));
+
+        let result = terminates("leftward search_next over a wrapping range", move || {
+            let mut regex = RegexSearch::new("[^ ]+ ?").unwrap();
+            term.search_next(&mut regex, origin, Direction::Left, Side::Left, Some(12))
+        });
+        let match_start = Point::new(Line(7), Column(0));
+        let match_end = Point::new(Line(7), Column(1));
+        assert_eq!(result, Some(match_start..=match_end));
     }
 
     #[test]
