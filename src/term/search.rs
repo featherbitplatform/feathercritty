@@ -1747,7 +1747,10 @@ mod tests {
         thread::spawn(move || {
             let _ = tx.send(f());
         });
-        match rx.recv_timeout(Duration::from_secs(10)) {
+        // A hang shows up as a timeout, not a stuck run. The bound is generous: on a loaded CI
+        // runner a debug build can take several times the ~4 s `cache_give_up_ends_a_search`
+        // takes alone, and a hang never finishes, so any bound catches it.
+        match rx.recv_timeout(Duration::from_secs(120)) {
             Ok(result) => result,
             Err(RecvTimeoutError::Timeout) => panic!("{what} did not terminate"),
             Err(RecvTimeoutError::Disconnected) => panic!("{what} panicked"),
