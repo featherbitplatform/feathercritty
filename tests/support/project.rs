@@ -375,3 +375,47 @@ pub fn diff_queries(
     let _ = writeln!(out, "plan: {plan:?}");
     out
 }
+
+/// The matches 0.26.0's iterator yielded in one probed search (`term_impl::search_terminates`), and
+/// how the walk ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Walk {
+    pub matches: Vec<(Pt, Pt)>,
+    pub end: WalkEnd,
+}
+
+/// How a [`Walk`] ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkEnd {
+    /// On the match `search_next` stops at (past its origin), the last of `matches`.
+    Found,
+    /// The iteration ended without such a match.
+    Ended,
+    /// The next match repeats an earlier one: the iteration cycles forever.
+    Repeats,
+    /// 0.26.0 panics before yielding the next match (`underflows` in
+    /// `term_impl::search_terminates`).
+    Panics,
+    /// A search of the next step never returns (0.26.0's `consumed_bytes` overflow, see
+    /// `term_impl::catch_classified`).
+    Hangs,
+}
+
+impl Walk {
+    /// The answer fork change 5 gives for this iteration (`final_match` in feathercritty's
+    /// `src/term/search.rs`), with `in_range` its range check: where the iteration ended,
+    /// upstream's choice (the match it stopped at, else the first match) if it lies in the range;
+    /// otherwise, and wherever the iteration repeats forever or panics, the last match in the
+    /// range, or `None`.
+    pub fn answer(&self, in_range: impl Fn(&(Pt, Pt)) -> bool) -> Option<(Pt, Pt)> {
+        let choice = match self.end {
+            WalkEnd::Found => self.matches.last(),
+            WalkEnd::Ended => self.matches.first(),
+            WalkEnd::Repeats | WalkEnd::Panics | WalkEnd::Hangs => None,
+        };
+        match choice {
+            Some(m) if in_range(m) => Some(*m),
+            _ => self.matches.iter().rev().find(|m| in_range(m)).copied(),
+        }
+    }
+}

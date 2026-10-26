@@ -16,7 +16,7 @@
 //! | resize of lines only, one step of up to 10 lines, 126 and 200 columns | fork median at most 50 µs |
 //! | resize of lines only, the whole screen down to 1 line and back | fork median at most 1 ms |
 //!
-//! The lines-only rows have absolute bounds, not ratios (controller ruling on spec 6.4,
+//! The lines-only rows have absolute bounds, not ratios (project ruling on spec 6.4,
 //! 2026-10-25). 0.26.0 keeps screen and history in one ring, so a lines-only resize there is an
 //! O(1) rotation and a few counter updates; feathercritty keeps the history apart (spec 5.5), so
 //! the rows that cross between screen and history are moved, one by one. A ratio against an
@@ -36,8 +36,8 @@
 mod common;
 
 use common::{
-    HISTORY, Stats, Workload, ac, compare_ms, fc, gate_requested, runs, selected, table_header,
-    table_row, table_row_abs, workload_lines,
+    HISTORY, Stats, Workload, ac, compare_ms, fc, runs, selected, table_header, table_row,
+    table_row_abs, timed_gate_requested, workload_lines,
 };
 
 /// Repetitions of the lines-only resize inside one timed run (one pair takes microseconds).
@@ -62,7 +62,7 @@ macro_rules! sims {
 }
 
 fn main() {
-    let gate = gate_requested();
+    let gate = timed_gate_requested();
     let mut failed = 0;
     let mut row =
         |label: &str, (a, f): (common::Stats, common::Stats), max: f64, floor: Option<f64>| {

@@ -29,7 +29,7 @@
 //!    `Term::search_next`. If upstream changes one of these, change the macro (one place).
 //! 3. Re-check the workloads against any new escape-sequence behavior (the scroll-region and
 //!    alternate-screen workloads rely on DECSTBM, `CSI ? 1049 h` and `CSI 2 K` with a background).
-//! 4. Re-run all three binaries and refresh `benches/BASELINE.md`.
+//! 4. Re-run all three binaries and refresh `benches/RESULTS.md`.
 
 // Each benchmark binary uses a different part of this module.
 #![allow(dead_code)]
@@ -420,14 +420,72 @@ pub fn compare_ms<A, B>(
     (Stats::from_samples(sa), Stats::from_samples(sb))
 }
 
+/// One timed run: fresh state from `setup` (not timed), then `run`, in milliseconds.
+pub fn timed_ms<S>(setup: &mut impl FnMut() -> S, run: &mut impl FnMut(S) -> S) -> f64 {
+    let state = setup();
+    let start = Instant::now();
+    let state = run(state);
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+    drop(state);
+    elapsed
+}
+
+/// Median timings of several subjects, each a closure doing one timed run (see [`timed_ms`]),
+/// run interleaved: one untimed warm-up each, then `runs` rounds, the order rotating every
+/// round, so that drift and background load hit all alike.
+pub fn interleaved_ms(runs: usize, subjects: &mut [&mut dyn FnMut() -> f64]) -> Vec<Stats> {
+    for subject in subjects.iter_mut() {
+        subject();
+    }
+    let n = subjects.len();
+    let mut samples = vec![Vec::with_capacity(runs); n];
+    for round in 0..runs {
+        for slot in 0..n {
+            let k = (round + slot) % n;
+            samples[k].push(subjects[k]());
+        }
+    }
+    samples.into_iter().map(Stats::from_samples).collect()
+}
+
 /// Number of benchmark runs per row (spec: at least 5), `BENCH_RUNS` overrides.
 pub fn runs() -> usize {
     std::env::var("BENCH_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(7)
 }
 
-/// Whether the command line asks for threshold checking.
+/// Whether the command line asks for threshold checking. A gate run must measure every row, so
+/// `--gate` together with a row filter (`BENCH_ONLY`, or a positional filter argument) is refused
+/// with an error and exit status 2.
 pub fn gate_requested() -> bool {
-    std::env::args().any(|a| a == "--gate")
+    let gate = std::env::args().any(|a| a == "--gate");
+    if gate {
+        let only = std::env::var_os("BENCH_ONLY").is_some();
+        // `cargo bench` passes `--bench`; anything not starting with `-` is a filter.
+        let filters: Vec<String> =
+            std::env::args().skip(1).filter(|a| !a.starts_with('-')).collect();
+        if only || !filters.is_empty() {
+            refuse_gate(&format!(
+                "--gate runs every row; unset BENCH_ONLY and drop the filter arguments ({})",
+                if only { "BENCH_ONLY is set".to_owned() } else { filters.join(" ") }
+            ));
+        }
+    }
+    gate
+}
+
+/// [`gate_requested`] for the timed benches: also refuses `--gate` with `BENCH_RUNS` below 5,
+/// the spec's minimum number of runs per row.
+pub fn timed_gate_requested() -> bool {
+    let gate = gate_requested();
+    if gate && runs() < 5 {
+        refuse_gate(&format!("--gate needs BENCH_RUNS >= 5 (got {})", runs()));
+    }
+    gate
+}
+
+fn refuse_gate(why: &str) -> ! {
+    eprintln!("error: {why}");
+    std::process::exit(2);
 }
 
 /// Row filter from `BENCH_ONLY` (substring of the row label), for quick runs.

@@ -4,12 +4,13 @@
 //! `k` = feathercritty) and `ac::imp` (with `k` = `alacritty_terminal` 0.26.0); both crates
 //! expose the same API here.
 
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{cell_at, k, row_at};
+use super::{ORACLE, cell_at, k, new_term, row_at, set_cell};
 use k::event::VoidListener;
 use k::grid::{Dimensions, Scroll};
 use k::index::{Boundary, Column, Direction, Line, Point, Side as KSide};
@@ -22,7 +23,7 @@ use k::vi_mode::{ViModeCursor, ViMotion};
 use k::vte::ansi::Processor;
 
 use crate::support::project::{
-    CellP, CursorP, LinkP, Panicked, QAns, QueryPlan, SearchQ, Snapshot, VI_MOTIONS,
+    CellP, CursorP, LinkP, Panicked, QAns, QueryPlan, SearchQ, Snapshot, VI_MOTIONS, Walk, WalkEnd,
 };
 use crate::support::{Pt, SelTy, Start, Step, catch};
 
@@ -56,6 +57,9 @@ pub struct Side {
     pub term: Term<VoidListener>,
     parser: Processor,
     kitty: bool,
+    /// The matches 0.26.0's iterator yielded in each probed `search` since the last `queries`
+    /// (`search_terminates`), `None` where it was not walked; see `check_search_walked`.
+    walks: RefCell<Vec<Option<Walk>>>,
 }
 
 fn sel_ty(ty: SelTy) -> SelectionType {
@@ -109,15 +113,25 @@ fn cell_p(cell: &Cell, ids: &mut HashMap<String, usize>, index: Option<usize>) -
 }
 
 /// Origin (after `expand_wide`), start and end of the range `Term::search_next` searches, and
-/// whether `max_lines` bounds it. Copied from upstream `search_next` and `next_match_left/right`;
-/// re-check against the source when the oracle moves to a new release.
+/// whether `max_lines` bounds it. Copied from upstream `search_next` and `next_match_left/right`,
+/// with feathercritty's origin for a leading spacer on the bottommost line (below); re-check
+/// against the source when the oracle moves to a new release.
 fn search_bounds(
     term: &Term<VoidListener>,
     origin: Point,
     direction: Direction,
     max_lines: Option<usize>,
 ) -> (Point, Point, Point, bool) {
-    let origin = term.expand_wide(origin, direction);
+    // Where `expand_wide` leaves the grid (`origin_leaves_grid`), feathercritty uses the cell its
+    // search lands on after reading the spacer, two cells on, clamped to the grid's last cell
+    // (fork change 5, `search_next`).
+    let origin = if origin_leaves_grid(term, origin, direction) {
+        let last = Point::new(term.bottommost_line(), term.last_column());
+        let step = |p: Point| if p == last { p } else { p.add(term, Boundary::Grid, 1) };
+        step(step(origin))
+    } else {
+        term.expand_wide(origin, direction)
+    };
     let max_lines = max_lines.filter(|max_lines| max_lines + 1 < term.total_lines());
     let (start, end) = match direction {
         Direction::Right => {
@@ -145,15 +159,34 @@ fn search_bounds(
     (origin, start, end, max_lines.is_some())
 }
 
-/// Whether `Term::search_next` returns for these arguments.
+/// Whether `search_next`'s origin is a leading spacer on the bottommost line, going right. 0.26.0's
+/// `expand_wide` then moves it to column 1 of the line below the grid, and 0.26.0 panics (debug
+/// builds, and release builds when its ring has no row there) or answers from whichever row its
+/// ring holds at that index. feathercritty keeps the origin on the line
+/// (`search_origin_on_bottom_line_stale_spacer`), so these searches are not compared.
+fn origin_leaves_grid(term: &Term<VoidListener>, origin: Point, direction: Direction) -> bool {
+    direction == Direction::Right
+        && origin.line == term.bottommost_line()
+        && cell_at(term.grid(), origin).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+}
+
+/// Whether `Term::search_next` returns, never returns or panics for these arguments (`Probe`).
 ///
 /// Workaround for a 0.26.0 bug, still needed on the oracle side: 0.26.0's match iterator
 /// (`RegexIter`) can cycle between two matches forever (next to a `LEADING_WIDE_CHAR_SPACER`,
 /// wrapped or stale). This walks the same iterator `search_next` walks, with the same start, end
 /// and stop condition (`search_bounds`), but gives up after more matches than the grid has cells.
-/// feathercritty fixed the cycle (fork change 5, `+fbterm.3`), so on its side this returns `true`
-/// (anything else fails the run through `check_search`); keep it while the oracle runs 0.26.0
-/// and remove it once the oracle release fixes the cycle too.
+/// feathercritty ends such iterations (fork change 5), so on its side this answers `Probe::Ends`
+/// without walking; keep it while the oracle runs 0.26.0 and remove it once the oracle release
+/// fixes the cycle too.
+///
+/// A single search inside the iterator can also run forever in 0.26.0, and that cannot be bounded
+/// from outside. On the oracle side this therefore also answers `Probe::Never`, without searching,
+/// when the iterator's searches can jump over its end (`first_search_misses_end`), even though
+/// 0.26.0 still terminates there when it finds its match first. feathercritty's answer is then
+/// checked on its own (fork change 5). `project::search_window` moves the windows of leftward
+/// searches with `max_lines` off such ends instead; this catches the remaining ones (unbounded
+/// leftward searches and rightward searches).
 fn search_terminates(
     term: &Term<VoidListener>,
     regex: &mut RegexSearch,
@@ -161,13 +194,80 @@ fn search_terminates(
     direction: Direction,
     side: KSide,
     max_lines: Option<usize>,
-) -> bool {
-    let (origin, start, end, _) = search_bounds(term, origin, direction, max_lines);
+) -> (Probe, Option<Walk>) {
+    // feathercritty's searches always return (fork change 5: its iteration ends where 0.26.0's
+    // would repeat forever), and `check_search` checks its answers, so its side does not walk the
+    // iterator here. Its `RegexIter` yields 0.26.0's matches, repeats included, until its cycle
+    // check notices the repeat, which can take more than the limit below.
+    if !ORACLE {
+        return (Probe::Ends, None);
+    }
 
+    // Workaround for a 0.26.0 bug: going left from a wide char spacer at column 0 (a stale one),
+    // `expand_wide` subtracts from column 0. 0.26.0 panics there in debug builds and goes on from
+    // a wrapped-around column in release builds; both builds are answered "panics", here for the
+    // origin of `search_next` (no match produced) and in the walk below after a match
+    // (differential soak seed 30001812). feathercritty answers there (fork change 5). Remove this
+    // once upstream's `expand_wide` handles column 0.
+    let underflows = |p: Point| {
+        direction == Direction::Left
+            && p.column == Column(0)
+            && cell_at(term.grid(), p).flags.contains(Flags::WIDE_CHAR_SPACER)
+    };
+    if underflows(origin) {
+        return (Probe::Panics, Some(Walk { matches: Vec::new(), end: WalkEnd::Panics }));
+    }
+
+    // On the oracle side, searches 0.26.0 cannot run sensibly are answered "does not terminate":
+    // - an origin that leaves the grid (`origin_leaves_grid`): 0.26.0's own search reads outside
+    //   the grid. Its iterator is still walked, from feathercritty's in-grid origin
+    //   (`search_bounds`), so feathercritty's answer can be checked against the matches 0.26.0's
+    //   code yields from there (`search_grid_regressions`);
+    // - ranges whose end the searches can step over (`first_search_misses_end`), without running
+    //   them: a single 0.26.0 search there can run forever.
+    let leaves_grid = origin_leaves_grid(term, origin, direction);
+    let (origin, start, end, _) = search_bounds(term, origin, direction, max_lines);
+    if first_search_misses_end(term, end, direction) {
+        return (Probe::Never, None);
+    }
+    let ends = if leaves_grid { Probe::Never } else { Probe::Ends };
+
+    // The walk also records every match 0.26.0 yields: where its answer is off, feathercritty
+    // answers from them (fork change 5, `check_search_walked`, `Walk::answer`). Each step depends
+    // only on its origin, and the next origin only on the match, so a repeated match means the
+    // iteration cycles forever, unless it ends right there (the repeat came from a search started
+    // at the range's end, which sets `done`): the walk stops at the first repeat, with every match
+    // before it recorded. The limit covers every origin once. Where 0.26.0 panics moving its
+    // origin past a match (`underflows`), the walk ends with the matches yielded before the panic.
     let limit = term.total_lines() * term.columns() + 2;
+    let mut walked = Vec::new();
+    let mut seen = HashSet::new();
     let mut matches = RegexIter::new(start, end, direction, term, regex);
+    let walk = |matches, end| Some(Walk { matches, end });
     for _ in 0..limit {
-        let Some(found) = matches.next() else { return true };
+        let found = match catch_classified(|| matches.next()) {
+            Ok(Some(found)) => found,
+            Ok(None) => return (ends, walk(walked, WalkEnd::Ended)),
+            Err(Probe::Panics) => return (Probe::Panics, walk(walked, WalkEnd::Panics)),
+            Err(probe) => return (probe, walk(walked, WalkEnd::Hangs)),
+        };
+        // A debug build panics inside `next` before yielding this match (caught above).
+        if *found.end() != end && underflows(*found.end()) {
+            return (Probe::Panics, walk(walked, WalkEnd::Panics));
+        }
+        let found_pt = (pt(*found.start()), pt(*found.end()));
+        if !seen.insert(found_pt) {
+            // A repeated match is never one `search_next` stops at (the earlier one would have
+            // been), so the iteration either ends now or cycles.
+            return match catch_classified(|| matches.next()) {
+                Ok(None) => {
+                    walked.push(found_pt);
+                    (ends, walk(walked, WalkEnd::Ended))
+                },
+                _ => (Probe::Never, walk(walked, WalkEnd::Repeats)),
+            };
+        }
+        walked.push(found_pt);
         let point = match side {
             KSide::Right => *found.end(),
             KSide::Left => *found.start(),
@@ -185,10 +285,82 @@ fn search_terminates(
             },
         };
         if stop {
-            return true;
+            return (ends, walk(walked, WalkEnd::Found));
         }
     }
-    false
+    (Probe::Never, walk(walked, WalkEnd::Repeats))
+}
+
+/// Run one step of 0.26.0's iterator in `search_terminates`, classifying a panic by its message:
+/// - `attempt to subtract with overflow`: `expand_wide` going left from a wide char spacer at
+///   column 0 (`underflows`; the only subtraction on the search paths that can overflow there),
+///   [`Probe::Panics`];
+/// - `attempt to add with overflow`: `regex_search_internal`'s `consumed_bytes` (an `i32`)
+///   overflowing in a debug build, after about 2^31 bytes of a search that never ends (a release
+///   build reads on forever), [`Probe::Never`];
+/// - anything else is a 0.26.0 panic this harness does not know: it is raised again, so the query
+///   answers `Panicked` without a walk and is compared for equality (`oracle_search_is_off`), which
+///   fails and shows it.
+fn catch_classified<R>(f: impl FnOnce() -> R) -> Result<R, Probe> {
+    catch(f).map_err(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|m| m.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        if message.contains("attempt to subtract with overflow") {
+            Probe::Panics
+        } else if message.contains("attempt to add with overflow") {
+            Probe::Never
+        } else {
+            std::panic::resume_unwind(payload)
+        }
+    })
+}
+
+/// What `search_terminates` found out about 0.26.0's `search_next`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// It returns; run it.
+    Ends,
+    /// It would never return, or its origin leaves the grid.
+    Never,
+    /// It panics (in debug builds; see `search_terminates`).
+    Panics,
+}
+
+/// Whether 0.26.0's searches towards `end` (the first search of every `RegexIter` step) can step
+/// over it and never stop there: `regex_search_internal` checks for `end` only on the cells it
+/// stands on before and after `skip_fullwidth`, and a skip moves past `end` without standing on
+/// it when
+/// - going right, the cell before `end` is a `LEADING_WIDE_CHAR_SPACER` (wrapped or stale, also in
+///   the middle of a line): the skip reads `end` in its place and lands on the cell after it;
+/// - going left, `end` is a wide character between a leading spacer and its spacer: the skip goes
+///   from the spacer to the leading spacer.
+///
+/// The search then reads around the buffer and past `end` again on every lap, so it stops only if
+/// it finds a match first (differential soak seed `random_streams` 2001598: a rightward search
+/// on a 2-column grid whose `end` follows a stale spacer in column 0 ran forever). Skips do not
+/// cross the grid's edges, so `end` next to them is never stepped over.
+fn first_search_misses_end(term: &Term<VoidListener>, end: Point, direction: Direction) -> bool {
+    let grid = term.grid();
+    let first = Point::new(grid.topmost_line(), Column(0));
+    let last = Point::new(grid.bottommost_line(), grid.last_column());
+    let flags = |p: Point| cell_at(grid, p).flags;
+    match direction {
+        Direction::Right => {
+            end > first
+                && end < last
+                && flags(end.sub(grid, Boundary::Grid, 1)).contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        },
+        Direction::Left => {
+            end > first
+                && end < last
+                && flags(end).contains(Flags::WIDE_CHAR)
+                && flags(end.add(grid, Boundary::Grid, 1)).contains(Flags::WIDE_CHAR_SPACER)
+                && flags(end.sub(grid, Boundary::Grid, 1)).contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        },
+    }
 }
 
 /// Run one query, answering [`QAns::Panicked`] if it panics.
@@ -203,6 +375,35 @@ fn guarded(query: impl FnOnce() -> QAns) -> QAns {
 }
 
 impl Side {
+    /// A terminal with no history whose screen holds `rows`, each a line of characters and a
+    /// line of flag codes, one per cell: `.` none, `r` `WRAPLINE`, `W` `WIDE_CHAR`, `s`
+    /// `WIDE_CHAR_SPACER`, `S` `WIDE_CHAR_SPACER | WRAPLINE`, `L`
+    /// `LEADING_WIDE_CHAR_SPACER | WRAPLINE`, `l`
+    /// `LEADING_WIDE_CHAR_SPACER`. Used by `search_grid_probe` to write the same grid into both
+    /// crates without a byte stream.
+    pub fn from_rows(rows: &[(String, String)]) -> Self {
+        let columns = rows[0].1.chars().count();
+        let start = Start { lines: rows.len(), columns, history: 0, kitty: false, query_seed: 0 };
+        let mut side = Self::new(&start);
+        for (line, (text, flags)) in rows.iter().enumerate() {
+            for (column, (c, code)) in text.chars().zip(flags.chars()).enumerate() {
+                let flags = match code {
+                    '.' => Flags::empty(),
+                    'r' => Flags::WRAPLINE,
+                    'W' => Flags::WIDE_CHAR,
+                    's' => Flags::WIDE_CHAR_SPACER,
+                    'L' => Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE,
+                    'l' => Flags::LEADING_WIDE_CHAR_SPACER,
+                    'S' => Flags::WIDE_CHAR_SPACER | Flags::WRAPLINE,
+                    other => panic!("unknown flag code {other:?}"),
+                };
+                let cell = Cell { c, flags, ..Cell::default() };
+                set_cell(&mut side.term, Point::new(Line(line as i32), Column(column)), cell);
+            }
+        }
+        side
+    }
+
     pub fn new(start: &Start) -> Self {
         let config = Config {
             scrolling_history: start.history,
@@ -211,9 +412,10 @@ impl Side {
         };
         let size = TermSize::new(start.columns, start.lines);
         Self {
-            term: Term::new(config, &size, VoidListener),
+            term: new_term(config, &size),
             parser: Processor::new(),
             kitty: start.kitty,
+            walks: RefCell::default(),
         }
     }
 
@@ -319,11 +521,21 @@ impl Side {
         let term = &self.term;
         let direction = if search.right { Direction::Right } else { Direction::Left };
         let (origin, side) = (self.point(search.origin), side(search.side_right));
+        // One entry per probed search, even if the search panics, so `walk(k)` stays aligned.
+        if probe {
+            self.walks.borrow_mut().push(None);
+        }
         guarded(|| match RegexSearch::new(&search.pattern) {
             Ok(mut regex) => {
-                if probe && !search_terminates(term, &mut regex, origin, direction, side, max_lines)
-                {
-                    return QAns::NoTermination;
+                if probe {
+                    let (probe, walked) =
+                        search_terminates(term, &mut regex, origin, direction, side, max_lines);
+                    *self.walks.borrow_mut().last_mut().unwrap() = walked;
+                    match probe {
+                        Probe::Ends => (),
+                        Probe::Never => return QAns::NoTermination,
+                        Probe::Panics => return QAns::Panicked,
+                    }
                 }
                 let found = term.search_next(&mut regex, origin, direction, side, max_lines);
                 QAns::Match(found.map(|m| (pt(*m.start()), pt(*m.end()))))
@@ -344,17 +556,43 @@ impl Side {
         max_lines: Option<usize>,
         timeout: Duration,
     ) -> Option<QAns> {
+        self.search_timed(search, max_lines, false, timeout).map(|(answer, _)| answer)
+    }
+
+    /// `search` with `probe` on another thread, as `search_detached` runs it: `None` if it has not
+    /// returned after `timeout`. `search_grid_probe` runs the oracle side this way, so a 0.26.0
+    /// search that never returns (one the probe does not foresee) is classified instead of
+    /// hanging the test.
+    pub fn search_timed(
+        &self,
+        search: &SearchQ,
+        max_lines: Option<usize>,
+        probe: bool,
+        timeout: Duration,
+    ) -> Option<(QAns, Option<Walk>)> {
         let grid = self.term.grid().clone();
         let size = TermSize::new(grid.columns(), grid.screen_lines());
         let mut term = Term::new(Config::default(), &size, VoidListener);
         *term.grid_mut() = grid;
-        let side = Side { term, parser: Processor::new(), kitty: false };
+        let side = Side { term, parser: Processor::new(), kitty: false, walks: RefCell::default() };
         let search = search.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
-            let _ = tx.send(side.search(&search, max_lines, false));
+            let answer = side.search(&search, max_lines, probe);
+            let walked = side.walks.borrow_mut().pop().flatten();
+            let _ = tx.send((answer, walked));
         });
         rx.recv_timeout(timeout).ok()
+    }
+
+    /// The matches 0.26.0's iterator yielded in the `k`th probed search of the last `queries`.
+    pub fn walk(&self, k: usize) -> Option<Walk> {
+        self.walks.borrow().get(k).cloned().flatten()
+    }
+
+    /// The walk of the last probed search (see `walk`).
+    pub fn last_walk(&self) -> Option<Walk> {
+        self.walks.borrow().last().cloned().flatten()
     }
 
     /// The cells after `p` that a rightward search reads or steps over together with it, as
@@ -418,7 +656,14 @@ impl Side {
     ///   completion of the character at the range's end (`completion_right` going right,
     ///   `completion_left` going left);
     /// - the near end may also lie in the completion of the character at the range's start in the
-    ///   other direction (the second search, back to the start, completes it, as 0.26.0 does).
+    ///   other direction (the second search, back to the start, completes it, as 0.26.0 does);
+    /// - the near end comes no later than the far end along the range. A match whose ends both lie
+    ///   in the range but in the wrong order ran around the whole buffer: 0.26.0's last search of a
+    ///   range, from its end to itself, starting on a leading spacer reads past the end, around the
+    ///   buffer and back (differential soak seed `random_streams` 2013725: a rightward search
+    ///   answered with a match from (8,1) to (8,0) on a 2-column grid). A match that runs around
+    ///   the buffer's end inside the range, as a search that wraps around it reads, keeps its ends
+    ///   in order along the range.
     ///
     /// If upstream's or feathercritty's range handling in `search.rs` changes, update this.
     fn match_in_range(
@@ -458,142 +703,225 @@ impl Side {
                 (end, start, self.completion_right(range_start), self.completion_left(range_end))
             },
         };
-        (range.contains(&near) || near_completion.contains(&near))
-            && (range.contains(&far) || far_completion.contains(&far))
+        // Position along the range: the near completion lies before it, the far one after it.
+        let near = match range.iter().position(|&p| p == near) {
+            Some(index) => index as isize,
+            None if near_completion.contains(&near) => -1,
+            None => return false,
+        };
+        let far = match range.iter().position(|&p| p == far) {
+            Some(index) => index as isize,
+            None if far_completion.contains(&far) => range.len() as isize,
+            None => return false,
+        };
+        near <= far
     }
 
-    /// The text `regex_search_internal` reads from `start` to `end` going right, following
+    /// What `regex_search_internal` reads at `point` going right and where it lands, following
     /// `skip_fullwidth` in feathercritty's `src/term/search.rs`: a wide character is read and the
-    /// cell after it stepped over; at a `LEADING_WIDE_CHAR_SPACER` the next cell is read in its
-    /// place and the cell after that stepped over (for a stale spacer that next cell is an
-    /// ordinary one); every other cell, a stray spacer included, is read as its character.
-    fn text_right(&self, start: Point, end: Point) -> String {
+    /// search lands on the cell after it (its spacer); at a `LEADING_WIDE_CHAR_SPACER` the next
+    /// cell is read in its place and the search lands on the cell after that (for a stale spacer
+    /// that next cell is an ordinary one); every other cell, a stray spacer included, is read as
+    /// its character and landed on. The skip stops at the grid's last cell, as the grid iterator
+    /// does.
+    fn read_right(&self, point: Point) -> (char, Point) {
         let grid = self.term.grid();
         let last = Point::new(grid.bottommost_line(), grid.last_column());
-        let mut text = String::new();
-        let mut point = start;
-        loop {
-            let cell = cell_at(grid, point);
-            let skip = if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && point < last {
-                text.push(cell_at(grid, point.add(grid, Boundary::Grid, 1)).c);
-                3
-            } else {
-                text.push(cell.c);
-                if cell.flags.contains(Flags::WIDE_CHAR) && point.column < grid.last_column() {
-                    2
-                } else {
-                    1
-                }
-            };
-            for _ in 0..skip {
-                if point >= end || point == last {
-                    return text;
-                }
-                point = point.add(grid, Boundary::Grid, 1);
-            }
-            if point > end {
-                return text;
-            }
+        let cell = cell_at(grid, point);
+        if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) && point < last {
+            let next = point.add(grid, Boundary::Grid, 1);
+            let landing = if next < last { next.add(grid, Boundary::Grid, 1) } else { next };
+            (cell_at(grid, next).c, landing)
+        } else if cell.flags.contains(Flags::WIDE_CHAR) && point.column < grid.last_column() {
+            (cell.c, point.add(grid, Boundary::Grid, 1))
+        } else {
+            (cell.c, point)
         }
     }
 
-    /// The text read from `end` back to `start` going left, as `skip_fullwidth` does: at a
-    /// wide character's spacer the wide character is read (and a leading spacer just before it
-    /// stepped over); every other cell, a stale leading spacer included, is read as its
-    /// character (a stale spacer reads as a blank).
-    fn text_left(&self, start: Point, end: Point) -> String {
+    /// What the search reads at `point` going left and where it lands, as `skip_fullwidth` does:
+    /// at a wide character's spacer the wide character is read and the search lands on it, or on
+    /// the `LEADING_WIDE_CHAR_SPACER` just before it; every other cell, a stale leading spacer
+    /// included, is read as its character (a stale spacer reads as a blank) and landed on.
+    fn read_left(&self, point: Point) -> (char, Point) {
         let grid = self.term.grid();
         let first = Point::new(grid.topmost_line(), Column(0));
-        let mut text = Vec::new();
-        let mut point = end;
-        loop {
-            let cell = cell_at(grid, point);
-            let mut skip = 1;
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) && point > first {
-                let wide = point.sub(grid, Boundary::Grid, 1);
-                text.push(cell_at(grid, wide).c);
-                skip = 2;
-                if wide > first
-                    && cell_at(grid, wide.sub(grid, Boundary::Grid, 1))
-                        .flags
-                        .contains(Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    skip = 3;
-                }
-            } else {
-                text.push(cell.c);
-            }
-            for _ in 0..skip {
-                if point <= start || point == first {
-                    return text.into_iter().rev().collect();
-                }
-                point = point.sub(grid, Boundary::Grid, 1);
-            }
-            if point < start {
-                return text.into_iter().rev().collect();
-            }
+        let cell = cell_at(grid, point);
+        if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) || point == first {
+            return (cell.c, point);
         }
+        let wide = point.sub(grid, Boundary::Grid, 1);
+        let before = (wide > first).then(|| wide.sub(grid, Boundary::Grid, 1));
+        let landing = match before {
+            Some(s) if cell_at(grid, s).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) => s,
+            _ => wide,
+        };
+        (cell_at(grid, wide).c, landing)
     }
 
-    /// Whether the cells from `start` to `end` (grid order) spell a match of `pattern` the way
-    /// the search reads them (`text_right` or `text_left`; a rightward search finds a match's
-    /// end reading right and its start reading back left, so either reading may be the one that
-    /// matched), only across wrapped line ends, with smart case (case insensitive unless the
-    /// pattern has an uppercase letter), as `RegexSearch` does.
-    fn is_real_match(&self, pattern: &str, start: Pt, end: Pt) -> Result<(), String> {
+    /// The text `regex_search_internal` reads walking from `from` to `to` in `direction` (in
+    /// reading order), or `None` when the search sees a line break on the way, which ends any
+    /// match. Modeled on the search loop:
+    /// - each character is read with `read_right`/`read_left`, and the next one starts on the cell
+    ///   after the landing cell, wrapping around the buffer (from the bottom line's last cell to
+    ///   the top line's first and back), as the search does;
+    /// - the search sees a line break between two consecutive landing cells `a` and `b` when `a` is
+    ///   in the last column, `b` in column 0 and `a` has no `WRAPLINE`, or `a` is in column 0, `b`
+    ///   in the last column and `b` has no `WRAPLINE` (both directions check both). A line whose
+    ///   last cell is a wide character's spacer and whose next line starts with a wide character
+    ///   therefore reads on without a break even when the line does not wrap. The walk from the
+    ///   bottom line to the top line is a break unless the bottom line's last cell has `WRAPLINE`.
+    ///
+    /// 0.26.0 reads the same way: it returns matches across such hidden breaks and, when the
+    /// bottom line wraps, matches that run around the buffer's end (start after end in grid
+    /// order). If upstream's or feathercritty's reading in `search.rs` changes, update this.
+    fn read(&self, from: Point, to: Point, direction: Direction) -> Option<String> {
         let grid = self.term.grid();
-        let (start, end) = (self.point(start), self.point(end));
-        if start > end {
-            return Err(format!("match start {start:?} after its end {end:?}"));
-        }
-        for line in start.line.0..end.line.0 {
-            let last = Point::new(Line(line), grid.last_column());
-            if !cell_at(grid, last).flags.contains(Flags::WRAPLINE) {
-                return Err(format!("match crosses the unwrapped end of line {line}"));
-            }
-        }
+        let last_column = grid.last_column();
+        let wrapped = |p: Point| cell_at(grid, p).flags.contains(Flags::WRAPLINE);
+        let step = |p: Point| match direction {
+            Direction::Right => p.add(grid, Boundary::None, 1),
+            Direction::Left => p.sub(grid, Boundary::None, 1),
+        };
 
+        let mut chars = Vec::new();
+        let mut cell = from;
+        let mut last_landing: Option<Point> = None;
+        for _ in 0..=grid.total_lines() * grid.columns() {
+            let (c, landing) = match direction {
+                Direction::Right => self.read_right(cell),
+                Direction::Left => self.read_left(cell),
+            };
+            if let Some(a) = last_landing {
+                if (a.column == last_column && landing.column == Column(0) && !wrapped(a))
+                    || (a.column == Column(0) && landing.column == last_column && !wrapped(landing))
+                {
+                    return None;
+                }
+            }
+            chars.push(c);
+
+            // Done once `to` is among the cells this read covered.
+            let mut p = cell;
+            loop {
+                if p == to {
+                    if direction == Direction::Left {
+                        chars.reverse();
+                    }
+                    return Some(chars.into_iter().collect());
+                }
+                if p == landing {
+                    break;
+                }
+                p = step(p);
+            }
+            last_landing = Some(landing);
+            cell = step(landing);
+        }
+        None
+    }
+
+    /// Whether the cells from `start` to `end` spell a match of `pattern` the way the search
+    /// reads them (`read`; a rightward search finds a match's end reading right and its start
+    /// reading back left, so either reading may be the one that matched), with smart case (case
+    /// insensitive unless the pattern has an uppercase letter), as `RegexSearch` does. The match
+    /// runs from `start` to `end` in reading order, around the buffer's end when `start` lies
+    /// after `end`; a reading that sees a line break (`read` answers `None`) is not a match.
+    fn is_real_match(&self, pattern: &str, start: Pt, end: Pt) -> Result<(), String> {
+        let (start, end) = (self.point(start), self.point(end));
         let case_insensitive = !pattern.chars().any(char::is_uppercase);
         let regex = regex_automata::meta::Regex::builder()
             .syntax(regex_automata::util::syntax::Config::new().case_insensitive(case_insensitive))
             .build(&format!(r"\A(?:{pattern})\z"))
             .map_err(|err| err.to_string())?;
-        let (right, left) = (self.text_right(start, end), self.text_left(start, end));
-        if regex.is_match(&right) || regex.is_match(&left) {
+        let right = self.read(start, end, Direction::Right);
+        let left = self.read(end, start, Direction::Left);
+        let matches = |text: &Option<String>| text.as_ref().is_some_and(|t| regex.is_match(t));
+        if matches(&right) || matches(&left) {
             Ok(())
         } else {
-            Err(format!("neither {right:?} nor {left:?} matches {pattern:?}"))
+            Err(format!(
+                "neither reading matches {pattern:?}: right {right:?}, left {left:?} (None: the \
+                 search sees a line break, so no match can span it)"
+            ))
         }
     }
 
     /// Check a `search_next` answer without an oracle (used on the feathercritty side where
     /// 0.26.0 cannot answer, fork change 5): it must have terminated, and a match must lie in
     /// the searched range (`match_in_range`) and be a real match of the pattern. `Match(None)` is
-    /// accepted (absence is not checked).
+    /// accepted (absence is not checked). `check_search_walked` is stricter where 0.26.0's
+    /// iteration could be walked.
     pub fn check_search(
         &self,
         search: &SearchQ,
         max_lines: Option<usize>,
         answer: &QAns,
     ) -> Result<(), String> {
-        match answer {
-            QAns::Match(None) => Ok(()),
-            QAns::Match(Some((start, end))) => {
-                if !self.match_in_range(search, max_lines, *start, *end) {
+        self.check_search_walked(search, max_lines, answer, None)
+    }
+
+    /// `check_search`, given 0.26.0's own iteration for this search (`walked`, from
+    /// `search_terminates` on the oracle side). Where 0.26.0 has no in-range answer, fork change 5
+    /// answers with upstream's choice if that lies in the range, else with the last in-range match
+    /// the iteration produced (up to its first repeated match, or up to where it panics), or
+    /// `None`; with `walked` the answer must equal that one (`Walk::answer`). The match is compared
+    /// exactly, not by its text: 0.26.0's two searches can read a stale spacer or a wide char
+    /// without its spacer differently from either single reading (soak seed 10009868,
+    /// `search_grid_probe` grid 133174).
+    ///
+    /// Without `walked` (0.26.0's iteration was not walked: `first_search_misses_end`, or a window
+    /// moved for 0.26.0), it is `check_search`.
+    pub fn check_search_walked(
+        &self,
+        search: &SearchQ,
+        max_lines: Option<usize>,
+        answer: &QAns,
+        walked: Option<&Walk>,
+    ) -> Result<(), String> {
+        let in_range =
+            |&(start, end): &(Pt, Pt)| self.match_in_range(search, max_lines, start, end);
+        match (answer, walked) {
+            (QAns::Match(answer), Some(walked)) => {
+                let expected = walked.answer(in_range);
+                if *answer == expected {
+                    Ok(())
+                } else {
+                    Err(format!("expected {expected:?} from 0.26.0's iteration (fork change 5)"))
+                }
+            },
+            (QAns::Match(None), None) => Ok(()),
+            (QAns::Match(Some(m)), None) => {
+                if !in_range(m) {
                     return Err("the match lies outside the searched range".to_owned());
                 }
-                self.is_real_match(&search.pattern, *start, *end)
+                self.is_real_match(&search.pattern, m.0, m.1)
             },
-            other => Err(format!("expected a search result, got {other:?}")),
+            (other, _) => Err(format!("expected a search result, got {other:?}")),
         }
     }
 
     /// Whether a 0.26.0 `search_next` answer is one fork change 5 may change: the search did
     /// not terminate, or its match lies (at least partly) outside the searched range because
-    /// 0.26.0 missed the range's end and wrapped around.
-    pub fn oracle_search_is_off(&self, search: &SearchQ, answer: &QAns) -> bool {
+    /// 0.26.0 missed the range's end and wrapped around, or its origin leaves the grid
+    /// (`origin_leaves_grid`), whatever 0.26.0 answered, or it panicked where `search_terminates`
+    /// predicts it (`walked` then ends in [`WalkEnd::Panics`]). Any other panic is compared like
+    /// an answer, so a 0.26.0 panic the harness does not know fails the run.
+    pub fn oracle_search_is_off(
+        &self,
+        search: &SearchQ,
+        answer: &QAns,
+        walked: Option<&Walk>,
+    ) -> bool {
+        let direction = if search.right { Direction::Right } else { Direction::Left };
+        if origin_leaves_grid(&self.term, self.point(search.origin), direction) {
+            return true;
+        }
         match answer {
             QAns::NoTermination => true,
+            // 0.26.0 panics going left from a stale wide char spacer at column 0 (`expand_wide`;
+            // soak seed 30001812); feathercritty answers there (fork change 5).
+            QAns::Panicked => walked.is_some_and(|walk| walk.end == WalkEnd::Panics),
             QAns::Match(Some((start, end))) => {
                 !self.match_in_range(search, search.max_lines, *start, *end)
             },
@@ -603,6 +931,7 @@ impl Side {
 
     pub fn queries(&mut self, plan: &QueryPlan) -> Vec<(&'static str, QAns)> {
         let mut out = Vec::new();
+        self.walks.borrow_mut().clear();
 
         let saved = self.term.selection.take();
         for &(ty, start, end) in &plan.selections {

@@ -40,3 +40,18 @@ jobs:
       - run: cargo clippy --locked --all-targets --no-default-features -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked --no-default-features
+      # The differential test in release with tiny history blocks (256 bytes) and a reflow window
+      # of one row, so block boundaries, spares, oversized rows and the reflow's decode-back path
+      # are crossed all the time (see tests/differential.rs).
+      - name: differential test, tiny blocks (release)
+        run: cargo test --locked --release --test differential
+        env:
+          DIFF_TINY: 1
+      # Large histories (tests/large_history.rs, all #[ignore]). The 100,000-line comparison
+      # against 0.26.0 holds two full snapshots (peak RSS measured at 3.9 GB), which fits the
+      # Linux and macOS runners; Windows runs neither. large_history_cost_table is manual.
+      - name: large history tests (release, Linux and macOS)
+        if: runner.os != 'Windows'
+        run: >-
+          cargo test --locked --release --test large_history -- --ignored --exact
+          large_history_matches_oracle_at_100k large_history_invariants_at_1m

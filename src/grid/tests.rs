@@ -8,10 +8,13 @@
 
 use super::*;
 
+use std::collections::VecDeque;
+
+use crate::grid::compact::{self, RowHeader};
 use crate::term::cell::Cell;
 
 /// Line `line` of `grid`, screen or history, as an owned row.
-fn row<T: Clone + Default>(grid: &Grid<T>, line: i32) -> Row<T> {
+fn row<T: HistoryCell>(grid: &Grid<T>, line: i32) -> Row<T> {
     RowReader::new().row(grid, Line(line)).clone()
 }
 
@@ -33,7 +36,53 @@ impl GridCell for usize {
     }
 }
 
-impl HistoryCell for usize {}
+/// feathercritty: test-only record format for `usize` cells: the shared header (`P = W`, no runs,
+/// marks or extras), then each cell as a varint.
+impl HistoryCell for usize {
+    type Extra = ();
+
+    fn encode(row: &Row<Self>, out: &mut Vec<u8>, _extras: &mut VecDeque<()>) -> RowHeader {
+        let header = RowHeader {
+            width: row.len() as u32,
+            wraps: false,
+            clear: row.is_clear(),
+            extras: 0,
+            len: row.len() as u32,
+        };
+        compact::write_header(out, &header, 0, 0);
+        for &value in row {
+            compact::write_varint(out, value);
+        }
+        header
+    }
+
+    fn decode(bytes: &[u8], _extras: &[()], into: &mut Row<Self>) -> usize {
+        let mut reader = compact::RecordReader::new(bytes);
+        let width = reader.layout().header.width as usize;
+        for cell in compact::prepare_row(into, width) {
+            *cell = reader.varint();
+        }
+        reader.position()
+    }
+}
+
+#[test]
+fn usize_history_cell_roundtrip() {
+    let mut row = Row::new(5);
+    for (col, value) in [0, 1, 127, 128, usize::MAX].into_iter().enumerate() {
+        row[Column(col)] = value;
+    }
+    let mut out = vec![9];
+    let header = usize::encode(&row, &mut out, &mut VecDeque::new());
+    assert_eq!(compact::read_header(&out[1..]), header);
+    assert_eq!((header.width, header.clear, header.extras), (5, false, 0));
+
+    let mut into = Row::new(2);
+    usize::decode(&out[1..], &[], &mut into);
+    assert_eq!(into, row);
+    assert_eq!(into.occ, 5);
+    assert!(usize::encode(&Row::new(3), &mut out, &mut VecDeque::new()).clear);
+}
 
 // Scroll up moves lines upward.
 #[test]
@@ -653,4 +702,290 @@ fn iterator_reads_outside_the_grid_as_no_row() {
     let mut above = grid.iter_from(Point::new(Line(-1), Column(1)));
     assert_eq!(above.cell(), &Cell::default());
     assert_eq!(above.next().map(|indexed| indexed.cell), Some(cell('x')));
+}
+
+// feathercritty: tests of the streaming reflow (`resize.rs`).
+
+/// Random terminal output: text with wide characters, colors, line feeds and cursor moves, so
+/// that rows wrap, wide characters straddle the right edge and the cursor lands anywhere.
+fn random_output(rng: &mut impl rand::Rng, out: &mut Vec<u8>) {
+    out.clear();
+    for _ in 0..rng.gen_range(1..60) {
+        match rng.gen_range(0..14) {
+            0..=5 => {
+                let text = ["abc", "x", "hello world ", "0123456789", " "];
+                out.extend_from_slice(text[rng.gen_range(0..text.len())].as_bytes());
+            },
+            6 | 7 => out.extend_from_slice("\u{4e00}\u{754c}".as_bytes()),
+            8 => out.extend_from_slice(b"\r\n"),
+            9 => out.extend_from_slice(b"\n"),
+            10 => out.extend_from_slice(format!("\x1b[{}m", rng.gen_range(30..48)).as_bytes()),
+            11 => out.extend_from_slice(b"\x1b[0m"),
+            12 => out.extend_from_slice(
+                format!("\x1b[{};{}H", rng.gen_range(1..14), rng.gen_range(1..30)).as_bytes(),
+            ),
+            _ => out.extend_from_slice(b"\x1b[K"),
+        }
+    }
+}
+
+/// A reflow with a window of one row gives exactly the grid the default window gives: rows
+/// leaving the window are encoded and decoded back whenever the algorithm reaches them again, so
+/// correctness does not depend on the window size (design spec 5.6).
+#[test]
+fn reflow_window_one_matches_default() {
+    use rand::{Rng, SeedableRng};
+
+    use crate::event::VoidListener;
+    use crate::term::test::TermSize;
+    use crate::term::{Config, Term};
+    use crate::vte::ansi::Processor;
+
+    // At least two columns: with wide characters in one column upstream's reflow never ends
+    // (the differential generator has the same rule).
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(9);
+    let mut bytes = Vec::new();
+    let mut resizes = 0;
+    while resizes < 1000 {
+        let history = rng.gen_range(0..40);
+        let config = Config { scrolling_history: history, ..Config::default() };
+        let size = TermSize::new(rng.gen_range(2..30), rng.gen_range(1..14));
+        let mut default = Term::new(config, &size, VoidListener);
+        if rng.gen_bool(0.5) {
+            // Tiny blocks, so rows cross block boundaries during the pass too.
+            *default.grid_mut() =
+                Grid::new_with_block_size(size.screen_lines, size.columns, history, 256);
+        }
+        let config = Config { scrolling_history: history, ..Config::default() };
+        let mut one = Term::new(config, &size, VoidListener);
+        *one.grid_mut() = default.grid().clone();
+        one.grid_mut().set_reflow_window(1);
+        // And without the byte-copy fast path: every history row decoded and re-encoded.
+        let config = Config { scrolling_history: history, ..Config::default() };
+        let mut decoded = Term::new(config, &size, VoidListener);
+        *decoded.grid_mut() = default.grid().clone();
+        decoded.grid_mut().set_reflow_byte_copy(false);
+        let (mut parser_default, mut parser_one, mut parser_decoded): (
+            Processor,
+            Processor,
+            Processor,
+        ) = (Processor::new(), Processor::new(), Processor::new());
+
+        for _ in 0..25 {
+            random_output(&mut rng, &mut bytes);
+            parser_default.advance(&mut default, &bytes);
+            parser_one.advance(&mut one, &bytes);
+            parser_decoded.advance(&mut decoded, &bytes);
+
+            let size = TermSize::new(rng.gen_range(2..30), rng.gen_range(1..14));
+            one.resize(TermSize::new(size.columns, size.screen_lines));
+            decoded.resize(TermSize::new(size.columns, size.screen_lines));
+            default.resize(size);
+            resizes += 1;
+
+            for other in [&one, &decoded] {
+                let (a, b) = (default.grid(), other.grid());
+                assert_eq!(a, b, "grids differ after resize {resizes}");
+                assert_eq!(a.cursor.point, b.cursor.point, "cursor differs, resize {resizes}");
+                assert_eq!(a.cursor.input_needs_wrap, b.cursor.input_needs_wrap);
+                assert_eq!(a.saved_cursor.point, b.saved_cursor.point);
+                assert_eq!(a.display_offset(), b.display_offset());
+            }
+        }
+    }
+}
+
+/// Whenever `Pass::byte_copy_width` lets the reflow copy a history row's record, that copy is
+/// byte for byte the record of the row the reflow loop would have pushed: grown with default
+/// cells (`grow_columns`), or cut by `Row::shrink` with nothing to carry to the next line
+/// (`shrink_columns`). Random `Cell` rows, widths and passes, near every boundary.
+#[test]
+fn byte_copy_width_only_when_the_loop_keeps_the_row() {
+    use std::collections::VecDeque;
+
+    use rand::{Rng, SeedableRng};
+
+    use super::compact::copy_with_width;
+    use super::resize::Pass;
+    use crate::term::cell::Cell;
+    use crate::vte::ansi::Color;
+
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0xc0b1);
+    let cell = |rng: &mut rand_chacha::ChaCha8Rng| {
+        let mut cell = Cell::default();
+        match rng.gen_range(0..6) {
+            0 => cell.c = 'x',
+            1 => cell.bg = Color::Indexed(1),
+            2 => cell.flags = Flags::WRAPLINE,
+            3 => cell.c = '\t',
+            4 => cell.push_zerowidth('\u{301}'),
+            _ => (),
+        }
+        cell
+    };
+    let encode = |row: &Row<Cell>| {
+        let mut out = Vec::new();
+        Cell::encode(row, &mut out, &mut VecDeque::new());
+        out
+    };
+
+    let mut copies = 0;
+    for n in 0..50_000 {
+        let width = rng.gen_range(1..12);
+        let mut cells: Vec<Cell> = (0..width).map(|_| cell(&mut rng)).collect();
+        let stored = rng.gen_range(0..width);
+        let tail = cells[width - 1].clone();
+        cells[stored..].fill(tail);
+        let row = Row::from_vec(cells, width);
+        let record = encode(&row);
+        let info = Cell::reflow_info(&record).unwrap();
+
+        let columns = rng.gen_range(1..14);
+        let reflow = rng.gen_bool(0.8);
+        let takes_cells = rng.gen_bool(0.3);
+        let pass = if columns > width {
+            Pass::Grow { columns, reflow }
+        } else {
+            Pass::Shrink { columns, reflow, carried: rng.gen_bool(0.2) }
+        };
+        let Some(new_width) = pass.byte_copy_width(&info, |_, _| takes_cells) else {
+            continue;
+        };
+
+        // What the loop pushes, and what the sink then stores.
+        let mut pushed = row.clone();
+        match pass {
+            Pass::Grow { columns, .. } => {
+                assert!(!takes_cells, "row {n}: copied a row the previous one takes cells from");
+                pushed.grow(columns);
+            },
+            Pass::Shrink { columns, reflow, carried } => {
+                assert!(!carried, "row {n}: copied a row cells are carried into");
+                let wrapped = pushed.shrink(columns);
+                assert!(wrapped.is_none() || !reflow, "row {n}: copied a row that wraps cells");
+            },
+        }
+        let mut copied = Vec::new();
+        copy_with_width(&record, new_width, &mut copied);
+        assert_eq!(copied, encode(&pushed), "row {n}: {pass:?}, P {stored}, W {width}");
+        copies += 1;
+    }
+    assert!(copies > 5_000, "{copies} copies");
+}
+
+/// The reflow pops the old history's rows one at a time, oldest first, so its blocks are freed
+/// as the pass goes, not at the end (design spec 5.6: no dense copy, no late release).
+#[test]
+fn reflow_frees_old_blocks_progressively() {
+    let mut history = History::<usize>::with_block_size(1000, 256);
+    let mut row = Row::new(8);
+    for value in 0..1000 {
+        row[Column(0)] = value;
+        history.push_newest(&row);
+    }
+    let full = history.blocks_held();
+    assert!(full > 20, "the test needs many blocks, got {full}");
+
+    let screen = vec![Row::new(8); 3];
+    let mut source = super::resize::RowSource::new(&mut history, screen);
+    for _ in 0..500 {
+        source.next_back().expect("a history row");
+    }
+    drop(source);
+
+    let half = history.blocks_held();
+    assert!(half <= full / 2 + 1, "{half} of {full} blocks still held after popping half the rows");
+}
+
+/// `ReflowSink` behaves as upstream's `Vec` for any window: random pushes, edits of the newest
+/// row, truncations reaching past the window and blank fills, then `finish`, against a `Vec`
+/// model doing what upstream did (grow short rows, reverse, trim to `limit + lines`).
+#[test]
+fn reflow_sink_matches_vec_for_any_window() {
+    use rand::{Rng, SeedableRng};
+
+    use super::resize::ReflowSink;
+
+    let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(5);
+    for round in 0..400 {
+        let (lines, limit, columns) = (rng.gen_range(1..6), rng.gen_range(0..30), 4);
+        let window = [1, 2, 3, 2 * lines + 2][round % 4];
+        let truncating = rng.gen_bool(0.5);
+        let mut sink =
+            ReflowSink::new(window, Some(columns), History::with_block_size(limit + lines, 64));
+        let mut model: Vec<Row<usize>> = Vec::new();
+        let mut next = 1;
+        for _ in 0..rng.gen_range(0..80) {
+            match rng.gen_range(0..10) {
+                // Without truncations the rows may exceed `limit + lines` (shrink_columns).
+                _ if !truncating || model.len() + 1 < limit + lines => {
+                    match rng.gen_range(0..4) {
+                        0 if truncating && !model.is_empty() => {
+                            let len = rng.gen_range(0..model.len());
+                            model.truncate(len);
+                            sink.truncate_newest(len);
+                        },
+                        // As truncations, only where nothing was evicted (`grow_columns`).
+                        1 if truncating => {
+                            let len = model.len() + rng.gen_range(0..3);
+                            model.resize_with(len, || Row::new(columns));
+                            sink.resize_with_blank(len, columns, &0);
+                        },
+                        2 if !model.is_empty() => {
+                            model.last_mut().unwrap()[Column(0)] += 100;
+                            sink.last_mut().unwrap()[Column(0)] += 100;
+                        },
+                        _ => {
+                            let mut row = Row::new(rng.gen_range(1..=columns));
+                            row[Column(0)] = next;
+                            next += 1;
+                            model.push(row.clone());
+                            sink.push(row);
+                        },
+                    }
+                },
+                _ => {},
+            }
+            if truncating {
+                // Without truncations the sink drops rows past `limit + lines` early.
+                assert_eq!(sink.len(), model.len());
+            }
+            // A row decoded back after leaving the window is already grown (see `ReflowSink`).
+            let grown = |row: &Row<usize>| {
+                let mut row = row.clone();
+                row.grow(columns);
+                row
+            };
+            assert_eq!(sink.last_mut().map(|row| grown(row)), model.last().map(grown));
+        }
+        if truncating && model.len() < lines {
+            model.resize_with(lines, || Row::new(columns));
+            sink.resize_with_blank(lines, columns, &0);
+        } else if model.len() < lines {
+            continue;
+        }
+
+        let mut expected: Vec<Row<usize>> = model
+            .into_iter()
+            .rev()
+            .map(|mut row| {
+                if row.len() < columns {
+                    row.grow(columns);
+                }
+                row
+            })
+            .collect();
+        expected.truncate(limit + lines);
+
+        let (screen, history) = sink.finish(lines, limit);
+        let mut got: Vec<Row<usize>> =
+            (0..lines).rev().map(|l| screen[Line(l as i32)].clone()).collect();
+        let mut row = Row::default();
+        for i in 0..history.len() {
+            history.read(i, &mut row);
+            got.push(row.clone());
+        }
+        assert_eq!(got, expected, "round {round}, window {window}, lines {lines}, limit {limit}");
+        assert_eq!(history.limit(), limit);
+    }
 }

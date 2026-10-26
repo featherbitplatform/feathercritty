@@ -11,6 +11,18 @@ mod imp;
 
 pub use imp::*;
 
+/// Write one screen cell (`term_impl::Side::from_rows`).
+pub fn set_cell(
+    term: &mut k::term::Term<k::event::VoidListener>,
+    point: k::index::Point,
+    cell: k::term::cell::Cell,
+) {
+    term.grid_mut().screen_mut()[point] = cell;
+}
+
+/// This side is feathercritty, whose searches always terminate (fork change 5).
+pub const ORACLE: bool = false;
+
 /// Grid reads written differently per crate (feathercritty does not index `Grid` (screen rows are
 /// behind `Grid::screen`, history rows are read through `RowReader` and `Grid::cell`));
 /// `term_impl.rs` reads cells and rows through these.
@@ -19,6 +31,29 @@ pub fn cell_at(
     point: k::index::Point,
 ) -> k::term::cell::Cell {
     grid.cell(point)
+}
+
+/// A new terminal; under `DIFF_TINY` its grid's history uses tiny blocks and its column reflow
+/// keeps a window of one dense row (see `support::tiny_blocks`). The grid is replaced right after
+/// `Term::new`, before anything is written, by one built with the same size and history limit.
+pub fn new_term(
+    config: k::term::Config,
+    size: &k::term::test::TermSize,
+) -> k::term::Term<k::event::VoidListener> {
+    use k::grid::Dimensions;
+
+    let history = config.scrolling_history;
+    let mut term = k::term::Term::new(config, size, k::event::VoidListener);
+    if super::tiny_blocks() {
+        *term.grid_mut() = k::grid::Grid::new_with_block_size(
+            size.screen_lines(),
+            size.columns(),
+            history,
+            super::TINY_BLOCK_BYTES,
+        );
+        term.grid_mut().set_reflow_window(1);
+    }
+    term
 }
 
 /// See `cell_at`.

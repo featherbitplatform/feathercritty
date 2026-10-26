@@ -8,7 +8,11 @@
 //! Three tables:
 //!
 //! 1. **Live bytes** of a terminal (126x37, 10,000-line history) after 12,000 lines of each content
-//!    kind (spec 6.5), 0.26.0 against the fork, plus bytes per history row.
+//!    kind (spec 6.5), 0.26.0 against the fork, plus bytes per history row. The gated number is the
+//!    terminal after the lines minus a freshly created terminal of the same size, for both crates
+//!    (project ruling on spec 6.5, 2026-10-25): a new `Term` already holds about 2.3 MB in both
+//!    crates (screen, tab stops, the parser's buffers), which is not history and is the same with
+//!    or without compact history. The full terminal is printed too.
 //! 2. **Peak live bytes** while resizing a terminal holding a full history: 126->100->126 columns
 //!    and 200->80 (spec 6.4). Measured above the live bytes before the terminal was created, so the
 //!    terminal itself is included.
@@ -130,14 +134,16 @@ impl Subject for ac::Sim {
     }
 }
 
-/// Live bytes of a terminal after `buffer` was fed to it.
-fn live_bytes<S: Subject>(columns: usize, lines: usize, buffer: &[u8]) -> usize {
+/// Live bytes of a terminal after `buffer` was fed to it, and of the same terminal when it was
+/// new (before anything was fed).
+fn live_bytes<S: Subject>(columns: usize, lines: usize, buffer: &[u8]) -> (usize, usize) {
     let before = live();
     let mut sim = S::make(columns, lines);
+    let fresh = live() - before;
     sim.feed(buffer);
     let bytes = live() - before;
     drop(sim);
-    bytes
+    (bytes, fresh)
 }
 
 /// Peak live bytes (terminal included) while resizing `steps` after `buffer` was fed.
@@ -192,7 +198,7 @@ fn main() {
     );
     println!(
         "{:<28} | {:>10} | {:>10} | {:>9} | {:>9} | {:>6} | gate",
-        "content", "0.26.0 MB", "fork MB", "ac B/row", "fork B/row", "ratio"
+        "content (minus a new Term)", "0.26.0 MB", "fork MB", "ac B/row", "fork B/row", "ratio"
     );
     // (kind, spec 0.26.0 MB, absolute limit in bytes, limit as a fraction of 0.26.0)
     let rows = [
@@ -203,8 +209,9 @@ fn main() {
     ];
     for (kind, spec_mb, absolute, relative) in rows {
         let buffer = workload_lines(kind, 12_000, 5, columns, lines);
-        let a = live_bytes::<ac::Sim>(columns, lines, &buffer);
-        let f = live_bytes::<fc::Sim>(columns, lines, &buffer);
+        let (a_full, a_fresh) = live_bytes::<ac::Sim>(columns, lines, &buffer);
+        let (f_full, f_fresh) = live_bytes::<fc::Sim>(columns, lines, &buffer);
+        let (a, f) = (a_full - a_fresh, f_full - f_fresh);
         let limit = absolute.unwrap_or_else(|| (a as f64 * relative.unwrap()) as usize);
         let ok = f <= limit;
         if !ok {
@@ -216,7 +223,7 @@ fn main() {
         };
         println!(
             "{:<28} | {:>10.2} | {:>10.2} | {:>9} | {:>9} | {:>6.3} | {} ({rel}); spec 0.26.0 \
-             ~{spec_mb:.0} MB, measured {:+.0}%",
+             ~{spec_mb:.0} MB, measured {:+.0}%; whole Term {:.2} / {:.2} MB",
             kind.name(),
             mb(a),
             mb(f),
@@ -224,7 +231,9 @@ fn main() {
             f / HISTORY,
             f as f64 / a as f64,
             verdict(ok),
-            (mb(a) / spec_mb - 1.0) * 100.0
+            (mb(a) / spec_mb - 1.0) * 100.0,
+            mb(a_full),
+            mb(f_full),
         );
     }
 

@@ -3,13 +3,13 @@
 //! A specialized 2D grid implementation optimized for use in a terminal.
 
 use std::cmp::{max, min};
-use std::mem;
 use std::ops::{Bound, Deref, Index, IndexMut, Range, RangeBounds};
 
 use crate::index::{Column, Line, Point};
-use crate::term::cell::{Flags, ResetDiscriminant};
+use crate::term::cell::{Cell, Flags, ResetDiscriminant};
 use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
+mod compact;
 mod history;
 pub mod resize;
 mod row;
@@ -17,8 +17,11 @@ mod storage;
 #[cfg(test)]
 mod tests;
 
-// feathercritty: the history and its read API (see `history.rs`).
-pub use self::history::{History, HistoryCell, RowReader};
+// feathercritty: the history and its read API (see `history.rs`), and the trait for cells it
+// stores, next to their row codec (see `compact.rs`).
+pub(crate) use self::compact::PlainText;
+pub use self::compact::{HistoryCell, ReflowInfo};
+pub use self::history::{History, RowReader};
 pub use self::row::Row;
 use self::storage::Storage;
 
@@ -119,8 +122,11 @@ pub enum Scroll {
 ///                           ^
 ///                        columns
 /// ```
+///
+/// feathercritty: `T: HistoryCell` because the history stores rows in that cell type's compact
+/// record format (upstream: no bound).
 #[derive(Clone, Debug)]
-pub struct Grid<T> {
+pub struct Grid<T: HistoryCell> {
     /// Current cursor for writing data.
     pub cursor: Cursor<T>,
 
@@ -150,6 +156,16 @@ pub struct Grid<T> {
     /// Lines rotated into history since the grid was created (fbterm patch: lets a host keep
     /// positions stable while output scrolls).
     scrolled_lines: i64,
+
+    /// Rows the column reflow keeps dense, when a test sets it (feathercritty: a test hook, see
+    /// `set_reflow_window`; `None` is the default window of `resize.rs`).
+    #[cfg(any(test, feature = "test-hooks"))]
+    reflow_window: Option<usize>,
+
+    /// Whether the column reflow copies untouched history rows as bytes (feathercritty: a test
+    /// hook, see `set_reflow_byte_copy`; always on otherwise).
+    #[cfg(any(test, feature = "test-hooks"))]
+    reflow_byte_copy: bool,
 }
 
 /// The visible lines of a [`Grid`], indexed by `Line` (`0..screen_lines`) and `Point`.
@@ -194,18 +210,63 @@ impl<T> IndexMut<Point> for Screen<T> {
     }
 }
 
-impl<T: GridCell + Default + PartialEq> Grid<T> {
+// feathercritty: upstream's bound was `T: GridCell + Default + PartialEq`, which `HistoryCell`
+// includes.
+impl<T: HistoryCell> Grid<T> {
     pub fn new(lines: usize, columns: usize, max_scroll_limit: usize) -> Grid<T> {
+        Self::with_history(lines, columns, History::new(max_scroll_limit))
+    }
+
+    /// A grid whose history uses blocks of `block_bytes` bytes (feathercritty: a test hook, so
+    /// tests and the differential test can use tiny blocks; the `test-hooks` feature exposes it
+    /// outside the crate). Not a stable API.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn new_with_block_size(
+        lines: usize,
+        columns: usize,
+        max_scroll_limit: usize,
+        block_bytes: usize,
+    ) -> Grid<T> {
+        Self::with_history(lines, columns, History::with_block_size(max_scroll_limit, block_bytes))
+    }
+
+    /// feathercritty: upstream's `new` body, with the history passed in.
+    fn with_history(lines: usize, columns: usize, history: History<T>) -> Grid<T> {
         Grid {
             screen: Screen { raw: Storage::with_capacity(lines, columns) },
-            history: History::new(max_scroll_limit),
+            history,
             display_offset: 0,
             saved_cursor: Cursor::default(),
             cursor: Cursor::default(),
             lines,
             columns,
             scrolled_lines: 0,
+            #[cfg(any(test, feature = "test-hooks"))]
+            reflow_window: None,
+            #[cfg(any(test, feature = "test-hooks"))]
+            reflow_byte_copy: true,
         }
+    }
+
+    /// Keep only `rows` rows dense during a column reflow instead of the default window
+    /// (feathercritty: a test hook, so tests can prove the reflow's result does not depend on the
+    /// window, design spec 5.6; the `test-hooks` feature exposes it outside the crate). Not a
+    /// stable API.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_reflow_window(&mut self, rows: usize) {
+        assert!(rows > 0, "the reflow window holds at least one row");
+        self.reflow_window = Some(rows);
+    }
+
+    /// Turn the column reflow's byte-copy fast path off or on (feathercritty: a test hook, so
+    /// tests can prove the fast path gives the same result as decoding every row, design spec
+    /// 5.6; the `test-hooks` feature exposes it outside the crate). Not a stable API.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_reflow_byte_copy(&mut self, enabled: bool) {
+        self.reflow_byte_copy = enabled;
     }
 
     /// Lines rotated into history since the grid was created (fbterm patch). A line at
@@ -245,10 +306,7 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     fn decrease_scroll_limit(&mut self, count: usize) {
         let count = min(count, self.history_size());
         if count != 0 {
-            let mut removed = Row::default();
-            for _ in 0..count {
-                self.history.pop_oldest(&mut removed);
-            }
+            self.history.remove_oldest(count);
             self.display_offset = min(self.display_offset, self.history_size());
         }
     }
@@ -353,23 +411,16 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
             // feathercritty: upstream grew the history here (`increase_scroll_limit`) and its
             // rotation below left the departing rows in place as the newest history rows,
             // recycling cache rows (or the oldest history rows at the limit) as the new bottom
-            // rows. Here each departing row moves into history oldest first and its slot gets
-            // the row `History` hands back (the evicted oldest row at the limit, else a spare
-            // screen row or a new one). The rotation then brings the ring's hidden rows, or
-            // those slots, to the bottom, where they are reset below as upstream's recycled rows
-            // are. With a history limit of 0 nothing is stored and the departing rows are
-            // recycled. Which row is recycled is invisible because the `Row` `occ` invariant
-            // makes every reset row fully reset (`Row::grow`). `push_newest_recycle` is temporary
-            // (dense history only); with an encoded history this pushes a copy and resets the row
-            // in place. When merging upstream: if upstream changes this rotation, port it onto
-            // these pushes; the differential test checks the result.
-            let rotated_into_history = if self.history.limit() == 0 { 0 } else { rotated };
-            for i in (0..rotated_into_history).map(Line::from) {
-                let row = mem::take(&mut self.screen[i]);
-                self.screen[i] = match self.history.push_newest_recycle(row) {
-                    Some(recycled) => recycled,
-                    None => self.screen.raw.take_spare(self.columns),
-                };
+            // rows. Here each departing row is encoded into history, oldest first (`push_newest`
+            // evicts the oldest history row at the limit; with a limit of 0 it stores nothing),
+            // and stays in the screen ring. The rotation below then brings the ring's hidden
+            // rows, or the departed rows themselves, to the bottom, where they are reset in place
+            // as upstream's recycled rows are. Which row is recycled is invisible because the
+            // `Row` `occ` invariant makes every reset row fully reset (`Row::grow`). When merging
+            // upstream: if upstream changes this rotation, port it onto these pushes; the
+            // differential test checks the result.
+            for i in (0..rotated).map(Line::from) {
+                self.history.push_newest(&self.screen[i]);
             }
 
             // Swap the lines fixed at the top to their target positions after rotation.
@@ -416,10 +467,10 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
         // feathercritty: the rest of a count above the region's height (see `rotated`): upstream
         // reset that many rows above the screen, so they enter history as reset rows.
         if positions > rotated && self.history.limit() != 0 {
+            let mut row = Row::new(self.columns);
+            row.reset(&self.cursor.template);
             for _ in rotated..positions {
-                let mut row = Row::new(self.columns);
-                row.reset(&self.cursor.template);
-                self.history.push_newest_owned(row);
+                self.history.push_newest(&row);
             }
         }
     }
@@ -477,7 +528,8 @@ impl<T: GridCell + Default + PartialEq> Grid<T> {
     }
 }
 
-impl<T> Grid<T> {
+// feathercritty: upstream had no bound here; the history needs `HistoryCell`.
+impl<T: HistoryCell> Grid<T> {
     /// Reset a visible region within the grid.
     pub fn reset_region<D, R: RangeBounds<Line>>(&mut self, bounds: R)
     where
@@ -531,13 +583,15 @@ impl<T> Grid<T> {
         // history until it reached `max_scroll_limit`; the history is rebuilt with them first.
         let missing = self.history.limit() - self.history_size();
         if missing != 0 {
-            let mut history = History::new(self.history.limit());
+            let mut history =
+                History::with_block_size(self.history.limit(), self.history.block_bytes());
+            let blank = Row::new(self.columns);
             for _ in 0..missing {
-                history.push_newest_owned(Row::new(self.columns));
+                history.push_newest(&blank);
             }
             let mut row = Row::default();
             while self.history.pop_oldest(&mut row) {
-                history.push_newest_owned(mem::take(&mut row));
+                history.push_newest(&row);
             }
             self.history = history;
         }
@@ -618,9 +672,14 @@ impl<T> Grid<T> {
         &self.history
     }
 
-    /// Change history row `line` (`line < 0`) in place (feathercritty: the one history write,
-    /// see `Term::input`).
-    #[inline]
+    /// Change history row `line` (`line < 0`) (feathercritty: the one history write, see
+    /// `Term::input`; the row is decoded, changed and re-encoded, see `History::update`).
+    ///
+    /// Cold and never inlined: it runs only when a wide character is overwritten at the start of
+    /// the screen's first line, and inlined it made `Term::input`, the parser's hottest path,
+    /// measurably slower (about 1.5% on full-screen redraws).
+    #[cold]
+    #[inline(never)]
     pub(crate) fn update_history_row(&mut self, line: Line, f: impl FnOnce(&mut Row<T>)) {
         debug_assert!(line < 0 && line >= self.topmost_line());
         self.history.update((-line.0 - 1) as usize, f);
@@ -651,7 +710,7 @@ impl<T> Grid<T> {
         } else if point.line.0 >= 0 {
             self.screen[point].clone()
         } else {
-            self.history.row((-point.line.0 - 1) as usize)[point.column].clone()
+            self.history.cell((-point.line.0 - 1) as usize, point.column)
         }
     }
 
@@ -691,11 +750,26 @@ impl<T> Grid<T> {
     }
 }
 
+impl Grid<Cell> {
+    /// History line `line` as plain text read straight from its record, without decoding its
+    /// cells (feathercritty: the text fast path; see `compact::plain_text` for which rows
+    /// qualify). `None` for a screen line, a line outside the grid, or a row that does not
+    /// qualify; read those through [`RowReader`].
+    #[inline]
+    pub(crate) fn history_plain_text(&self, line: Line) -> Option<PlainText<'_>> {
+        if line.0 >= 0 || line < self.topmost_line() {
+            return None;
+        }
+        self.history.plain_text((-line.0 - 1) as usize)
+    }
+}
+
 /// feathercritty: upstream compared the `raw` storage (asserting both rings were truncated and
-/// zeroed); this compares the content, screen rows then history rows, which is what that
-/// comparison meant.
-impl<T: PartialEq> PartialEq for Grid<T> {
+/// zeroed); this compares the content, screen rows then history rows (decoded), which is what
+/// that comparison meant.
+impl<T: HistoryCell> PartialEq for Grid<T> {
     fn eq(&self, other: &Self) -> bool {
+        let (mut ours, mut theirs) = (Row::default(), Row::default());
         // Compare struct fields and check result of grid comparison.
         self.columns.eq(&other.columns)
             && self.lines.eq(&other.lines)
@@ -704,7 +778,11 @@ impl<T: PartialEq> PartialEq for Grid<T> {
             && (0..self.lines as i32)
                 .map(Line::from)
                 .all(|line| self.screen[line] == other.screen[line])
-            && (0..self.history.len()).all(|i| self.history.row(i) == other.history.row(i))
+            && (0..self.history.len()).all(|i| {
+                self.history.read(i, &mut ours);
+                other.history.read(i, &mut theirs);
+                ours == theirs
+            })
     }
 }
 
@@ -714,12 +792,13 @@ impl<T: PartialEq> PartialEq for Grid<T> {
 /// up through history to the oldest row), `len` rows of it are live. Serializing writes the
 /// order upstream writes after `Grid::truncate` (`zero` 0, no cache rows). Deserializing splits
 /// the live rows at the grid's `lines`; `visible_lines` is written as `lines` and ignored on
-/// read, because old ref-test files carry a stale value there.
+/// read, because old ref-test files carry a stale value there. Serializing decodes the history
+/// rows; deserializing encodes them.
 #[cfg(feature = "serde")]
 mod serde_proxy {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-    use super::{Grid, History, Row, Screen, Storage};
+    use super::{Grid, History, HistoryCell, Row, Screen, Storage};
     use crate::index::Line;
 
     #[derive(Serialize)]
@@ -761,11 +840,18 @@ mod serde_proxy {
         len: usize,
     }
 
-    impl<T: Serialize> Serialize for Grid<T> {
+    impl<T: Serialize + HistoryCell> Serialize for Grid<T> {
         fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let history: Vec<Row<T>> = (0..self.history.len())
+                .map(|i| {
+                    let mut row = Row::default();
+                    self.history.read(i, &mut row);
+                    row
+                })
+                .collect();
             let mut inner = Vec::with_capacity(self.lines + self.history.len());
             inner.extend((0..self.lines as i32).rev().map(|line| &self.screen[Line(line)]));
-            inner.extend((0..self.history.len()).map(|i| self.history.row(i)));
+            inner.extend(history.iter());
             let len = inner.len();
 
             GridRef {
@@ -779,7 +865,7 @@ mod serde_proxy {
         }
     }
 
-    impl<'de, T: Deserialize<'de> + Default> Deserialize<'de> for Grid<T> {
+    impl<'de, T: Deserialize<'de> + HistoryCell> Deserialize<'de> for Grid<T> {
         fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
             let GridOwned { raw, columns, lines, display_offset, max_scroll_limit } =
                 GridOwned::deserialize(deserializer)?;
@@ -798,8 +884,8 @@ mod serde_proxy {
             let history_rows = inner.split_off(lines);
 
             let mut history = History::new(max_scroll_limit);
-            for row in history_rows.into_iter().rev() {
-                history.push_newest_owned(row);
+            for row in history_rows.iter().rev() {
+                history.push_newest(row);
             }
 
             Ok(Grid {
@@ -811,6 +897,10 @@ mod serde_proxy {
                 lines,
                 display_offset,
                 scrolled_lines: 0,
+                #[cfg(any(test, feature = "test-hooks"))]
+                reflow_window: None,
+                #[cfg(any(test, feature = "test-hooks"))]
+                reflow_byte_copy: true,
             })
         }
     }
@@ -852,7 +942,8 @@ pub trait Dimensions {
     }
 }
 
-impl<G> Dimensions for Grid<G> {
+// feathercritty: upstream had no bound; `Grid` needs `HistoryCell`.
+impl<G: HistoryCell> Dimensions for Grid<G> {
     /// feathercritty: upstream returned `raw.len()`; it is the screen plus the history.
     #[inline]
     fn total_lines(&self) -> usize {
@@ -902,13 +993,13 @@ impl<T> Deref for Indexed<T> {
 
 /// Grid cell iterator.
 ///
-/// feathercritty: upstream yielded `Indexed<&T>` borrowed from the grid. Encoded history rows have
-/// no cells to borrow, so the iterator yields `Indexed<T>` by value (a clone of the cell) and
-/// `cell()` borrows from the iterator. It looks a row up once when it enters it and keeps a
-/// reference to it: the screen row, or in the dense phase the stored history row (the encoded
-/// store decodes a history row once into the iterator instead, never per cell). Iterating never
-/// allocates.
-pub struct GridIterator<'a, T> {
+/// feathercritty: upstream yielded `Indexed<&T>` borrowed from the grid. History rows are
+/// encoded and have no cells to borrow, so the iterator yields `Indexed<T>` by value (a clone of
+/// the cell) and `cell()` borrows from the iterator. It looks a row up once when it enters it:
+/// a screen row is borrowed in place, a history row is decoded once into the iterator's scratch
+/// row (never per cell). Iterating the screen never allocates; the scratch row is allocated on
+/// the first history row.
+pub struct GridIterator<'a, T: HistoryCell> {
     /// Immutable grid reference.
     grid: &'a Grid<T>,
 
@@ -918,32 +1009,53 @@ pub struct GridIterator<'a, T> {
     /// Last cell included in the iterator.
     end: Point,
 
-    /// The row `point` is on, `None` while `point` is outside the grid (feathercritty).
-    row: Option<&'a Row<T>>,
+    /// Where the row `point` is on lives (feathercritty).
+    row: IterRow<'a, T>,
+
+    /// The decoded history row, when `row` is `IterRow::History` (feathercritty).
+    scratch: Row<T>,
 
     /// The cell read at a point outside the grid, "no row" (feathercritty, see [`Grid::cell`]).
     blank: T,
 }
 
-impl<'a, T> GridIterator<'a, T> {
-    fn new(grid: &'a Grid<T>, point: Point, end: Point) -> Self
-    where
-        T: Default,
-    {
-        Self { grid, point, end, row: Self::row_at(grid, point.line), blank: T::default() }
+/// The row a [`GridIterator`] is on (feathercritty).
+enum IterRow<'a, T> {
+    /// A screen row, borrowed from the grid.
+    Screen(&'a Row<T>),
+    /// A history row, decoded into the iterator's scratch row.
+    History,
+    /// A line outside the grid ("no row").
+    Outside,
+}
+
+impl<'a, T: HistoryCell> GridIterator<'a, T> {
+    fn new(grid: &'a Grid<T>, point: Point, end: Point) -> Self {
+        let mut iter = Self {
+            grid,
+            point,
+            end,
+            row: IterRow::Outside,
+            scratch: Row::default(),
+            blank: T::default(),
+        };
+        iter.enter_row();
+        iter
     }
 
-    /// Row `line` of `grid`, `None` outside the grid (feathercritty).
+    /// Look up the row `point` is on, decoding it if it is a history row (feathercritty).
     #[inline]
-    fn row_at(grid: &'a Grid<T>, line: Line) -> Option<&'a Row<T>> {
-        if line > grid.bottommost_line() || line < grid.topmost_line() {
-            None
+    fn enter_row(&mut self) {
+        let grid = self.grid;
+        let line = self.point.line;
+        self.row = if line > grid.bottommost_line() || line < grid.topmost_line() {
+            IterRow::Outside
         } else if line.0 >= 0 {
-            Some(&grid.screen[line])
+            IterRow::Screen(&grid.screen[line])
         } else {
-            // Dense phase: lend the stored history row.
-            Some(grid.history.row((-line.0 - 1) as usize))
-        }
+            grid.history.read((-line.0 - 1) as usize, &mut self.scratch);
+            IterRow::History
+        };
     }
 
     /// Current iterator position.
@@ -960,8 +1072,9 @@ impl<'a, T> GridIterator<'a, T> {
     #[inline]
     pub fn cell(&self) -> &T {
         match self.row {
-            Some(row) => &row[self.point.column],
-            None => &self.blank,
+            IterRow::Screen(row) => &row[self.point.column],
+            IterRow::History => &self.scratch[self.point.column],
+            IterRow::Outside => &self.blank,
         }
     }
 
@@ -979,7 +1092,7 @@ impl<'a, T> GridIterator<'a, T> {
                 self.point.column = Column(0);
                 self.point.line += 1;
                 // feathercritty: look the new row up once.
-                self.row = Self::row_at(self.grid, self.point.line);
+                self.enter_row();
             },
             _ => self.point.column += Column(1),
         }
@@ -1004,7 +1117,7 @@ impl<'a, T> GridIterator<'a, T> {
                 self.point.column = last_column;
                 self.point.line -= 1;
                 // feathercritty: look the new row up once.
-                self.row = Self::row_at(self.grid, self.point.line);
+                self.enter_row();
             },
             _ => self.point.column -= Column(1),
         }
@@ -1015,7 +1128,7 @@ impl<'a, T> GridIterator<'a, T> {
 
 /// feathercritty: upstream's `next` and `prev` bodies moved into `advance` and `retreat`
 /// unchanged; these add the item, a clone of the cell.
-impl<T: Clone> Iterator for GridIterator<'_, T> {
+impl<T: HistoryCell> Iterator for GridIterator<'_, T> {
     type Item = Indexed<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1050,7 +1163,7 @@ pub trait BidirectionalIterator: Iterator {
     fn prev(&mut self) -> Option<Self::Item>;
 }
 
-impl<T: Clone> BidirectionalIterator for GridIterator<'_, T> {
+impl<T: HistoryCell> BidirectionalIterator for GridIterator<'_, T> {
     fn prev(&mut self) -> Option<Self::Item> {
         if !self.retreat() {
             return None;

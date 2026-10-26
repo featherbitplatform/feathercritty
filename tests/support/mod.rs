@@ -74,16 +74,17 @@
 //!    - Fork change 5 (regex search over leading spacers, complete in `0.26.0+fbterm.3`: every
 //!      search terminates, and matches stay in their range up to the glyph completion at its ends;
 //!      where 0.26.0 terminates in range the answers are 0.26.0's): where 0.26.0's `search_next`
-//!      does not terminate or answers from outside the searched range
+//!      does not terminate, panics or answers from outside the searched range
 //!      (`Side::oracle_search_is_off`), [`run`] does not require equality but checks
 //!      feathercritty's answer on its own, even when both answers are equal (`Side::check_search`:
 //!      it terminated, and a match lies in the range, allowing the glyph completion at its ends
 //!      (`Side::match_in_range`), and spells a match of the pattern as the search reads cells,
-//!      `Side::text_right`/`text_left`, which follow `skip_fullwidth`); windows that
-//!      `project::search_window` moves for 0.26.0 are also searched as drawn on feathercritty alone
-//!      and checked the same way. Both are counted in [`Stats`]; `oracle_sees_fork_change_5` shows
-//!      both paths are taken. If the new oracle release carries the same fix, drop that modeling
-//!      and require equality again; if feathercritty's change was dropped, drop it too.
+//!      `Side::read`, which follows `skip_fullwidth`, the search's line-break check and its wrap
+//!      around the buffer's end); windows that `project::search_window` moves for 0.26.0 are also
+//!      searched as drawn on feathercritty alone and checked the same way. Both are counted in
+//!      [`Stats`]; `oracle_sees_fork_change_5` shows both paths are taken. If the new oracle
+//!      release carries the same fix, drop that modeling and require equality again; if
+//!      feathercritty's change was dropped, drop it too.
 //!
 //! [`gen`]: mod@r#gen
 
@@ -407,16 +408,19 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
         let rb = catch(|| b.queries(&plan));
         let (mut qa, qb) = combine(i, "queries", ra, rb)?;
 
-        // Fork change 5: where 0.26.0's search does not terminate or answers from outside the
-        // searched range, feathercritty's answer is checked on its own instead of compared,
+        // Fork change 5: where 0.26.0's search does not terminate, panics or answers from outside
+        // the searched range, feathercritty's answer is checked on its own instead of compared,
         // even when both answers are the same (both could be wrong the same way).
         // The searches follow the selections and `bounds_to_string` in the answers.
         let first = plan.selections.len() + 1;
         for (k, search) in plan.searches.iter().enumerate() {
             assert_eq!((qa[first + k].0, qb[first + k].0), ("search_next", "search_next"));
             let (fork, oracle) = (&qa[first + k].1, &qb[first + k].1);
-            if b.oracle_search_is_off(search, oracle) {
-                if let Err(why) = a.check_search(search, search.max_lines, fork) {
+            let walked = b.walk(k);
+            if b.oracle_search_is_off(search, oracle, walked.as_ref()) {
+                if let Err(why) =
+                    a.check_search_walked(search, search.max_lines, fork, walked.as_ref())
+                {
                     let diff = format!(
                         "search_next where 0.26.0 cannot answer (fork change 5): feathercritty \
                          {fork:?} fails its own check: {why}\n0.26.0 {oracle:?}\nsearch {search:?}"
@@ -484,6 +488,18 @@ fn env_u64(name: &str) -> Option<u64> {
     Some(value.trim().parse().unwrap_or_else(|_| panic!("{name} must be an integer: {value:?}")))
 }
 
+/// `DIFF_TINY`: when set (to anything but `0`), every feathercritty grid's history uses
+/// [`TINY_BLOCK_BYTES`]-byte blocks, so block boundaries, spares and oversized rows are crossed
+/// all the time, and its column reflow keeps a window of one dense row (`Grid::set_reflow_window`),
+/// so every row the reflow produces goes through the new history; the primary grid only, the
+/// alternate one has no history.
+pub fn tiny_blocks() -> bool {
+    std::env::var("DIFF_TINY").is_ok_and(|value| value.trim() != "0")
+}
+
+/// History block size under `DIFF_TINY`.
+pub const TINY_BLOCK_BYTES: usize = 256;
+
 /// `DIFF_SEEDS`, or `default`.
 pub fn seed_count(default: u64) -> u64 {
     env_u64("DIFF_SEEDS").unwrap_or(default)
@@ -494,11 +510,13 @@ pub fn step_count(default: usize) -> usize {
     env_u64("DIFF_STEPS").map_or(default, |n| n as usize)
 }
 
-/// The seeds to run: `DIFF_SEED` alone when set, otherwise `0..count`.
+/// The seeds to run: `DIFF_SEED` alone when set, otherwise `start..start + count` with `start`
+/// from `DIFF_SEED_START` (default 0), so long soak runs can cover fresh seed ranges in chunks.
 pub fn seeds(count: u64) -> Vec<u64> {
+    let start = env_u64("DIFF_SEED_START").unwrap_or(0);
     match env_u64("DIFF_SEED") {
         Some(seed) => vec![seed],
-        None => (0..count).collect(),
+        None => (start..start + count).collect(),
     }
 }
 
@@ -544,7 +562,10 @@ where
         return total;
     };
     let start = case.start;
-    let steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
+    let mut steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
+    if tiny_blocks() {
+        steps += " DIFF_TINY=1";
+    }
     if divergence.hang {
         // Minimizing would rerun the hanging query many times, leaving a spinning thread each
         // time; report the seed and the query instead.
