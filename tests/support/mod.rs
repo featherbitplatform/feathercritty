@@ -74,7 +74,7 @@
 //!    - Fork change 5 (regex search over leading spacers, complete in `0.26.0+fbterm.3`: every
 //!      search terminates, and matches stay in their range up to the glyph completion at its ends;
 //!      where 0.26.0 terminates in range the answers are 0.26.0's): where 0.26.0's `search_next`
-//!      does not terminate or answers from outside the searched range
+//!      does not terminate, panics or answers from outside the searched range
 //!      (`Side::oracle_search_is_off`), [`run`] does not require equality but checks
 //!      feathercritty's answer on its own, even when both answers are equal (`Side::check_search`:
 //!      it terminated, and a match lies in the range, allowing the glyph completion at its ends
@@ -408,8 +408,8 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
         let rb = catch(|| b.queries(&plan));
         let (mut qa, qb) = combine(i, "queries", ra, rb)?;
 
-        // Fork change 5: where 0.26.0's search does not terminate or answers from outside the
-        // searched range, feathercritty's answer is checked on its own instead of compared,
+        // Fork change 5: where 0.26.0's search does not terminate, panics or answers from outside
+        // the searched range, feathercritty's answer is checked on its own instead of compared,
         // even when both answers are the same (both could be wrong the same way).
         // The searches follow the selections and `bounds_to_string` in the answers.
         let first = plan.selections.len() + 1;

@@ -21,10 +21,10 @@
 //! - Fork change 1 (kitty keyboard stack eviction) needs more than 4,096 pushes; the generator
 //!   stays below 4,000, and `oracle_sees_fork_change_1` checks that the oracle does notice it.
 //! - Fork change 5 (regex search over leading spacers terminates and stays in range; complete in
-//!   `0.26.0+fbterm.3`): where 0.26.0 does not terminate or answers from outside the searched
-//!   range, feathercritty's answer is checked on its own instead of compared, even when both are
-//!   equal; `oracle_sees_fork_change_5` covers it. Every feathercritty query runs under a timeout,
-//!   so a search that never returns fails with its seed instead of hanging the run.
+//!   `0.26.0+fbterm.3`): where 0.26.0 does not terminate, panics or answers from outside the
+//!   searched range, feathercritty's answer is checked on its own instead of compared, even when
+//!   both are equal; `oracle_sees_fork_change_5` covers it. Every feathercritty query runs under a
+//!   timeout, so a search that never returns fails with its seed instead of hanging the run.
 //! - The `Row` `occ` invariant and "no row" reads outside the grid (compact history work) are
 //!   applied to the oracle as patches (`tests/oracle/PATCHES.md`), so they are compared for
 //!   equality like everything else.
@@ -322,6 +322,7 @@ fn search_soak_regressions() {
         5_104_388,  // a match is never rewritten into text the pattern does not match
         7_000_448,  // the same, for a match running around the buffer
         7_025_823,  // 0.26.0 goes on from inside the range's far end; so does the iteration
+        20_042_253, // a release 0.26.0 is not compared where a debug one panics (column 0)
     ];
     for seed in random {
         let case = r#gen::random_case(seed, DEFAULT_STEPS);
@@ -333,6 +334,12 @@ fn search_soak_regressions() {
     let case = r#gen::realistic_case(Realistic::Cjk, 1_000_223);
     if let Err(divergence) = support::run(&case.start, &case.steps) {
         panic!("realistic_cjk seed 1000223: {divergence}");
+    }
+    // 0.26.0 panics going left past a match ending on a stale wide char spacer at column 0; the
+    // fork answers there (found with DIFF_TINY=1 in a debug build).
+    let case = r#gen::large_case(30_001_812, DEFAULT_STEPS.div_ceil(4));
+    if let Err(divergence) = support::run(&case.start, &case.steps) {
+        panic!("large_history_limit seed 30001812: {divergence}");
     }
 }
 

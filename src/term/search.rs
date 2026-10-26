@@ -160,7 +160,8 @@ impl<T> Term<T> {
     /// the search returns instead of panicking, but its answer for such an origin is unspecified.
     ///
     /// feathercritty: the search runs as upstream's does (fork change 5, README). Where upstream
-    /// would never return (its iteration loops) or would answer with a match outside the searched
+    /// would never return (its iteration loops), panics (going left from a stale wide char spacer
+    /// at column 0, `expand_wide_underflows`) or would answer with a match outside the searched
     /// range, this answers with the last match inside the range that the iteration produced, or
     /// `None`; otherwise it answers exactly as upstream.
     pub fn search_next(
@@ -180,6 +181,15 @@ impl<T> Term<T> {
         // the line. Upstream has no answer there, so no result it gives changes.
         // When merging upstream: if `expand_wide` stays inside the grid, drop this; re-run
         // `search_origin_on_bottom_line_stale_spacer`.
+        //
+        // feathercritty: going left from a wide char spacer at column 0, `expand_wide` subtracts
+        // from column 0 (`expand_wide_underflows`): upstream panics here in debug builds, before
+        // its search produced any match, so we answer `None` (the answer of rule 3 of fork change
+        // 5 with no match). When merging upstream: drop this with `expand_wide_underflows`; re-run
+        // `stale_spacer_column_zero_search_next`.
+        if self.expand_wide_underflows(origin, direction) {
+            return None;
+        }
         let expanded = self.expand_wide(origin, direction);
         origin =
             if expanded.line > self.bottommost_line() { self.glyph_end(origin) } else { expanded };
@@ -261,11 +271,12 @@ impl<T> Term<T> {
     }
 
     /// The answer of `search_next`: upstream's (`find` with `done`, falling back to the first
-    /// match), unless the iteration hit the bound (`RegexIter::bound_fired`) or that answer lies
-    /// outside the searched range (`match_in_range`); then the last match inside the range that
-    /// the iteration produced, or `None`. An iteration that upstream repeats forever counts up to
-    /// the point where it starts repeating (`last_in_range_before_repeat`), so the answer does
-    /// not depend on where the cycle check happened to notice the repeat.
+    /// match), unless the iteration hit the bound (`RegexIter::bound_fired`: upstream loops or
+    /// panics) or that answer lies outside the searched range (`match_in_range`); then the last
+    /// match inside the range that the iteration produced, or `None`. An iteration that upstream
+    /// repeats forever counts up to the point where it starts repeating
+    /// (`last_in_range_before_repeat`), so the answer does not depend on where the cycle check
+    /// happened to notice the repeat.
     ///
     /// feathercritty: not in upstream; fork change 5. Upstream wrote
     /// `regex_iter.peekable()`, `peek()?` for the first match and
@@ -301,7 +312,7 @@ impl<T> Term<T> {
             }
         }
 
-        // Upstream never returns here.
+        // Upstream never returns here, or panics (`RegexIter::next`).
         if regex_iter.bound_fired() {
             if let Some(cycle) = regex_iter.cycle {
                 // The rerun runs on a copy of the regex, whose cache may give up where this pass
@@ -779,6 +790,19 @@ impl<T> Term<T> {
         self.glyph_cells(point, Direction::Right).last().copied().unwrap_or(point)
     }
 
+    /// Whether `expand_wide` at `point` going `direction` subtracts from column 0: going left from
+    /// a wide char spacer at column 0 (a stale one, left behind by a resize or an erase), it moves
+    /// one column back to the spacer's wide char. 0.26.0 panics there in debug builds (`Column`
+    /// overflow) and goes on from a wrapped-around column in release builds.
+    ///
+    /// feathercritty: not in upstream; see `search_next` and `RegexIter::next`. When merging
+    /// upstream: if `expand_wide` handles column 0 itself, drop this and its two uses.
+    fn expand_wide_underflows(&self, point: Point, direction: Direction) -> bool {
+        direction == Direction::Left
+            && point.column == Column(0)
+            && self.grid.cell(point).flags.contains(Flags::WIDE_CHAR_SPACER)
+    }
+
     /// Advance a grid iterator over fullwidth characters.
     ///
     /// feathercritty: upstream took `cell: &mut &'a Cell` borrowed from the grid; `cell` is a
@@ -994,8 +1018,9 @@ struct LoopState {
 ///
 /// feathercritty: it yields exactly upstream's matches, in upstream's order, out-of-range ones
 /// included. Where upstream's iteration would never end (it returns to an origin it already
-/// searched from, or one of its searches would never return), it ends instead and
-/// `bound_fired` says so.
+/// searched from, or one of its searches would never return), or where upstream panics moving
+/// its origin past a match (`Term::expand_wide_underflows`), it ends instead and `bound_fired`
+/// says so.
 pub struct RegexIter<'a, T> {
     point: Point,
     end: Point,
@@ -1004,8 +1029,8 @@ pub struct RegexIter<'a, T> {
     term: &'a Term<T>,
     done: bool,
     // feathercritty: the cycle check in `next` (Brent: one saved origin, compared with each new
-    // one, replaced after 1, 2, 4, ... searches), whether it or a search's own check fired, and
-    // the length of the cycle it found.
+    // one, replaced after 1, 2, 4, ... searches), whether it, a search's own check or the stop
+    // where upstream panics fired, and the length of the cycle it found.
     saved: Option<Point>,
     power: usize,
     steps: usize,
@@ -1039,7 +1064,8 @@ impl<'a, T> RegexIter<'a, T> {
         }
     }
 
-    /// Whether the iteration ended where upstream's would never end (feathercritty).
+    /// Whether the iteration ended where upstream's would never end, or where upstream panics
+    /// (feathercritty; `Term::expand_wide_underflows`).
     pub fn bound_fired(&self) -> bool {
         self.bound_fired
     }
@@ -1113,6 +1139,18 @@ impl<T> Iterator for RegexIter<'_, T> {
         if self.point == self.end {
             // Stop when the match terminates right on the end limit.
             self.done = true;
+        } else if self.term.expand_wide_underflows(self.point, self.direction) {
+            // feathercritty: upstream calls `skip` here in every case. A leftward match ending on
+            // a stale wide char spacer at column 0 makes `expand_wide` subtract from column 0
+            // (`Term::expand_wide_underflows`): upstream panics in debug builds before yielding
+            // this match, and goes on from a wrapped-around column in release builds. We end the
+            // iteration where it panics, without the match, and record it like the bounds, so
+            // `search_next` answers with the last in-range match yielded before (rule 3 of fork
+            // change 5). When merging upstream: drop this branch if `expand_wide` handles column
+            // 0; re-run `stale_spacer_column_zero_left_iteration`.
+            self.done = true;
+            self.bound_fired = true;
+            return None;
         } else {
             // Move the new search origin past the match.
             self.skip();
@@ -2529,6 +2567,57 @@ mod tests {
             let match_start = Point::new(Line(0), Column(5));
             let match_end = Point::new(Line(0), Column(6));
             assert_eq!(result, Some(match_start..=match_end), "{side:?}");
+        }
+    }
+
+    /// Lines 0 to 2 are one wrapped line whose line 1 starts with a stale wide char spacer
+    /// (`WIDE_CHAR_SPACER` without its wide char, at column 0), as a resize to 2 columns and an
+    /// erase leave behind (differential soak seed 30001812, `large_history_limit`, shrunk).
+    fn stale_spacer_column_zero_term() -> Term<VoidListener> {
+        #[rustfmt::skip]
+        let term = term_from_rows(0, &[
+            ("ab", ".r"),
+            ("  ", "Sr"),
+            ("cd", ".."),
+        ]);
+        term
+    }
+
+    #[test]
+    fn stale_spacer_column_zero_left_iteration() {
+        // A leftward `RegexIter` from (2,1) yields (2,1) and (2,0); its third match ends on the
+        // spacer at (1,0), and moving its origin past that match (`expand_wide`, going left from a
+        // spacer to its wide char one column back) subtracts from column 0: 0.26.0 panics in debug
+        // builds (recorded from the differential test's oracle) and goes on from a wrapped-around
+        // column in release builds. We end the iteration there, with the bound, after 0.26.0's
+        // matches.
+        let start = Point::new(Line(2), Column(1));
+        let end = Point::new(Line(0), Column(0));
+        let result =
+            iterate(stale_spacer_column_zero_term(), "[^ ]+ ?", start, end, Direction::Left);
+        assert_eq!(result, (vec![span((2, 1), (2, 1)), span((2, 0), (2, 0))], true));
+    }
+
+    #[test]
+    fn stale_spacer_column_zero_search_next() {
+        // `search_next` runs the iteration of `stale_spacer_column_zero_left_iteration` (its start
+        // is the end of the wrapped line, (2,1)); neither match yielded is past the origin, and
+        // 0.26.0 panics before it finds one, so the answer is the last match in range.
+        for origin in [(0, 0), (0, 1), (1, 1)] {
+            let origin = Point::new(Line(origin.0), Column(origin.1));
+            let term = stale_spacer_column_zero_term();
+            let result = next_match(term, "[^ ]+ ?", origin, Direction::Left, Side::Left, None);
+            assert_eq!(result, Some(span((2, 0), (2, 0))), "{origin:?}");
+        }
+
+        // From the spacer itself, 0.26.0 already panics moving the origin (`expand_wide`): no
+        // match was produced, so there is none.
+        let origin = Point::new(Line(1), Column(0));
+        for max_lines in [None, Some(1)] {
+            let term = stale_spacer_column_zero_term();
+            let result =
+                next_match(term, "[^ ]+ ?", origin, Direction::Left, Side::Left, max_lines);
+            assert_eq!(result, None, "{max_lines:?}");
         }
     }
 

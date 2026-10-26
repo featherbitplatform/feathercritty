@@ -173,23 +173,23 @@ fn origin_leaves_grid(term: &Term<VoidListener>, origin: Point, direction: Direc
         && cell_at(term.grid(), origin).flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
 }
 
-/// Whether `Term::search_next` returns for these arguments.
+/// Whether `Term::search_next` returns, never returns or panics for these arguments (`Probe`).
 ///
 /// Workaround for a 0.26.0 bug, still needed on the oracle side: 0.26.0's match iterator
 /// (`RegexIter`) can cycle between two matches forever (next to a `LEADING_WIDE_CHAR_SPACER`,
 /// wrapped or stale). This walks the same iterator `search_next` walks, with the same start, end
 /// and stop condition (`search_bounds`), but gives up after more matches than the grid has cells.
-/// feathercritty ends such iterations (fork change 5), so on its side this returns `true` without
-/// walking; keep it while the oracle runs 0.26.0 and remove it once the oracle release fixes the
-/// cycle too.
+/// feathercritty ends such iterations (fork change 5), so on its side this answers `Probe::Ends`
+/// without walking; keep it while the oracle runs 0.26.0 and remove it once the oracle release
+/// fixes the cycle too.
 ///
 /// A single search inside the iterator can also run forever in 0.26.0, and that cannot be bounded
-/// from outside. On the oracle side this therefore also answers `false`, without searching, when
-/// the iterator's searches can jump over its end (`first_search_misses_end`), even though 0.26.0
-/// still terminates there when it finds its match first. feathercritty's answer is then checked on
-/// its own (fork change 5). `project::search_window` moves the windows of leftward searches
-/// with `max_lines` off such ends instead; this catches the remaining ones (unbounded leftward
-/// searches and rightward searches).
+/// from outside. On the oracle side this therefore also answers `Probe::Never`, without searching,
+/// when the iterator's searches can jump over its end (`first_search_misses_end`), even though
+/// 0.26.0 still terminates there when it finds its match first. feathercritty's answer is then
+/// checked on its own (fork change 5). `project::search_window` moves the windows of leftward
+/// searches with `max_lines` off such ends instead; this catches the remaining ones (unbounded
+/// leftward searches and rightward searches).
 fn search_terminates(
     term: &Term<VoidListener>,
     regex: &mut RegexSearch,
@@ -197,13 +197,28 @@ fn search_terminates(
     direction: Direction,
     side: KSide,
     max_lines: Option<usize>,
-) -> (bool, Option<Walk>) {
+) -> (Probe, Option<Walk>) {
     // feathercritty's searches always return (fork change 5: its iteration ends where 0.26.0's
     // would repeat forever), and `check_search` checks its answers, so its side does not walk the
     // iterator here. Its `RegexIter` yields 0.26.0's matches, repeats included, until its cycle
     // check notices the repeat, which can take more than the limit below.
     if !ORACLE {
-        return (true, None);
+        return (Probe::Ends, None);
+    }
+
+    // Workaround for a 0.26.0 bug: going left from a wide char spacer at column 0 (a stale one),
+    // `expand_wide` subtracts from column 0. 0.26.0 panics there in debug builds and goes on from
+    // a wrapped-around column in release builds; both builds are answered "panics", here for the
+    // origin of `search_next` (no match produced) and in the walk below after a match
+    // (differential soak seed 30001812). feathercritty answers there (fork change 5). Remove this
+    // once upstream's `expand_wide` handles column 0.
+    let underflows = |p: Point| {
+        direction == Direction::Left
+            && p.column == Column(0)
+            && cell_at(term.grid(), p).flags.contains(Flags::WIDE_CHAR_SPACER)
+    };
+    if underflows(origin) {
+        return (Probe::Panics, Some(Vec::new()));
     }
 
     // On the oracle side, searches 0.26.0 cannot run sensibly are answered "does not terminate":
@@ -216,23 +231,31 @@ fn search_terminates(
     let leaves_grid = origin_leaves_grid(term, origin, direction);
     let (origin, start, end, _) = search_bounds(term, origin, direction, max_lines);
     if first_search_misses_end(term, end, direction) {
-        return (false, None);
+        return (Probe::Never, None);
     }
+    let ends = if leaves_grid { Probe::Never } else { Probe::Ends };
 
     // The walk also records every match 0.26.0 yields: where its answer is off, feathercritty may
     // answer with one of them (fork change 5, `check_search_walked`). Each step depends only on
     // its origin, and the next origin only on the match, so a repeated match means the iteration
     // cycles forever: the walk stops there, with every match before the repeat recorded. The
-    // limit covers every origin once.
+    // limit covers every origin once. Where 0.26.0 panics moving its origin past a match
+    // (`underflows`, or any other panic in the iterator), the walk ends with the matches yielded
+    // before the panic, and feathercritty's answer is checked against them (fork change 5).
     let limit = term.total_lines() * term.columns() + 2;
     let mut walked = Vec::new();
     let mut seen = HashSet::new();
     let mut matches = RegexIter::new(start, end, direction, term, regex);
     for _ in 0..limit {
-        let Some(found) = matches.next() else { return (!leaves_grid, Some(walked)) };
+        let Ok(next) = catch(|| matches.next()) else { return (Probe::Panics, Some(walked)) };
+        let Some(found) = next else { return (ends, Some(walked)) };
+        // A debug build panics inside `next` before yielding this match (caught above).
+        if *found.end() != end && underflows(*found.end()) {
+            return (Probe::Panics, Some(walked));
+        }
         let found_pt = (pt(*found.start()), pt(*found.end()));
         if !seen.insert(found_pt) {
-            return (false, Some(walked));
+            return (Probe::Never, Some(walked));
         }
         walked.push(found_pt);
         let point = match side {
@@ -252,10 +275,21 @@ fn search_terminates(
             },
         };
         if stop {
-            return (!leaves_grid, Some(walked));
+            return (ends, Some(walked));
         }
     }
-    (false, Some(walked))
+    (Probe::Never, Some(walked))
+}
+
+/// What `search_terminates` found out about 0.26.0's `search_next`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Probe {
+    /// It returns; run it.
+    Ends,
+    /// It would never return, or its origin leaves the grid.
+    Never,
+    /// It panics (in debug builds; see `search_terminates`).
+    Panics,
 }
 
 /// Whether 0.26.0's searches towards `end` (the first search of every `RegexIter` step) can step
@@ -457,11 +491,13 @@ impl Side {
         guarded(|| match RegexSearch::new(&search.pattern) {
             Ok(mut regex) => {
                 if probe {
-                    let (terminates, walked) =
+                    let (probe, walked) =
                         search_terminates(term, &mut regex, origin, direction, side, max_lines);
                     *self.walks.borrow_mut().last_mut().unwrap() = walked;
-                    if !terminates {
-                        return QAns::NoTermination;
+                    match probe {
+                        Probe::Ends => (),
+                        Probe::Never => return QAns::NoTermination,
+                        Probe::Panics => return QAns::Panicked,
                     }
                 }
                 let found = term.search_next(&mut regex, origin, direction, side, max_lines);
@@ -824,8 +860,8 @@ impl Side {
     }
 
     /// Whether a 0.26.0 `search_next` answer is one fork change 5 may change: the search did
-    /// not terminate, or its match lies (at least partly) outside the searched range because
-    /// 0.26.0 missed the range's end and wrapped around, or its origin leaves the grid
+    /// not terminate or panicked, or its match lies (at least partly) outside the searched range
+    /// because 0.26.0 missed the range's end and wrapped around, or its origin leaves the grid
     /// (`origin_leaves_grid`), whatever 0.26.0 answered.
     pub fn oracle_search_is_off(&self, search: &SearchQ, answer: &QAns) -> bool {
         let direction = if search.right { Direction::Right } else { Direction::Left };
@@ -833,7 +869,9 @@ impl Side {
             return true;
         }
         match answer {
-            QAns::NoTermination => true,
+            // 0.26.0 panics going left from a stale wide char spacer at column 0 (`expand_wide`;
+            // soak seed 30001812); feathercritty answers there (fork change 5).
+            QAns::NoTermination | QAns::Panicked => true,
             QAns::Match(Some((start, end))) => {
                 !self.match_in_range(search, search.max_lines, *start, *end)
             },
