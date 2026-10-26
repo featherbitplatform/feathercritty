@@ -10,7 +10,7 @@ in it.
 
 - Date: 2026-10-25
 - Machine: Apple M5 Max, macOS (Darwin 27.0.0), rustc 1.99.1 (58cf8f9c3 2026-10-13), release profile
-- Library code: as of `5e53307` (the release commit after it changes only docs, tests, the bench
+- Library code: as of `8766119` (the release commit after it changes only docs, tests, the bench
   harness and one `debug_assert!`, so the release build measured is the released code)
 - Comparison crate: the differential test's oracle, the published 0.26.0 source vendored at
   `tests/oracle/` with the two patches of `tests/oracle/PATCHES.md` (neither touches a timed path)
@@ -256,7 +256,7 @@ the byte copy) had 100,000-line rewraps of 44 to 69 ms.
 
 ## Baseline on identical code (formerly `benches/BASELINE.md`)
 
-Before the compact store (commit `25f82f3`, the fork's library identical to 0.26.0 apart from
+Before the compact store (commit `05dd594`, the fork's library identical to 0.26.0 apart from
 changes 1 to 5) the same binaries measured every ingest ratio between 0.96 and 1.05 (one
 alt-screen row, at 1.017, missed its 1% gate), every read ratio between 0.96 and 1.02, and 3,309 bytes per history
 row for both crates whatever the content (126 columns of 24-byte cells plus the row header). It
