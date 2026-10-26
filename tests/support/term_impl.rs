@@ -23,7 +23,7 @@ use k::vi_mode::{ViModeCursor, ViMotion};
 use k::vte::ansi::Processor;
 
 use crate::support::project::{
-    CellP, CursorP, LinkP, Panicked, QAns, QueryPlan, SearchQ, Snapshot, VI_MOTIONS,
+    CellP, CursorP, LinkP, Panicked, QAns, QueryPlan, SearchQ, Snapshot, VI_MOTIONS, Walk, WalkEnd,
 };
 use crate::support::{Pt, SelTy, Start, Step, catch};
 
@@ -51,9 +51,6 @@ const MOTIONS: [ViMotion; VI_MOTIONS] = [
     ViMotion::ParagraphUp,
     ViMotion::ParagraphDown,
 ];
-
-/// The matches 0.26.0's iterator yielded in one probed search (`search_terminates`).
-pub type Walk = Vec<(Pt, Pt)>;
 
 /// One terminal and its parser.
 pub struct Side {
@@ -218,7 +215,7 @@ fn search_terminates(
             && cell_at(term.grid(), p).flags.contains(Flags::WIDE_CHAR_SPACER)
     };
     if underflows(origin) {
-        return (Probe::Panics, Some(Vec::new()));
+        return (Probe::Panics, Some(Walk { matches: Vec::new(), end: WalkEnd::Panics }));
     }
 
     // On the oracle side, searches 0.26.0 cannot run sensibly are answered "does not terminate":
@@ -235,27 +232,40 @@ fn search_terminates(
     }
     let ends = if leaves_grid { Probe::Never } else { Probe::Ends };
 
-    // The walk also records every match 0.26.0 yields: where its answer is off, feathercritty may
-    // answer with one of them (fork change 5, `check_search_walked`). Each step depends only on
-    // its origin, and the next origin only on the match, so a repeated match means the iteration
-    // cycles forever: the walk stops there, with every match before the repeat recorded. The
-    // limit covers every origin once. Where 0.26.0 panics moving its origin past a match
-    // (`underflows`, or any other panic in the iterator), the walk ends with the matches yielded
-    // before the panic, and feathercritty's answer is checked against them (fork change 5).
+    // The walk also records every match 0.26.0 yields: where its answer is off, feathercritty
+    // answers from them (fork change 5, `check_search_walked`, `Walk::answer`). Each step depends
+    // only on its origin, and the next origin only on the match, so a repeated match means the
+    // iteration cycles forever, unless it ends right there (the repeat came from a search started
+    // at the range's end, which sets `done`): the walk stops at the first repeat, with every match
+    // before it recorded. The limit covers every origin once. Where 0.26.0 panics moving its
+    // origin past a match (`underflows`), the walk ends with the matches yielded before the panic.
     let limit = term.total_lines() * term.columns() + 2;
     let mut walked = Vec::new();
     let mut seen = HashSet::new();
     let mut matches = RegexIter::new(start, end, direction, term, regex);
+    let walk = |matches, end| Some(Walk { matches, end });
     for _ in 0..limit {
-        let Ok(next) = catch(|| matches.next()) else { return (Probe::Panics, Some(walked)) };
-        let Some(found) = next else { return (ends, Some(walked)) };
+        let found = match catch_classified(|| matches.next()) {
+            Ok(Some(found)) => found,
+            Ok(None) => return (ends, walk(walked, WalkEnd::Ended)),
+            Err(Probe::Panics) => return (Probe::Panics, walk(walked, WalkEnd::Panics)),
+            Err(probe) => return (probe, walk(walked, WalkEnd::Hangs)),
+        };
         // A debug build panics inside `next` before yielding this match (caught above).
         if *found.end() != end && underflows(*found.end()) {
-            return (Probe::Panics, Some(walked));
+            return (Probe::Panics, walk(walked, WalkEnd::Panics));
         }
         let found_pt = (pt(*found.start()), pt(*found.end()));
         if !seen.insert(found_pt) {
-            return (Probe::Never, Some(walked));
+            // A repeated match is never one `search_next` stops at (the earlier one would have
+            // been), so the iteration either ends now or cycles.
+            return match catch_classified(|| matches.next()) {
+                Ok(None) => {
+                    walked.push(found_pt);
+                    (ends, walk(walked, WalkEnd::Ended))
+                },
+                _ => (Probe::Never, walk(walked, WalkEnd::Repeats)),
+            };
         }
         walked.push(found_pt);
         let point = match side {
@@ -275,10 +285,37 @@ fn search_terminates(
             },
         };
         if stop {
-            return (ends, Some(walked));
+            return (ends, walk(walked, WalkEnd::Found));
         }
     }
-    (Probe::Never, Some(walked))
+    (Probe::Never, walk(walked, WalkEnd::Repeats))
+}
+
+/// Run one step of 0.26.0's iterator in `search_terminates`, classifying a panic by its message:
+/// - `attempt to subtract with overflow`: `expand_wide` going left from a wide char spacer at
+///   column 0 (`underflows`; the only subtraction on the search paths that can overflow there),
+///   [`Probe::Panics`];
+/// - `attempt to add with overflow`: `regex_search_internal`'s `consumed_bytes` (an `i32`)
+///   overflowing in a debug build, after about 2^31 bytes of a search that never ends (a release
+///   build reads on forever), [`Probe::Never`];
+/// - anything else is a 0.26.0 panic this harness does not know: it is raised again, so the query
+///   answers `Panicked` without a walk and is compared for equality (`oracle_search_is_off`), which
+///   fails and shows it.
+fn catch_classified<R>(f: impl FnOnce() -> R) -> Result<R, Probe> {
+    catch(f).map_err(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|m| m.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        if message.contains("attempt to subtract with overflow") {
+            Probe::Panics
+        } else if message.contains("attempt to add with overflow") {
+            Probe::Never
+        } else {
+            std::panic::resume_unwind(payload)
+        }
+    })
 }
 
 /// What `search_terminates` found out about 0.26.0's `search_next`.
@@ -553,6 +590,11 @@ impl Side {
         self.walks.borrow().get(k).cloned().flatten()
     }
 
+    /// The walk of the last probed search (see `walk`).
+    pub fn last_walk(&self) -> Option<Walk> {
+        self.walks.borrow().last().cloned().flatten()
+    }
+
     /// The cells after `p` that a rightward search reads or steps over together with it, as
     /// `skip_fullwidth` in feathercritty's `src/term/search.rs` does (`Term::glyph_end` there):
     /// the two cells after a `LEADING_WIDE_CHAR_SPACER` (wrapped: the wide character and its
@@ -819,59 +861,67 @@ impl Side {
         self.check_search_walked(search, max_lines, answer, None)
     }
 
-    /// `check_search`, given the matches 0.26.0's own iteration yielded for this search
-    /// (`walked`, from `search_terminates` on the oracle side). Fork change 5 answers, where
-    /// 0.26.0 has no in-range answer, with the last in-range match that iteration produced, or
-    /// `None`. So with `walked`:
-    /// - a match must lie in the range and be one of `walked` (exactly; the text is 0.26.0's
-    ///   reading, which can differ from `read` when its two searches read a stale spacer or a wide
-    ///   char without its spacer differently: soak seed 10009868, `search_grid_probe` grid 133174);
-    /// - `None` is accepted only when no match in `walked` lies in the range.
+    /// `check_search`, given 0.26.0's own iteration for this search (`walked`, from
+    /// `search_terminates` on the oracle side). Where 0.26.0 has no in-range answer, fork change 5
+    /// answers with upstream's choice if that lies in the range, else with the last in-range match
+    /// the iteration produced (up to its first repeated match, or up to where it panics), or
+    /// `None`; with `walked` the answer must equal that one (`Walk::answer`). The match is compared
+    /// exactly, not by its text: 0.26.0's two searches can read a stale spacer or a wide char
+    /// without its spacer differently from either single reading (soak seed 10009868,
+    /// `search_grid_probe` grid 133174).
     ///
-    /// Without `walked` (0.26.0's iteration was not walked: `origin_leaves_grid`,
-    /// `first_search_misses_end`, or a window moved for 0.26.0), it is `check_search`.
+    /// Without `walked` (0.26.0's iteration was not walked: `first_search_misses_end`, or a window
+    /// moved for 0.26.0), it is `check_search`.
     pub fn check_search_walked(
         &self,
         search: &SearchQ,
         max_lines: Option<usize>,
         answer: &QAns,
-        walked: Option<&[(Pt, Pt)]>,
+        walked: Option<&Walk>,
     ) -> Result<(), String> {
         let in_range =
             |&(start, end): &(Pt, Pt)| self.match_in_range(search, max_lines, start, end);
         match (answer, walked) {
-            (QAns::Match(None), None) => Ok(()),
-            (QAns::Match(None), Some(walked)) => match walked.iter().find(|m| in_range(m)) {
-                Some(m) => Err(format!("no match, but 0.26.0's iteration yielded {m:?} in range")),
-                None => Ok(()),
+            (QAns::Match(answer), Some(walked)) => {
+                let expected = walked.answer(in_range);
+                if *answer == expected {
+                    Ok(())
+                } else {
+                    Err(format!("expected {expected:?} from 0.26.0's iteration (fork change 5)"))
+                }
             },
-            (QAns::Match(Some(m)), walked) => {
+            (QAns::Match(None), None) => Ok(()),
+            (QAns::Match(Some(m)), None) => {
                 if !in_range(m) {
                     return Err("the match lies outside the searched range".to_owned());
                 }
-                match walked {
-                    Some(walked) if walked.contains(m) => Ok(()),
-                    Some(_) => Err("the match is not one 0.26.0's iteration yielded".to_owned()),
-                    None => self.is_real_match(&search.pattern, m.0, m.1),
-                }
+                self.is_real_match(&search.pattern, m.0, m.1)
             },
             (other, _) => Err(format!("expected a search result, got {other:?}")),
         }
     }
 
     /// Whether a 0.26.0 `search_next` answer is one fork change 5 may change: the search did
-    /// not terminate or panicked, or its match lies (at least partly) outside the searched range
-    /// because 0.26.0 missed the range's end and wrapped around, or its origin leaves the grid
-    /// (`origin_leaves_grid`), whatever 0.26.0 answered.
-    pub fn oracle_search_is_off(&self, search: &SearchQ, answer: &QAns) -> bool {
+    /// not terminate, or its match lies (at least partly) outside the searched range because
+    /// 0.26.0 missed the range's end and wrapped around, or its origin leaves the grid
+    /// (`origin_leaves_grid`), whatever 0.26.0 answered, or it panicked where `search_terminates`
+    /// predicts it (`walked` then ends in [`WalkEnd::Panics`]). Any other panic is compared like
+    /// an answer, so a 0.26.0 panic the harness does not know fails the run.
+    pub fn oracle_search_is_off(
+        &self,
+        search: &SearchQ,
+        answer: &QAns,
+        walked: Option<&Walk>,
+    ) -> bool {
         let direction = if search.right { Direction::Right } else { Direction::Left };
         if origin_leaves_grid(&self.term, self.point(search.origin), direction) {
             return true;
         }
         match answer {
+            QAns::NoTermination => true,
             // 0.26.0 panics going left from a stale wide char spacer at column 0 (`expand_wide`;
             // soak seed 30001812); feathercritty answers there (fork change 5).
-            QAns::NoTermination | QAns::Panicked => true,
+            QAns::Panicked => walked.is_some_and(|walk| walk.end == WalkEnd::Panics),
             QAns::Match(Some((start, end))) => {
                 !self.match_in_range(search, search.max_lines, *start, *end)
             },

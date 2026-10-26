@@ -274,9 +274,8 @@ impl<T> Term<T> {
     /// match), unless the iteration hit the bound (`RegexIter::bound_fired`: upstream loops or
     /// panics) or that answer lies outside the searched range (`match_in_range`); then the last
     /// match inside the range that the iteration produced, or `None`. An iteration that upstream
-    /// repeats forever counts up to the point where it starts repeating
-    /// (`last_in_range_before_repeat`), so the answer does not depend on where the cycle check
-    /// happened to notice the repeat.
+    /// repeats forever counts up to its first repeated match (`last_in_range_before_repeat`), so
+    /// the answer does not depend on where the cycle check happened to notice the repeat.
     ///
     /// feathercritty: not in upstream; fork change 5. Upstream wrote
     /// `regex_iter.peekable()`, `peek()?` for the first match and
@@ -330,13 +329,19 @@ impl<T> Term<T> {
         if in_range(&regex_match) { Some(regex_match) } else { last_in_range }
     }
 
-    /// The last match inside the range among those an iteration yields before it first returns
-    /// to an origin it already searched from, given the length of the cycle it then repeats.
+    /// The last match inside the range among those an iteration yields before its first repeated
+    /// match, given the length of the cycle it then repeats.
     ///
     /// feathercritty: not in upstream; see `final_match`. The second half of Brent's cycle
     /// search: one iteration runs `cycle` steps ahead of another, and the first origin they share
-    /// is where the repeating part starts. `None` if a search of the rerun ended early (its cache
-    /// gave up); `Some(None)` if no match before the repeat lies in the range.
+    /// is where the repeating origins start. Each origin follows from the match before it (`skip`
+    /// from its end), so the matches repeat from the same point or one step earlier: when the
+    /// matches just before that shared origin are equal too, the last of the `cycle` matches
+    /// after it is already a repeat and is not counted. The answer is then the last in-range match
+    /// among the distinct matches the iteration yields, the same cut-off as the differential
+    /// test's walk of 0.26.0's iteration (first repeated match). `None` if a search of the rerun
+    /// ended early (its cache gave up); `Some(None)` if no match before the repeat lies in the
+    /// range.
     fn last_in_range_before_repeat(
         &self,
         mut regex: RegexSearch,
@@ -354,17 +359,20 @@ impl<T> Term<T> {
         }
 
         let mut last_in_range = None;
-        let mut keep = |regex_match: Match| {
-            if in_range(&regex_match) {
-                last_in_range = Some(regex_match);
+        let mut keep = |regex_match: &Match| {
+            if in_range(regex_match) {
+                last_in_range = Some(regex_match.clone());
             }
         };
+        // Whether the matches just before the first shared origin are equal.
+        let mut repeated = false;
         while iter.point != ahead.point {
-            keep(iter.next()?);
-            ahead.next()?;
+            let regex_match = iter.next()?;
+            keep(&regex_match);
+            repeated = ahead.next()? == regex_match;
         }
-        for _ in 0..cycle {
-            keep(iter.next()?);
+        for _ in 0..cycle - usize::from(repeated) {
+            keep(&iter.next()?);
         }
         Some(last_in_range)
     }
@@ -2619,6 +2627,39 @@ mod tests {
                 next_match(term, "[^ ]+ ?", origin, Direction::Left, Side::Left, max_lines);
             assert_eq!(result, None, "{max_lines:?}");
         }
+    }
+
+    #[test]
+    fn repeat_from_range_end_ends_iteration() {
+        // Search fix 3 re-review 3, probe-style grid 345. 0.26.0's iteration from (8,2) to (7,0)
+        // yields (7,2), then (7,0)..=(7,1) from (7,1), then (7,0)..=(7,1) again from (7,0): that
+        // origin is the range's end, so the iteration ends there (`done`) although its last match
+        // repeats an earlier one. 0.26.0 terminates with its first match, (7,2)..=(7,2), in range,
+        // and the answer is 0.26.0's (the differential test's walk used to read the repeat as an
+        // endless cycle).
+        #[rustfmt::skip]
+        let rows = [
+            ("aa ", "..r"),
+            ("abb", "..."),
+            ("b符 ", ".W."),
+            ("中 x", "Ws."),
+            ("中  ", "WsL"),
+            ("符aa", "W.."),
+            ("中  ", "WsL"),
+            ("符ab", "W.r"),
+            ("中  ", "Ws."),
+            (" ba", "..."),
+        ];
+        let start = Point::new(Line(8), Column(2));
+        let end = Point::new(Line(7), Column(0));
+        let result = iterate(term_from_rows(0, &rows), "b|符", start, end, Direction::Left);
+        let matches = vec![span((7, 2), (7, 2)), span((7, 0), (7, 1)), span((7, 0), (7, 1))];
+        assert_eq!(result, (matches, false));
+
+        let origin = Point::new(Line(6), Column(2));
+        let term = term_from_rows(0, &rows);
+        let result = next_match(term, "b|符", origin, Direction::Left, Side::Right, Some(1));
+        assert_eq!(result, Some(span((7, 2), (7, 2))));
     }
 
     #[test]

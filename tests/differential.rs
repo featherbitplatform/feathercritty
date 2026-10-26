@@ -199,8 +199,11 @@ fn oracle_sees_fork_change_5() {
                             .expect("feathercritty search_next did not terminate");
                         let oracle = b.search(&search, window, true);
                         // Checked whenever 0.26.0 is off, even if both answers are equal.
-                        if b.oracle_search_is_off(&search, &oracle) {
-                            if let Err(why) = a.check_search(&search, window, &fork) {
+                        let walked = b.last_walk();
+                        if b.oracle_search_is_off(&search, &oracle, walked.as_ref()) {
+                            if let Err(why) =
+                                a.check_search_walked(&search, window, &fork, walked.as_ref())
+                            {
                                 panic!("{why}: {search:?}: fork {fork:?}, 0.26.0 {oracle:?}");
                             }
                             off += 1;
@@ -347,9 +350,9 @@ fn search_soak_regressions() {
 enum GridOutcome {
     /// 0.26.0 answered in range, and feathercritty gave the same answer.
     Equal,
-    /// 0.26.0 cannot answer (or its oracle search timed out); feathercritty's answer passed its
-    /// own check.
-    Off { timed_out: bool },
+    /// 0.26.0 cannot answer (or its oracle search timed out, or it panicked); feathercritty's
+    /// answer passed its own check.
+    Off { timed_out: bool, panicked: bool },
 }
 
 /// Compare `search_next` on two sides holding the same grid, as `run` does: equal answers where
@@ -371,16 +374,16 @@ fn compare_on_grid(
         Some((oracle, walked)) => (oracle, walked, false),
         None => (QAns::NoTermination, None, true),
     };
-    if !b.oracle_search_is_off(search, &oracle) {
+    if !b.oracle_search_is_off(search, &oracle, walked.as_ref()) {
         return if fork == oracle {
             Ok(GridOutcome::Equal)
         } else {
             Err(format!("fork {fork:?}, 0.26.0 {oracle:?}"))
         };
     }
-    a.check_search_walked(search, max_lines, &fork, walked.as_deref())
+    a.check_search_walked(search, max_lines, &fork, walked.as_ref())
         .map_err(|why| format!("{why}; fork {fork:?}, 0.26.0 {oracle:?}, walked {walked:?}"))?;
-    Ok(GridOutcome::Off { timed_out })
+    Ok(GridOutcome::Off { timed_out, panicked: oracle == QAns::Panicked })
 }
 
 /// Grids from `search_grid_probe` runs at higher counts that once failed. Grid 133174
@@ -408,6 +411,36 @@ fn search_grid_regressions() {
     let (a, b) = (fc::Side::from_rows(&rows), ac::Side::from_rows(&rows));
     let outcome = compare_on_grid(&a, &b, &search).unwrap_or_else(|why| panic!("{why}"));
     assert!(matches!(outcome, GridOutcome::Off { .. }));
+
+    // Search fix 3 re-review 3, grid 345: 0.26.0's iteration ends on a search started at the
+    // range's end that repeats an earlier match; 0.26.0 terminates in range, so the answers are
+    // compared (the walk used to read the repeat as an endless cycle).
+    let rows: Vec<(String, String)> = [
+        ("aa ", "..r"),
+        ("abb", "..."),
+        ("b符 ", ".W."),
+        ("中 x", "Ws."),
+        ("中  ", "WsL"),
+        ("符aa", "W.."),
+        ("中  ", "WsL"),
+        ("符ab", "W.r"),
+        ("中  ", "Ws."),
+        (" ba", "..."),
+    ]
+    .iter()
+    .map(|(t, f)| (t.to_string(), f.to_string()))
+    .collect();
+    let search = SearchQ {
+        pattern: "b|符".to_owned(),
+        origin: Pt::new(6, 2),
+        right: false,
+        side_right: true,
+        max_lines: Some(1),
+        unmoved: None,
+    };
+    let (a, b) = (fc::Side::from_rows(&rows), ac::Side::from_rows(&rows));
+    let outcome = compare_on_grid(&a, &b, &search).unwrap_or_else(|why| panic!("{why}"));
+    assert!(matches!(outcome, GridOutcome::Equal));
 }
 
 /// Hand-built small grids with wide characters, wide characters without their spacer, and
@@ -426,8 +459,8 @@ fn search_grid_probe() {
 
     let grids = support::seed_count(300) * 5;
     let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x5ea2c4);
-    let patterns = ["[^ ]+ ?", "[^ ]+", " ", "  ", "a", "中", "a ?中", "b|符"];
-    let (mut equal, mut off, mut hangs) = (0, 0, 0);
+    let patterns = ["[^ ]+ ?", "[^ ]+", " ", "  ", "a", "中", "a ?中", "b|符", " ?[ab]", "[^a]"];
+    let (mut equal, mut off, mut hangs, mut panics) = (0, 0, 0, 0);
     for grid in 0..grids {
         let columns = rng.gen_range(2..=3usize);
         let lines = rng.gen_range(3..=10usize);
@@ -449,6 +482,12 @@ fn search_grid_probe() {
                 } else if kind == 3 && column + 1 == columns {
                     text.push(' ');
                     flags.push(if rng.gen_bool(0.7) { 'L' } else { 'l' });
+                    column += 1;
+                } else if kind == 4 && rng.gen_bool(0.6) {
+                    // A stale spacer, at any column (0.26.0 panics going left from one at column
+                    // 0: fork change 5, rule 5).
+                    text.push(' ');
+                    flags.push('s');
                     column += 1;
                 } else {
                     text.push(['a', 'b', ' ', 'x'][rng.gen_range(0..4)]);
@@ -483,16 +522,20 @@ fn search_grid_probe() {
             };
             match compare_on_grid(&a, &b, &search) {
                 Ok(GridOutcome::Equal) => equal += 1,
-                Ok(GridOutcome::Off { timed_out }) => {
+                Ok(GridOutcome::Off { timed_out, panicked }) => {
                     off += 1;
                     hangs += usize::from(timed_out);
+                    panics += usize::from(panicked);
                 },
                 Err(why) => panic!("grid {grid} {rows:?}: {search:?}: {why}"),
             }
         }
     }
-    println!("search_grid_probe: {equal} equal, {off} checked alone ({hangs} oracle timeouts)");
-    assert!(equal > off && off > 0);
+    println!(
+        "search_grid_probe: {equal} equal, {off} checked alone ({hangs} oracle timeouts, {panics} \
+         0.26.0 panics)"
+    );
+    assert!(equal > off && off > 0 && panics > 0);
 }
 
 /// The oracle compares cells in history, not only the screen.

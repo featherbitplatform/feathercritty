@@ -416,10 +416,10 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
         for (k, search) in plan.searches.iter().enumerate() {
             assert_eq!((qa[first + k].0, qb[first + k].0), ("search_next", "search_next"));
             let (fork, oracle) = (&qa[first + k].1, &qb[first + k].1);
-            if b.oracle_search_is_off(search, oracle) {
-                let walked = b.walk(k);
+            let walked = b.walk(k);
+            if b.oracle_search_is_off(search, oracle, walked.as_ref()) {
                 if let Err(why) =
-                    a.check_search_walked(search, search.max_lines, fork, walked.as_deref())
+                    a.check_search_walked(search, search.max_lines, fork, walked.as_ref())
                 {
                     let diff = format!(
                         "search_next where 0.26.0 cannot answer (fork change 5): feathercritty \

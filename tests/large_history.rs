@@ -518,8 +518,9 @@ fn compare(phase: &str, a: &mut fc::Side, b: &mut ac::Side, plan: &QueryPlan) {
         // Fork change 5: where 0.26.0 cannot answer a search, the fork's answer is checked on
         // its own, as `support::run` does.
         if let Some(search) = i.checked_sub(first).and_then(|k| plan.searches.get(k)) {
-            if b.oracle_search_is_off(search, rb) {
-                a.check_search(search, search.max_lines, ra)
+            let walked = b.walk(i - first);
+            if b.oracle_search_is_off(search, rb, walked.as_ref()) {
+                a.check_search_walked(search, search.max_lines, ra, walked.as_ref())
                     .unwrap_or_else(|why| panic!("{phase}: {name} {search:?}: {why}"));
                 oracle_off += 1;
                 continue;
