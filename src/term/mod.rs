@@ -79,6 +79,8 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        // feathercritty: DEC private mode 2027, grapheme clusters in one cell; not upstream.
+        const GRAPHEME_CLUSTER        = 1 << 23;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -353,6 +355,12 @@ pub struct Config {
 
     /// OSC52 support mode.
     pub osc52: Osc52,
+
+    /// Whether DEC private mode 2027 (grapheme clusters) is set when the terminal is created
+    /// and after a full reset. Changing it on a live terminal never flips the mode.
+    ///
+    /// feathercritty: not upstream.
+    pub grapheme_clusters: bool,
 }
 
 impl Default for Config {
@@ -364,6 +372,7 @@ impl Default for Config {
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            grapheme_clusters: false,
         }
     }
 }
@@ -424,7 +433,7 @@ impl<T> Term<T> {
         // Initialize terminal damage, covering the entire terminal upon launch.
         let damage = TermDamageState::new(num_cols, num_lines);
 
-        Term {
+        let mut term = Term {
             inactive_grid,
             scroll_region,
             event_proxy,
@@ -443,7 +452,19 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
-        }
+        };
+        // feathercritty: upstream returns the struct directly; mode 2027 takes its default.
+        term.reset_grapheme_cluster_mode();
+        term
+    }
+
+    /// Set or clear DEC private mode 2027 (grapheme clusters) to the configured default
+    /// ([`Config::grapheme_clusters`]), as a full reset does. Meant for a new program taking
+    /// over an existing terminal, so it never inherits the mode from the one before.
+    ///
+    /// feathercritty: not upstream.
+    pub fn reset_grapheme_cluster_mode(&mut self) {
+        self.mode.set(TermMode::GRAPHEME_CLUSTER, self.config.grapheme_clusters);
     }
 
     /// Collect the information about the changes in the lines, which
@@ -1983,6 +2004,8 @@ impl<T: EventListener> Handler for Term<T> {
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
         self.mode.insert(TermMode::default());
+        // feathercritty: mode 2027 returns to its configured default; not upstream.
+        self.reset_grapheme_cluster_mode();
 
         self.event_proxy.send_event(Event::CursorBlinkingChange);
         self.mark_fully_damaged();
@@ -2065,6 +2088,11 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            // feathercritty: vte has no named variant for mode 2027; not upstream.
+            PrivateMode::Unknown(2027) => {
+                self.mode.insert(TermMode::GRAPHEME_CLUSTER);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2128,6 +2156,11 @@ impl<T: EventListener> Handler for Term<T> {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            // feathercritty: vte has no named variant for mode 2027; not upstream.
+            PrivateMode::Unknown(2027) => {
+                self.mode.remove(TermMode::GRAPHEME_CLUSTER);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in unset_private_mode");
                 return;
@@ -2215,6 +2248,8 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
+            // feathercritty: mode 2027 is reported; not upstream.
+            PrivateMode::Unknown(2027) => self.mode.contains(TermMode::GRAPHEME_CLUSTER).into(),
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
@@ -3527,5 +3562,96 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    // feathercritty: tests for grapheme clusters (DEC private mode 2027); not upstream.
+    mod clusters {
+        use std::sync::{Arc, Mutex};
+
+        use super::*;
+        use crate::event::{Event, EventListener};
+        use crate::vte::ansi::Processor;
+
+        /// Collects what the terminal writes back to the program.
+        #[derive(Clone, Default)]
+        pub(super) struct Replies(Arc<Mutex<Vec<String>>>);
+
+        impl EventListener for Replies {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(text) = event {
+                    self.0.lock().unwrap().push(text);
+                }
+            }
+        }
+
+        pub(super) fn term_with(config: Config, cols: usize, lines: usize) -> Term<Replies> {
+            Term::new(config, &TermSize::new(cols, lines), Replies::default())
+        }
+
+        pub(super) fn feed<T: EventListener>(term: &mut Term<T>, bytes: &[u8]) {
+            let mut parser: Processor = Processor::new();
+            parser.advance(term, bytes);
+        }
+
+        fn on(term: &Term<Replies>) -> bool {
+            term.mode().contains(TermMode::GRAPHEME_CLUSTER)
+        }
+
+        #[test]
+        fn mode_2027_is_reset_by_default() {
+            let term = term_with(Config::default(), 10, 2);
+            assert!(!on(&term));
+        }
+
+        #[test]
+        fn mode_2027_set_and_reset() {
+            let mut term = term_with(Config::default(), 10, 2);
+            feed(&mut term, b"\x1b[?2027h");
+            assert!(on(&term));
+            feed(&mut term, b"\x1b[?2027l");
+            assert!(!on(&term));
+        }
+
+        #[test]
+        fn mode_2027_reports_state() {
+            let mut term = term_with(Config::default(), 10, 2);
+            let replies = term.event_proxy.clone();
+            feed(&mut term, b"\x1b[?2027$p");
+            feed(&mut term, b"\x1b[?2027h\x1b[?2027$p");
+            assert_eq!(*replies.0.lock().unwrap(), ["\x1b[?2027;2$y", "\x1b[?2027;1$y"]);
+        }
+
+        #[test]
+        fn mode_2027_default_from_config() {
+            let config = Config { grapheme_clusters: true, ..Config::default() };
+            let mut term = term_with(config, 10, 2);
+            assert!(on(&term));
+            feed(&mut term, b"\x1b[?2027l");
+            assert!(!on(&term));
+            feed(&mut term, b"\x1bc");
+            assert!(on(&term));
+        }
+
+        #[test]
+        fn reset_grapheme_cluster_mode_restores_default() {
+            let mut term = term_with(Config::default(), 10, 2);
+            feed(&mut term, b"\x1b[?2027h");
+            term.reset_grapheme_cluster_mode();
+            assert!(!on(&term));
+        }
+
+        #[test]
+        fn set_options_never_flips_mode_2027() {
+            let mut term = term_with(Config::default(), 10, 2);
+            feed(&mut term, b"\x1b[?2027h");
+            term.set_options(Config::default());
+            assert!(on(&term));
+
+            let config = Config { grapheme_clusters: true, ..Config::default() };
+            let mut term = term_with(config.clone(), 10, 2);
+            feed(&mut term, b"\x1b[?2027l");
+            term.set_options(config);
+            assert!(!on(&term));
+        }
     }
 }
