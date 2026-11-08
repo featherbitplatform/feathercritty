@@ -1,6 +1,7 @@
-// feathercritty: new file, not in upstream. Grapheme cluster rules for DEC private mode 2027.
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
 
-//! Grapheme cluster rules used by `Term::input` while DEC private mode 2027 is set.
+//! Grapheme cluster rules used by `Term::input` while DEC private mode 2027 is set
+//! (feathercritty; new file, not in upstream).
 
 use unicode_segmentation::GraphemeCursor;
 use unicode_width::UnicodeWidthChar;
