@@ -88,10 +88,15 @@
 //!
 //! - **Eligibility.** A block should be cold when compression is on, it holds rows, none of them is
 //!   among the `keep_warm` newest (every row has `i >= keep_warm`), and it is not the newest block
-//!   (new records only go there). Each block counts its rows in that warm window (`warm_live`), so
-//!   eligibility is exact even when `update` moved old rows into newer blocks. The counts are kept
-//!   only while compression is on: every path that adds or removes an entry adjusts them behind one
-//!   `Option` check, and switching compression on recounts them.
+//!   (new records only go there). One exception: while the history is full, a warm oldest block
+//!   stays warm, because its rows are the next to be evicted and compressing it would free nothing
+//!   (with `keep_warm` just below the limit, every block would become eligible only then). A cold
+//!   one stays cold, so an eviction never warms the next block. A change that leaves a full history
+//!   not full without evicting (`pop_newest`, `remove_newest`, `pop_oldest`, a raised limit) marks
+//!   the oldest block (`left_full`). Each block counts its rows in that warm window (`warm_live`),
+//!   so eligibility is exact even when `update` moved old rows into newer blocks. The counts are
+//!   kept only while compression is on: every path that adds or removes an entry adjusts them
+//!   behind one `Option` check, and switching compression on recounts them.
 //! - **Jobs, never inline.** Blocks change state only through jobs: [`History::next_job`] copies
 //!   the bytes of the oldest block whose state disagrees with its eligibility, [`Job::run`]
 //!   compresses or decompresses the copy with no access to the history, and [`History::install`]
@@ -475,8 +480,10 @@ impl<T: HistoryCell> History<T> {
     /// the blocks and index capacity they used (keeping at most `MAX_SPARES` spare blocks).
     pub fn set_limit(&mut self, limit: usize) {
         let lower = limit < self.limit;
+        let was_full = self.compression.is_some() && self.index.len() >= self.limit;
         self.limit = limit;
         self.remove_oldest(self.index.len().saturating_sub(limit));
+        self.left_full(was_full);
         if lower {
             self.index.shrink_to(limit);
             self.extras.shrink_to_fit();
@@ -664,7 +671,9 @@ impl<T: HistoryCell> History<T> {
     }
 
     /// Whether the block at `at` in `blocks` should be cold: compression is on, it holds rows,
-    /// none of them is among the `keep_warm` newest, and it is not the newest block.
+    /// none of them is among the `keep_warm` newest, it is not the newest block, and it is not a
+    /// warm oldest block of a full history (its rows are the next to be evicted, so compressing
+    /// it would free nothing; see "Eligibility" in the module docs).
     #[inline]
     fn wants_cold(&self, at: usize) -> bool {
         let block = &self.blocks[at];
@@ -672,6 +681,17 @@ impl<T: HistoryCell> History<T> {
             && block.live > 0
             && block.warm_live == 0
             && at + 1 < self.blocks.len()
+            && (at > 0 || block.cold || self.index.len() < self.limit)
+    }
+
+    /// A change that was not an eviction (`was_full`: compression is on and the history was full
+    /// before it): if it left the history no longer full, its warm oldest block, held back while
+    /// full (see `wants_cold`), may now want to go cold.
+    #[inline]
+    fn left_full(&mut self, was_full: bool) {
+        if was_full && self.index.len() < self.limit && !self.blocks.is_empty() {
+            self.mark(self.front_seq);
+        }
     }
 
     /// Whether the block at `at` holds rows and is not in the state it should be in.
@@ -818,6 +838,7 @@ impl<T: HistoryCell> History<T> {
     /// Remove the newest row into `into` (reusing its allocation when the width matches).
     /// Returns `false`, leaving `into` untouched, when the history is empty.
     pub fn pop_newest(&mut self, into: &mut Row<T>) -> bool {
+        let was_full = self.compression.is_some() && self.index.len() >= self.limit;
         let Some(entry) = self.index.pop_back() else {
             return false;
         };
@@ -826,6 +847,7 @@ impl<T: HistoryCell> History<T> {
         if let Some(keep) = self.compression {
             self.popped(keep, entry);
         }
+        self.left_full(was_full);
         self.release(entry);
         self.extras.truncate(entry.first_extra.wrapping_sub(self.extras_base) as usize);
         true
@@ -839,7 +861,9 @@ impl<T: HistoryCell> History<T> {
         };
 
         self.decode(entry, self.extras_after(0), into);
+        let was_full = self.compression.is_some() && self.index.len() >= self.limit;
         self.remove_oldest(1);
+        self.left_full(was_full);
         true
     }
 
@@ -1034,6 +1058,7 @@ impl<T: HistoryCell> History<T> {
     /// Remove the newest row without decoding it (a reflow dropping rows it truncates). Returns
     /// `false` when the history is empty.
     pub(crate) fn remove_newest(&mut self) -> bool {
+        let was_full = self.compression.is_some() && self.index.len() >= self.limit;
         let Some(entry) = self.index.pop_back() else {
             return false;
         };
@@ -1041,6 +1066,7 @@ impl<T: HistoryCell> History<T> {
         if let Some(keep) = self.compression {
             self.popped(keep, entry);
         }
+        self.left_full(was_full);
         self.release(entry);
         self.extras.truncate(entry.first_extra.wrapping_sub(self.extras_base) as usize);
         true
@@ -2259,7 +2285,8 @@ mod tests {
     }
 
     /// Which blocks should be cold with `keep` warm rows: those holding rows, other than the
-    /// newest block, none of whose rows is among the `keep` newest.
+    /// newest block, none of whose rows is among the `keep` newest, except a warm oldest block
+    /// of a full history.
     fn eligible<T: HistoryCell>(history: &History<T>, keep: usize) -> Vec<bool> {
         let mut eligible: Vec<bool> = history.blocks.iter().map(|block| block.live > 0).collect();
         if let Some(newest) = eligible.last_mut() {
@@ -2267,6 +2294,9 @@ mod tests {
         }
         for entry in history.index.iter().rev().take(keep) {
             eligible[entry.block.wrapping_sub(history.front_seq) as usize] = false;
+        }
+        if history.len() >= history.limit() && history.blocks.front().is_some_and(|b| !b.cold) {
+            eligible[0] = false;
         }
         eligible
     }
@@ -2784,6 +2814,81 @@ mod tests {
         history.set_compression(None);
         assert!(!history.has_jobs());
         assert!(history.cold_blocks().iter().all(|&cold| !cold));
+    }
+
+    /// Feed `rows` varied rows into a history of `limit` rows keeping `keep` warm, on full-size
+    /// blocks, taking every job after each row (a worker that never falls behind); returns the
+    /// jobs taken.
+    fn jobs_over_a_feed(limit: usize, keep: usize, rows: usize) -> (History<usize>, usize) {
+        let mut rng = ChaCha8Rng::seed_from_u64(0xe71c);
+        let mut history = History::with_block_size(limit, DEFAULT_BLOCK_BYTES);
+        history.set_compression(Some(keep));
+        let mut jobs = 0;
+        for _ in 0..rows {
+            history.push_newest(&varied_row(&mut rng));
+            for job in history.next_jobs(8) {
+                jobs += 1;
+                history.install(job.run());
+            }
+        }
+        (history, jobs)
+    }
+
+    /// With the warm rows near the limit (the default scrollback of 10,000 keeps 9,999 warm), a
+    /// block only becomes eligible once its last rows are the next to be evicted: compressing
+    /// it frees nothing, so no job is offered for it. A long scrollback still compresses.
+    #[test]
+    fn blocks_about_to_be_evicted_are_not_compressed() {
+        let (history, jobs) = jobs_over_a_feed(10_000, 9_999, 200_000);
+        assert_eq!(jobs, 0, "jobs for blocks about to be evicted");
+        assert!(!history.has_jobs());
+        assert!(history.cold_blocks().iter().all(|&cold| !cold));
+
+        let (mut history, jobs) = jobs_over_a_feed(100_000, 10_000, 150_000);
+        assert!(jobs > 50, "{jobs} jobs");
+        let cold = history.cold_blocks().iter().filter(|&&cold| cold).count();
+        assert!(cold * 10 > history.cold_blocks().len() * 8, "{cold} cold blocks");
+        run_and_check(&mut history);
+    }
+
+    /// The oldest block held back warm while the history is full goes cold once a change leaves
+    /// the history not full without evicting (a popped newest row, a raised limit).
+    #[test]
+    fn leaving_full_offers_the_held_back_oldest_block() {
+        let full = || {
+            let mut rng = ChaCha8Rng::seed_from_u64(0xf011);
+            let mut history = History::with_block_size(200, TINY);
+            for _ in 0..1000 {
+                history.push_newest(&varied_row(&mut rng));
+            }
+            // Switched on while full: the oldest block is held back.
+            history.set_compression(Some(10));
+            run_and_check(&mut history);
+            assert!(!history.cold_blocks()[0]);
+            assert!(history.cold_blocks()[1]);
+            history
+        };
+
+        let mut history = full();
+        let mut into = Row::default();
+        assert!(history.pop_newest(&mut into));
+        assert!(history.has_jobs());
+        run_and_check(&mut history);
+        assert!(history.cold_blocks()[0]);
+
+        let mut history = full();
+        history.set_limit(300);
+        assert!(history.has_jobs());
+        run_and_check(&mut history);
+        assert!(history.cold_blocks()[0]);
+
+        // An eviction never warms the next oldest block once it is cold.
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        for _ in 0..500 {
+            history.push_newest(&varied_row(&mut rng));
+            run_and_check(&mut history);
+        }
+        assert!(history.cold_blocks()[0]);
     }
 
     /// `History` stays `Send` (fbterm's worker moves `Job`s and `Done`s across threads too).
