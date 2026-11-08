@@ -1118,8 +1118,10 @@ impl<T> Term<T> {
 
         let cell = &self.grid.screen()[line][col];
         let pieces = cell.zerowidth().unwrap_or(&[]);
-        let empty = cell.c == ' ' && pieces.is_empty() && cell.flags.is_empty();
-        if empty || !cluster::joins(cell.c, pieces, c) {
+        // A space (blank or written, whatever its style) takes zero-width marks, as it does
+        // without the mode, but never a visible joiner: that starts a cell of its own.
+        let space = cell.c == ' ' && pieces.is_empty();
+        if (space && c.width() != Some(0)) || !cluster::joins(cell.c, pieces, c) {
             return false;
         }
         if pieces.len() >= cluster::MAX_CLUSTER_PIECES {
@@ -1222,14 +1224,48 @@ impl<T> Term<T> {
     /// feathercritty: not upstream.
     fn narrow_cluster(&mut self, line: Line, col: Column) {
         let columns = self.columns();
+        let last = Column(columns - 1);
+
+        // A cluster that moved to this line because it was wide goes back to the end of the
+        // line above, where a narrow one fits, with the wrap pending there.
+        if col.0 == 0
+            && line.0 > 0
+            && self.grid.screen()[line - 1i32][last].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            let screen = self.grid.screen_mut();
+            let mut cluster = screen[line][col].clone();
+            cluster.flags.remove(Flags::WIDE_CHAR);
+            let blank = Cell { bg: cluster.bg, ..Cell::default() };
+            if columns > 1 {
+                screen[line][Column(1)] = blank.clone();
+            }
+            screen[line][col] = blank;
+            screen[line - 1i32][last] = cluster;
+            self.damage.damage_line(line.0 as usize - 1, last.0, last.0);
+            self.damage.damage_line(line.0 as usize, 0, 1);
+            self.grid.cursor.point = Point::new(line - 1i32, last);
+            self.grid.cursor.input_needs_wrap = true;
+            return;
+        }
+
         let screen = self.grid.screen_mut();
         screen[line][col].flags.remove(Flags::WIDE_CHAR);
         // A wide character in the last column has no spacer (the alternate screen does not
         // reflow, so a shrink can leave one there).
         if col.0 + 1 < columns {
-            let spacer = &mut screen[line][col + 1];
-            spacer.flags.remove(Flags::WIDE_CHAR_SPACER);
-            spacer.c = ' ';
+            if self.mode.contains(TermMode::INSERT) {
+                // In insert mode the spacer goes and the rest of the line moves back left,
+                // undoing the shift that made room for it.
+                let row = &mut screen[line][..];
+                for i in col.0 + 1..columns - 1 {
+                    row.swap(i, i + 1);
+                }
+                row[columns - 1] = Cell::default();
+            } else {
+                let spacer = &mut screen[line][col + 1];
+                spacer.flags.remove(Flags::WIDE_CHAR_SPACER);
+                spacer.c = ' ';
+            }
             self.grid.cursor.point.column = col + 1;
             self.grid.cursor.input_needs_wrap = false;
         } else {
@@ -4040,6 +4076,55 @@ mod tests {
             assert!(moved.flags.contains(Flags::WIDE_CHAR));
             assert_eq!(moved.fg, Color::Named(NamedColor::Red));
             assert_eq!(cell(&term, 1, 1).fg, Color::Named(NamedColor::Red));
+        }
+
+        #[test]
+        fn cluster_after_a_space_ignores_its_style() {
+            // A visible joiner never joins a space, styled or not.
+            let mut term = clustering(10, 2);
+            feed(&mut term, "a\x1b[4m \x1b[0m\u{1F3FD}".as_bytes());
+            assert_eq!((cell(&term, 0, 1).c, pieces(&term, 0, 1)), (' ', vec![]));
+            assert_eq!(cell(&term, 0, 2).c, '\u{1F3FD}');
+            // A zero-width mark joins a space, styled or not, as it does without the mode.
+            let mut term = clustering(10, 2);
+            feed(&mut term, "a \u{301}b\x1b[4m \x1b[0m\u{200D}".as_bytes());
+            assert_eq!(pieces(&term, 0, 1), ['\u{301}']);
+            assert_eq!(cell(&term, 0, 2).c, 'b');
+            assert_eq!(pieces(&term, 0, 3), ['\u{200D}']);
+        }
+
+        #[test]
+        fn cluster_narrows_in_insert_mode_shifts_back() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abc\r\x1b[4h⌚\u{FE0E}x".as_bytes());
+            let expected = [
+                ('⌚', false, false),
+                ('x', false, false),
+                ('a', false, false),
+                ('b', false, false),
+                ('c', false, false),
+            ];
+            assert_eq!(row(&term, 0), expected);
+        }
+
+        #[test]
+        fn cluster_narrowed_after_a_wrap_moves_back() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abcd⌚\u{FE0E}".as_bytes());
+            let back = cell(&term, 0, 4);
+            assert_eq!((back.c, pieces(&term, 0, 4)), ('⌚', vec!['\u{FE0E}']));
+            assert!(
+                !back.flags.intersects(
+                    Flags::WIDE_CHAR | Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE
+                )
+            );
+            assert_eq!(row(&term, 1)[0], (' ', false, false));
+            assert_eq!(row(&term, 1)[1], (' ', false, false));
+            assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(4)));
+            assert!(term.grid.cursor.input_needs_wrap);
+            feed(&mut term, b"y");
+            assert!(cell(&term, 0, 4).flags.contains(Flags::WRAPLINE));
+            assert_eq!(cell(&term, 1, 0).c, 'y');
         }
 
         #[test]

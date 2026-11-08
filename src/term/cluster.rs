@@ -21,15 +21,68 @@ pub(crate) enum WidthEffect {
 /// Whether `c` continues the cluster made of `base` and `pieces`: no extended grapheme
 /// cluster boundary (UAX #29) falls before it.
 pub(crate) fn joins(base: char, pieces: &[char], c: char) -> bool {
-    let mut text = String::with_capacity(4 * (pieces.len() + 2));
-    text.push(base);
-    text.extend(pieces);
-    let offset = text.len();
-    text.push(c);
+    !never_continues(base, pieces, c) && segmentation_joins(base, pieces, c)
+}
+
+/// Ranges whose code points have the grapheme break property Other, are not
+/// Extended_Pictographic and are not Hangul jamo: CJK symbols up to U+3029, kana (without the
+/// combining sound marks), box drawing and block elements, CJK ideographs, Hangul syllables
+/// and fullwidth forms. Between two of them (or one and Latin-1) no UAX #29 rule keeps a
+/// cluster together, which a test checks against the segmentation itself.
+/// Sorted by start, which `plain` relies on.
+const PLAIN_RANGES: [std::ops::RangeInclusive<u32>; 9] = [
+    0x2500..=0x259F,
+    0x3000..=0x3029,
+    0x3041..=0x3096,
+    0x30A0..=0x30FF,
+    0x3400..=0x4DBF,
+    0x4E00..=0x9FFF,
+    0xAC00..=0xD7A3,
+    0xFF01..=0xFF60,
+    0x20000..=0x2FFFD,
+];
+
+fn plain(c: char) -> bool {
+    let c = c as u32;
+    if c <= 0xFF {
+        return true;
+    }
+    // The ranges are sorted: find the last one starting at or before `c`.
+    let i = PLAIN_RANGES.partition_point(|r| *r.start() <= c);
+    i > 0 && c <= *PLAIN_RANGES[i - 1].end()
+}
+
+/// A quick "no" for the common case (text in a script whose characters never join), so most
+/// non-Latin output skips the segmentation below.
+fn never_continues(base: char, pieces: &[char], c: char) -> bool {
+    pieces.is_empty() && plain(base) && plain(c)
+}
+
+/// The UAX #29 answer, from `unicode-segmentation`.
+fn segmentation_joins(base: char, pieces: &[char], c: char) -> bool {
+    let mut stack = [0u8; 4 * (MAX_CLUSTER_PIECES + 2)];
+    let mut heap = String::new();
+    let len = 4 * (pieces.len() + 2);
+    let (text, offset) = if len <= stack.len() {
+        let mut at = 0;
+        for ch in std::iter::once(&base).chain(pieces) {
+            at += ch.encode_utf8(&mut stack[at..]).len();
+        }
+        let offset = at;
+        at += c.encode_utf8(&mut stack[at..]).len();
+        // Valid UTF-8: only whole chars were encoded.
+        (std::str::from_utf8(&stack[..at]).unwrap_or_default(), offset)
+    } else {
+        heap.push(base);
+        heap.extend(pieces);
+        let offset = heap.len();
+        heap.push(c);
+        (heap.as_str(), offset)
+    };
     // The whole text is one chunk, so the cursor never asks for more context; treat any
     // such answer as a boundary.
     let mut cursor = GraphemeCursor::new(offset, text.len(), true);
-    !cursor.is_boundary(&text, 0).unwrap_or(true)
+    !cursor.is_boundary(text, 0).unwrap_or(true)
 }
 
 /// How `c`, joining a cluster whose base is `base`, changes the cluster's width.
@@ -91,6 +144,58 @@ const EMOJI_VS_BASES: &[u32] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Code points the quick check calls plain, sampled densely enough to cross every range.
+    fn plain_samples() -> Vec<char> {
+        PLAIN_RANGES.iter().flat_map(|r| r.clone()).filter_map(char::from_u32).collect()
+    }
+
+    #[test]
+    fn plain_pairs_never_join_by_segmentation() {
+        // The quick check may only answer "no" where segmentation says no too.
+        let bases: Vec<char> = "a\u{A9}\u{AE}中─カ가ガ日ｱ１　\u{3029}"
+            .chars()
+            .chain(
+                PLAIN_RANGES.iter().flat_map(|r| [*r.start(), *r.end()]).filter_map(char::from_u32),
+            )
+            .collect();
+        for c in plain_samples() {
+            for &base in &bases {
+                assert!(!segmentation_joins(base, &[], c), "{base:?} + {c:?}");
+                assert!(!segmentation_joins(c, &[], base), "{c:?} + {base:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_ranges_are_sorted_and_cover_their_ends() {
+        assert!(PLAIN_RANGES.windows(2).all(|w| w[0].end() < w[1].start()));
+        for r in &PLAIN_RANGES {
+            for c in [*r.start(), *r.end()].into_iter().filter_map(char::from_u32) {
+                assert!(plain(c), "{c:?}");
+            }
+            for c in [r.start() - 1, r.end() + 1].into_iter().filter_map(char::from_u32) {
+                let inside = PLAIN_RANGES.iter().any(|q| q.contains(&(c as u32)));
+                assert_eq!(plain(c), inside || c <= '\u{FF}', "{c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn plain_pairs_take_the_quick_answer() {
+        assert!(never_continues('中', &[], '日'));
+        assert!(never_continues('a', &[], '─'));
+        assert!(!never_continues('中', &['\u{200D}'], '日'), "a piece after the base");
+        assert!(!never_continues('\u{1100}', &[], '가'), "a Hangul L jamo is not plain");
+        assert!(!never_continues('👨', &[], '日'), "an emoji base is not plain");
+    }
+
+    #[test]
+    fn long_clusters_still_join() {
+        // More pieces than the stack buffer holds (stored before the mode was set).
+        let pieces = vec!['\u{301}'; 200];
+        assert!(joins('e', &pieces, '\u{302}'));
+    }
 
     #[test]
     fn flags_pair_regional_indicators() {
