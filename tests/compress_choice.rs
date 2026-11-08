@@ -9,12 +9,13 @@
 //!
 //! Each corpus (`tests/corpora/`) is fed to a 126-column `Term` with a 1,000,000-line history;
 //! the history's 64 KiB blocks are taken through the `test-hooks` accessor and each candidate
-//! compresses and decompresses every block. For each candidate the table gives the ratio
-//! (compressed bytes over block bytes), compression and decompression speed (MB/s of block bytes,
-//! block by block), and the projected size of the whole history against compression off, both
-//! counted as block bytes plus 16 bytes of row index per row. The selection rule is spec 5.3:
-//! at most 40% of off on every realistic corpus, then the fastest decompression, then pure Rust
-//! when within 20% on both ratio and speed.
+//! compresses and decompresses every block. Only the zstd levels remain: the other candidates were
+//! dropped after the choice (their tables stay in benches/RESULTS.md). For each candidate the table
+//! gives the ratio (compressed bytes over block bytes), compression and decompression speed (MB/s
+//! of block bytes, block by block), and the projected size of the whole history against compression
+//! off, both counted as block bytes plus 16 bytes of row index per row. The selection rule is spec
+//! 5.3: at most 40% of off on every realistic corpus, then the fastest decompression, then pure
+//! Rust when within 20% on both ratio and speed.
 
 mod corpora;
 
@@ -59,12 +60,6 @@ struct Candidate {
     decompress: fn(&[u8], usize) -> Vec<u8>,
 }
 
-fn lz4_compress(b: &[u8]) -> Vec<u8> {
-    lz4_flex::compress_prepend_size(b)
-}
-fn lz4_decompress(b: &[u8], _size: usize) -> Vec<u8> {
-    lz4_flex::decompress_size_prepended(b).unwrap()
-}
 fn zstd1_compress(b: &[u8]) -> Vec<u8> {
     zstd::bulk::compress(b, 1).unwrap()
 }
@@ -75,12 +70,6 @@ fn zstd_decompress(b: &[u8], size: usize) -> Vec<u8> {
     zstd::bulk::decompress(b, size).unwrap()
 }
 const CANDIDATES: &[Candidate] = &[
-    Candidate {
-        name: "lz4_flex block",
-        pure_rust: true,
-        compress: lz4_compress,
-        decompress: lz4_decompress,
-    },
     Candidate {
         name: "zstd level 1",
         pure_rust: false,
@@ -152,14 +141,16 @@ fn compressor_choice() {
         let history = fill(bytes);
         let raw: usize = history.blocks.iter().map(Vec::len).sum();
         println!(
-            "\n### {name}: {} input bytes, {} history rows, {} blocks, {raw} block bytes ({:.1} bytes per row)\n",
+            "\n### {name}: {} input bytes, {} history rows, {} blocks, {raw} block bytes ({:.1} \
+             bytes per row)\n",
             bytes.len(),
             history.rows,
             history.blocks.len(),
             raw as f64 / history.rows.max(1) as f64,
         );
         println!(
-            "| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |"
+            "| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off \
+             |"
         );
         println!("|---|---|---|---|---|---|");
         for candidate in CANDIDATES {

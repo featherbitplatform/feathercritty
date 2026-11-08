@@ -121,7 +121,8 @@ pub fn build_log(seed: u64, rows: usize) -> Vec<u8> {
                 format!("\x1b[1m\x1b[38;5;12m   --> \x1b[0m{path}:{line}:{col}"),
                 "\x1b[1m\x1b[38;5;12m    |\x1b[0m".to_owned(),
                 format!(
-                    "\x1b[1m\x1b[38;5;12m{line:>3} |\x1b[0m         let {var} = self.read_{}({code});",
+                    "\x1b[1m\x1b[38;5;12m{line:>3} |\x1b[0m         let {var} = \
+                     self.read_{}({code});",
                     pick(&mut rng, VARS)
                 ),
                 format!(
@@ -129,7 +130,8 @@ pub fn build_log(seed: u64, rows: usize) -> Vec<u8> {
                     "^".repeat(var.len())
                 ),
                 format!(
-                    "\x1b[1m\x1b[38;5;12m    |\x1b[0m             \x1b[1m\x1b[33mhelp: if this is intentional, prefix it with an underscore: `_{var}`\x1b[0m"
+                    "\x1b[1m\x1b[38;5;12m    |\x1b[0m             \x1b[1m\x1b[33mhelp: if this is \
+                     intentional, prefix it with an underscore: `_{var}`\x1b[0m"
                 ),
                 "\x1b[1m\x1b[38;5;12m    |\x1b[0m".to_owned(),
                 String::new(),
@@ -223,7 +225,8 @@ pub fn service_log(seed: u64, rows: usize) -> Vec<u8> {
         let module = pick(&mut rng, MODULES);
         let text = message(&mut rng, which);
         out.push_str(&format!(
-            "\x1b[2m2026-11-08T{h:02}:{m:02}:{s:02}.{ms:03}Z\x1b[0m {color}{level}{RESET} \x1b[2m{module}\x1b[0m: {text}\r\n"
+            "\x1b[2m2026-11-08T{h:02}:{m:02}:{s:02}.{ms:03}Z\x1b[0m {color}{level}{RESET} \
+             \x1b[2m{module}\x1b[0m: {text}\r\n"
         ));
     }
     out.into_bytes()
@@ -308,7 +311,8 @@ pub fn shell_session(seed: u64, rows: usize) -> Vec<u8> {
                 ""
             };
             out.push_str(&format!(
-                "{perms} {:>2} dev dev {size:>8} Nov {day:>2} {h:02}:{m:02} {color}{name}{RESET}\r\n",
+                "{perms} {:>2} dev dev {size:>8} Nov {day:>2} {h:02}:{m:02} \
+                 {color}{name}{RESET}\r\n",
                 rng.gen_range(1..9)
             ));
             n += 1;
