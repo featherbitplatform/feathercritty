@@ -706,6 +706,13 @@ impl<T: HistoryCell> Grid<T> {
         self.history.block_bytes_for_test()
     }
 
+    /// Whether each history block, oldest first, is compressed (test hook, see
+    /// `History::cold_blocks`).
+    #[cfg(feature = "test-hooks")]
+    pub fn cold_blocks_for_test(&self) -> Vec<bool> {
+        self.history.cold_blocks()
+    }
+
     /// Change history row `line` (`line < 0`) (feathercritty: the one history write, see
     /// `Term::input`; the row is decoded, changed and re-encoded, see `History::update`).
     ///

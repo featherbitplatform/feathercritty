@@ -23,18 +23,23 @@
 //!   through the fill, the column resizes, the lines-only resize and the trim to 10,000 lines.
 //!   Which block a row belongs to is computed from the bottom of the grid (see [`expected_at`]), so
 //!   rows evicted at the top never shift the expectation.
-//! - `large_history_cost_table` measures (does not gate): live bytes, resident set size, resize and
-//!   trim times for short, log-style and full-width lines at 100,000 and 1,000,000 history lines,
-//!   and prints the tables recorded in `benches/RESULTS.md`. Each cell runs in a fresh child
-//!   process (`large_history_cost_cell`, which does nothing unless the parent sets
-//!   `LARGE_HISTORY_CELL`), so the resident set size of one cell does not include the freed memory
-//!   of the previous one. Live bytes come from a counting `#[global_allocator]` that counts only
-//!   the calling thread, so the other tests' threads do not disturb it. The tests serialize on a
-//!   lock for the same reason.
+//! - `large_history_matches_oracle_at_100k_compressed` and
+//!   `large_history_invariants_at_1m_compressed` run the two above with `history_compression:
+//!   Some(10_000)`, `run_history_jobs()` after the fill and each step, and check that most blocks
+//!   are compressed.
+//! - `large_history_cost_table` measures (does not gate; the realistic corpora also with
+//!   compression on, in their own table): live bytes, resident set size, resize and trim times for
+//!   short, log-style and full-width lines at 100,000 and 1,000,000 history lines, and prints the
+//!   tables recorded in `benches/RESULTS.md`. Each cell runs in a fresh child process
+//!   (`large_history_cost_cell`, which does nothing unless the parent sets `LARGE_HISTORY_CELL`),
+//!   so the resident set size of one cell does not include the freed memory of the previous one.
+//!   Live bytes come from a counting `#[global_allocator]` that counts only the calling thread, so
+//!   the other tests' threads do not disturb it. The tests serialize on a lock for the same reason.
 //!
 //! The allocator below is the only `unsafe` code of this file, as in `tests/alloc.rs`: it
 //! forwards every call to `System` and keeps counters in `const` thread-locals.
 
+mod corpora;
 mod support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -45,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use feathercritty::grid::Dimensions;
 use feathercritty::index::{Column, Line, Point};
+use feathercritty::term::Config;
 use feathercritty::term::cell::{Cell, Flags};
 use feathercritty::vte::ansi::{Color, NamedColor};
 use support::project::{QAns, QueryPlan, SearchQ, Snapshot};
@@ -461,6 +467,43 @@ fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1000.0
 }
 
+/// Keep-warm rows of the compressed variants.
+const WARM: usize = 10_000;
+
+/// Switch compression on for `side` (`Some(WARM)`) at history limit `limit`; the steps of
+/// `fc::Side::apply` reset the options to the defaults, so the compressed variants apply their
+/// limit changes through [`set_history`].
+fn set_history(side: &mut fc::Side, limit: usize, compression: Option<usize>) {
+    side.term.set_options(Config {
+        scrolling_history: limit,
+        history_compression: compression,
+        ..Config::default()
+    });
+    side.term.run_history_jobs();
+}
+
+/// Most of the history is compressed, or a compressed variant would prove nothing new.
+fn assert_cold(side: &fc::Side, phase: &str) {
+    let cold = side.term.grid().cold_blocks_for_test();
+    let count = cold.iter().filter(|&&c| c).count();
+    println!("  {phase}: {count} of {} blocks compressed", cold.len());
+    assert!(count * 2 > cold.len(), "{phase}: only {count} of {} blocks compressed", cold.len());
+}
+
+/// Apply `step` and, with compression on, run the jobs it queued (a host does so after each batch
+/// of output and each resize).
+fn apply(side: &mut fc::Side, step: &Step, compression: Option<usize>) {
+    match step {
+        Step::SetHistory(limit) => set_history(side, *limit, compression),
+        _ => {
+            side.apply(step);
+            if compression.is_some() {
+                side.term.run_history_jobs();
+            }
+        },
+    }
+}
+
 // -- 100,000 lines against the oracle -------------------------------------------------------
 
 /// The queries after each phase: whole-history selections of each kind, `bounds_to_string` at
@@ -549,6 +592,16 @@ fn compare(phase: &str, a: &mut fc::Side, b: &mut ac::Side, plan: &QueryPlan) {
 #[test]
 #[ignore = "large; run with --release -- --ignored"]
 fn large_history_matches_oracle_at_100k() {
+    oracle_at_100k(None);
+}
+
+#[test]
+#[ignore = "large; run with --release -- --ignored"]
+fn large_history_matches_oracle_at_100k_compressed() {
+    oracle_at_100k(Some(WARM));
+}
+
+fn oracle_at_100k(compression: Option<usize>) {
     let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let started = Instant::now();
     let limit = 100_000;
@@ -556,10 +609,13 @@ fn large_history_matches_oracle_at_100k() {
     let blocks = 9_100;
     let mut a = fc::Side::new(&start(limit));
     let mut b = ac::Side::new(&start(limit));
+    if compression.is_some() {
+        set_history(&mut a, limit, compression);
+    }
 
     fill(
         |step| {
-            a.apply(step);
+            apply(&mut a, step, compression);
             b.apply(step);
         },
         blocks,
@@ -571,6 +627,9 @@ fn large_history_matches_oracle_at_100k() {
         blocks * BLOCK_LINES
     );
     compare("fill", &mut a, &mut b, &plan);
+    if compression.is_some() {
+        assert_cold(&a, "fill");
+    }
 
     // Scrolled back, so the display offset is part of what a resize must keep.
     let phases = [
@@ -584,7 +643,7 @@ fn large_history_matches_oracle_at_100k() {
     ];
     for (name, step) in phases {
         let t = Instant::now();
-        a.apply(&step);
+        apply(&mut a, &step, compression);
         let fork = t.elapsed();
         let t = Instant::now();
         b.apply(&step);
@@ -602,14 +661,30 @@ fn large_history_matches_oracle_at_100k() {
 #[test]
 #[ignore = "large; run with --release -- --ignored"]
 fn large_history_invariants_at_1m() {
+    invariants_at_1m(None);
+}
+
+#[test]
+#[ignore = "large; run with --release -- --ignored"]
+fn large_history_invariants_at_1m_compressed() {
+    invariants_at_1m(Some(WARM));
+}
+
+fn invariants_at_1m(compression: Option<usize>) {
     let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let started = Instant::now();
     let limit = 1_000_000;
     // 11 rows a block, and the 37-row screen: 7 rows more than the limit, so 7 are evicted.
     let blocks = 90_913;
     let mut side = fc::Side::new(&start(limit));
-    fill(|step| side.apply(step), blocks, false);
+    if compression.is_some() {
+        set_history(&mut side, limit, compression);
+    }
+    fill(|step| apply(&mut side, step, compression), blocks, false);
     println!("large history invariants, {limit}-line limit, {blocks} blocks");
+    if compression.is_some() {
+        assert_cold(&side, "fill");
+    }
     verify(&side, "fill", blocks, limit, 126, 0);
 
     let steps = [
@@ -619,7 +694,7 @@ fn large_history_invariants_at_1m() {
     let mut history = limit;
     for (name, step, expect, columns, skip) in steps {
         let t = Instant::now();
-        side.apply(&step);
+        apply(&mut side, &step, compression);
         let took = t.elapsed();
         history = side.term.grid().history_size();
         match expect {
@@ -629,23 +704,26 @@ fn large_history_invariants_at_1m() {
             None => assert!((900_000..limit).contains(&history), "{name}: history {history}"),
         }
         println!("  {name}: {:.0} ms, history {history}", ms(took));
+        if compression.is_some() {
+            assert_cold(&side, name);
+        }
         verify(&side, name, blocks, history, columns, skip);
     }
 
     // Lines only: the rows move between the screen and the history; the total stays.
     let total = history + LINES;
-    side.apply(&resize(30, 126));
+    apply(&mut side, &resize(30, 126), compression);
     let (h, lines, _) = size(&side.term);
     assert_eq!((h + lines, h), (total, history + 7), "37 -> 30 lines");
     verify(&side, "lines only 37 -> 30", blocks, h, 126, 2);
-    side.apply(&resize(LINES, 126));
+    apply(&mut side, &resize(LINES, 126), compression);
     let (h, lines, _) = size(&side.term);
     assert_eq!((h + lines, h), (total, history), "30 -> 37 lines");
     verify(&side, "lines only 30 -> 37", blocks, h, 126, 2);
 
     // Lowering the limit keeps the newest rows.
     let t = Instant::now();
-    side.apply(&Step::SetHistory(10_000));
+    apply(&mut side, &Step::SetHistory(10_000), compression);
     println!("  limit to 10,000: {:.0} ms", ms(t.elapsed()));
     verify(&side, "limit to 10,000", blocks, 10_000, 126, 0);
 
@@ -873,6 +951,83 @@ fn spread(stat: &str) -> String {
     format!("{} ({}-{})", p[0], p[1], p[2])
 }
 
+/// The realistic corpora of the compressed columns: name and generator.
+type Generator = fn(u64, usize) -> Vec<u8>;
+
+const CORPORA: [(&str, Generator); 3] = [
+    ("build log", corpora::build_log),
+    ("service log", corpora::service_log),
+    ("shell session", corpora::shell_session),
+];
+
+/// Live bytes of a `history`-row history of corpus `corpus` after the fill and after ten column
+/// resizes (jobs run after each), with compression `compression`.
+fn corpus_live(corpus: usize, history: usize, compression: Option<usize>) -> (usize, usize) {
+    // Generated before counting, so the text is not part of the live bytes.
+    let bytes = (CORPORA[corpus].1)(corpus as u64 + 1, history + LINES + 10);
+    start_counting();
+    let mut side = fc::Side::new(&start(history));
+    set_history(&mut side, history, compression);
+    for chunk in bytes.chunks(64 * 1024) {
+        side.apply(&Step::Bytes(chunk.to_vec()));
+        side.term.run_history_jobs();
+    }
+    assert_eq!(side.term.grid().history_size(), history);
+    let filled = live_bytes();
+    for _ in 0..5 {
+        apply(&mut side, &resize(LINES, 100), compression);
+        apply(&mut side, &resize(LINES, 126), compression);
+    }
+    let resized = live_bytes();
+    stop_counting();
+    (filled, resized)
+}
+
+/// Runs only as a child of `large_history_cost_table`: `LARGE_HISTORY_CORPUS=<index>,<lines>`.
+/// Prints one `CCELL|...` line: live bytes off and compressed, after the fill and the resizes.
+#[test]
+#[ignore = "child of large_history_cost_table"]
+fn large_history_cost_corpus_cell() {
+    let Ok(cell) = std::env::var("LARGE_HISTORY_CORPUS") else {
+        println!("large_history_cost_corpus_cell: LARGE_HISTORY_CORPUS not set, nothing to do");
+        return;
+    };
+    let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (corpus, lines) = cell.split_once(',').expect("<index>,<lines>");
+    let (corpus, history): (usize, usize) = (corpus.parse().unwrap(), lines.parse().unwrap());
+    let (off, off_resized) = corpus_live(corpus, history, None);
+    let (on, on_resized) = corpus_live(corpus, history, Some(WARM));
+    println!("CCELL|{corpus}|{history}|{off}|{off_resized}|{on}|{on_resized}");
+}
+
+/// One corpus cell as the child printed it: (off filled, off resized, on filled, on resized).
+fn run_corpus_cell(corpus: usize, history: usize) -> [usize; 4] {
+    let exe = std::env::current_exe().expect("test binary");
+    let out = Command::new(exe)
+        .args([
+            "--ignored",
+            "--exact",
+            "large_history_cost_corpus_cell",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("LARGE_HISTORY_CORPUS", format!("{corpus},{history}"))
+        .output()
+        .expect("spawn the corpus cell");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "corpus cell failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let line = stdout
+        .lines()
+        .find_map(|l| l.find("CCELL|").map(|at| &l[at..]))
+        .unwrap_or_else(|| panic!("no CCELL line in:\n{stdout}"));
+    let f: Vec<usize> = line.split('|').skip(3).map(|v| v.parse().unwrap()).collect();
+    [f[0], f[1], f[2], f[3]]
+}
+
 /// Measures and prints the tables of `benches/RESULTS.md`, "Large histories".
 #[test]
 #[ignore = "large; run with --release -- --ignored"]
@@ -930,6 +1085,29 @@ fn large_history_cost_table() {
             spread(&c.times[3]),
             spread(&c.times[4]),
         );
+    }
+
+    println!(
+        "\nRealistic corpora, compression off against on (keep {WARM} rows warm; live MB, after \
+         the fill and after 10 column resizes with the jobs run):\n"
+    );
+    println!(
+        "| corpus | history lines | off MB | compressed MB | compressed / off | off MB after \
+         resizes | compressed MB after resizes |"
+    );
+    println!("|---|---:|---:|---:|---:|---:|---:|");
+    for history in [100_000, 1_000_000] {
+        for (i, (name, _)) in CORPORA.iter().enumerate() {
+            let [off, off_resized, on, on_resized] = run_corpus_cell(i, history);
+            println!(
+                "| {name} | {history} | {} | {} | {:.0}% | {} | {} |",
+                mb(off),
+                mb(on),
+                on as f64 * 100.0 / off as f64,
+                mb(off_resized),
+                mb(on_resized),
+            );
+        }
     }
     println!("\nmeasured in {:.0} s", started.elapsed().as_secs_f64());
 }

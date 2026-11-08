@@ -55,3 +55,5 @@ jobs:
         run: >-
           cargo test --locked --release --test large_history -- --ignored --exact
           large_history_matches_oracle_at_100k large_history_invariants_at_1m
+          large_history_matches_oracle_at_100k_compressed
+          large_history_invariants_at_1m_compressed

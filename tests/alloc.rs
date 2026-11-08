@@ -14,10 +14,15 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell as StdCell;
 use std::sync::Arc;
 
+mod corpora;
+
+use feathercritty::event::VoidListener;
 use feathercritty::grid::{Dimensions, Grid};
 use feathercritty::index::{Column, Line};
 use feathercritty::term::cell::{Cell, CellExtra, Flags, Hyperlink};
-use feathercritty::vte::ansi::{Color, NamedColor, Rgb};
+use feathercritty::term::test::TermSize;
+use feathercritty::term::{Config, Term};
+use feathercritty::vte::ansi::{Color, NamedColor, Processor, Rgb};
 
 struct Counting;
 
@@ -153,10 +158,14 @@ fn scroll_one(grid: &mut Grid<Cell>, n: usize, extras: &[Arc<CellExtra>]) {
     grid.scroll_up::<Color>(&(Line(0)..Line(grid.screen_lines() as i32)), 1);
 }
 
-fn check(columns: usize, block_bytes: usize) {
+fn check(columns: usize, block_bytes: usize, compression_off: bool) {
     let limit = 1000;
     let extras = shared_extras();
     let mut grid = Grid::<Cell>::new_with_block_size(24, columns, limit, block_bytes);
+    if compression_off {
+        // Explicit, as `Config { history_compression: None }` sets it on a terminal's grids.
+        grid.set_history_compression(None);
+    }
 
     // Fill the history, then turn it over twice so the block count, the pool and every
     // buffer's capacity (the extras queue's too) reach their steady state.
@@ -177,11 +186,19 @@ fn check(columns: usize, block_bytes: usize) {
 #[test]
 fn steady_scroll_allocates_nothing() {
     // Default 64 KiB blocks at a typical width.
-    check(126, 64 * 1024);
+    check(126, 64 * 1024, false);
     // Tiny blocks, so blocks fill and are evicted constantly. Rows of up to 8 cells keep every
     // record within a quarter block (a larger one gets a block of its own, allocated and freed
     // with its row).
-    check(8, 256);
+    check(8, 256, false);
+}
+
+/// The same check with compression switched off explicitly (the default): the opt-in feature
+/// costs the off path nothing per row.
+#[test]
+fn compression_off_allocates_nothing_per_row() {
+    check(126, 64 * 1024, true);
+    check(8, 256, true);
 }
 
 /// A reflow streams the history: during 126->100->126 columns with a full 10,000-row history,
@@ -219,5 +236,56 @@ fn reflow_peak_below_dense() {
     assert!(
         (after as usize) < compact + compact / 4,
         "{after} B after the resize, {compact} B before"
+    );
+}
+
+/// Peak live bytes of the thread across 126->100->126 columns (and the history jobs a host runs
+/// after each resize) on a `rows`-row history of `bytes`, with the given compression. Returns
+/// (live bytes before the resizes, peak during them, live bytes after).
+fn resize_peak(bytes: &[u8], limit: usize, compression: Option<usize>) -> (isize, isize, isize) {
+    let (lines, columns) = (37, 126);
+    start_counting();
+    let config =
+        Config { scrolling_history: limit, history_compression: compression, ..Config::default() };
+    let mut term = Term::new(config, &TermSize::new(columns, lines), VoidListener);
+    let mut parser: Processor = Processor::new();
+    for chunk in bytes.chunks(4096) {
+        parser.advance(&mut term, chunk);
+        // A host drains the jobs after every batch of output.
+        term.run_history_jobs();
+    }
+    assert_eq!(term.grid().history_size(), limit, "the history must be full");
+    let (before, _) = live_and_peak();
+
+    // The peak covers the whole resize sequence, not only its end: the old store has to be
+    // freed as its rows leave, and each pass's jobs run inside the window too.
+    reset_peak();
+    term.resize(TermSize::new(100, lines));
+    term.run_history_jobs();
+    term.resize(TermSize::new(columns, lines));
+    term.run_history_jobs();
+    let (after, peak) = live_and_peak();
+    COUNTING.with(|counting| counting.set(false));
+    assert_eq!(term.grid().columns(), columns);
+    drop(term);
+    (before, peak, after)
+}
+
+/// Spec: peak live bytes during a resize are never above the same history with compression off.
+/// A 100,000-line service log, cold blocks compressed after 10,000 warm rows.
+#[test]
+fn reflow_peak_with_cold_history_not_above_off() {
+    let limit = 100_000;
+    let bytes = corpora::service_log(7, limit + 100);
+    let (off_before, off_peak, off_after) = resize_peak(&bytes, limit, None);
+    let (on_before, on_peak, on_after) = resize_peak(&bytes, limit, Some(10_000));
+    println!(
+        "off: {off_before} B before, peak {off_peak} B, {off_after} B after\non:  {on_before} B \
+         before, peak {on_peak} B, {on_after} B after"
+    );
+    assert!(on_before < off_before, "compression saved nothing: {on_before} vs {off_before}");
+    assert!(
+        on_peak <= off_peak,
+        "peak with compression {on_peak} B is above the peak with it off {off_peak} B"
     );
 }
