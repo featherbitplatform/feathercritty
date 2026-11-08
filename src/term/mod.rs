@@ -29,6 +29,8 @@ use crate::vte::ansi::{
 };
 
 pub mod cell;
+// feathercritty: grapheme cluster rules for mode 2027; not upstream.
+mod cluster;
 pub mod color;
 pub mod search;
 
@@ -79,6 +81,8 @@ bitflags! {
         const REPORT_ALTERNATE_KEYS   = 1 << 20;
         const REPORT_ALL_KEYS_AS_ESC  = 1 << 21;
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
+        // feathercritty: DEC private mode 2027, grapheme clusters in one cell; not upstream.
+        const GRAPHEME_CLUSTER        = 1 << 23;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -353,6 +357,12 @@ pub struct Config {
 
     /// OSC52 support mode.
     pub osc52: Osc52,
+
+    /// Whether DEC private mode 2027 (grapheme clusters) is set when the terminal is created
+    /// and after a full reset. Changing it on a live terminal never flips the mode.
+    ///
+    /// feathercritty: not upstream.
+    pub grapheme_clusters: bool,
 }
 
 impl Default for Config {
@@ -364,6 +374,7 @@ impl Default for Config {
             vi_mode_cursor_style: Default::default(),
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
+            grapheme_clusters: false,
         }
     }
 }
@@ -424,7 +435,7 @@ impl<T> Term<T> {
         // Initialize terminal damage, covering the entire terminal upon launch.
         let damage = TermDamageState::new(num_cols, num_lines);
 
-        Term {
+        let mut term = Term {
             inactive_grid,
             scroll_region,
             event_proxy,
@@ -443,7 +454,19 @@ impl<T> Term<T> {
             selection: Default::default(),
             title: Default::default(),
             mode: Default::default(),
-        }
+        };
+        // feathercritty: upstream returns the struct directly; mode 2027 takes its default.
+        term.reset_grapheme_cluster_mode();
+        term
+    }
+
+    /// Set or clear DEC private mode 2027 (grapheme clusters) to the configured default
+    /// ([`Config::grapheme_clusters`]), as a full reset does. Meant for a new program taking
+    /// over an existing terminal, so it never inherits the mode from the one before.
+    ///
+    /// feathercritty: not upstream.
+    pub fn reset_grapheme_cluster_mode(&mut self) {
+        self.mode.set(TermMode::GRAPHEME_CLUSTER, self.config.grapheme_clusters);
     }
 
     /// Collect the information about the changes in the lines, which
@@ -1075,6 +1098,183 @@ impl<T> Term<T> {
         self.damage_cursor();
     }
 
+    /// Join `c` onto the cluster in the previous cell while mode 2027 is set, changing the
+    /// cluster's width when `c` asks for it. Returns false when a grapheme boundary falls
+    /// before `c` (or there is no cluster), so `c` is printed as usual.
+    ///
+    /// feathercritty: not upstream.
+    fn join_cluster(&mut self, c: char) -> bool
+    where
+        T: EventListener,
+    {
+        let line = self.grid.cursor.point.line;
+        let mut col = self.grid.cursor.point.column;
+        if !self.grid.cursor.input_needs_wrap {
+            col -= 1;
+        }
+        if col.0 > 0 && self.grid.screen()[line][col].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            col -= 1;
+        }
+
+        let cell = &self.grid.screen()[line][col];
+        let pieces = cell.zerowidth().unwrap_or(&[]);
+        // A space (blank or written, whatever its style) takes zero-width marks, as it does
+        // without the mode, but never a visible joiner: that starts a cell of its own.
+        let space = cell.c == ' ' && pieces.is_empty();
+        if (space && c.width() != Some(0)) || !cluster::joins(cell.c, pieces, c) {
+            return false;
+        }
+        if pieces.len() >= cluster::MAX_CLUSTER_PIECES {
+            return true;
+        }
+        let (base, wide) = (cell.c, cell.flags.contains(Flags::WIDE_CHAR));
+
+        self.grid.screen_mut()[line][col].push_zerowidth(c);
+        self.damage.damage_line(line.0 as usize, col.0, col.0 + 1);
+        match cluster::width_effect(base, c) {
+            cluster::WidthEffect::Wide if !wide => self.widen_cluster(line, col),
+            cluster::WidthEffect::Narrow if wide => self.narrow_cluster(line, col),
+            _ => (),
+        }
+        true
+    }
+
+    /// Make the narrow cluster at `col` wide, with its spacer in the next column, and put the
+    /// cursor after it.
+    ///
+    /// feathercritty: not upstream.
+    fn widen_cluster(&mut self, line: Line, col: Column)
+    where
+        T: EventListener,
+    {
+        let columns = self.columns();
+        // A one-column terminal has no room for a wide cluster anywhere: it stays narrow.
+        if columns < 2 {
+            return;
+        }
+        if col.0 + 1 >= columns {
+            // No room in this row: like a wide character that does not fit, the cluster moves
+            // whole to the start of the next line behind a leading spacer. Without line wrap
+            // it stays narrow.
+            if !self.mode.contains(TermMode::LINE_WRAP) {
+                return;
+            }
+            let moved = self.grid.screen()[line][col].clone();
+            self.grid.cursor.point.column = col;
+            self.grid.cursor.template.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+            self.write_at_cursor(' ');
+            self.grid.cursor.template.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+            self.wrapline();
+
+            // The cluster keeps its own colors, attributes, pieces and hyperlink, not the
+            // current template's.
+            self.write_at_cursor(moved.c);
+            let line = self.grid.cursor.point.line;
+            let cell = &mut self.grid.screen_mut()[line][Column(0)];
+            let layout = Flags::WIDE_CHAR
+                | Flags::WIDE_CHAR_SPACER
+                | Flags::LEADING_WIDE_CHAR_SPACER
+                | Flags::WRAPLINE;
+            cell.fg = moved.fg;
+            cell.bg = moved.bg;
+            cell.flags = (cell.flags & layout) | (moved.flags & !layout);
+            cell.extra = moved.extra.clone();
+            self.widen_cluster(line, Column(0));
+            return;
+        }
+
+        self.grid.screen_mut()[line][col].flags.insert(Flags::WIDE_CHAR);
+
+        // In insert mode the spacer pushes the rest of the line right by one; a wide character
+        // whose spacer falls off the end is cleared.
+        if self.mode.contains(TermMode::INSERT) {
+            let row = &mut self.grid.screen_mut()[line][..];
+            for i in (col.0 + 1..columns - 1).rev() {
+                row.swap(i + 1, i);
+            }
+            row[col.0 + 1] = Cell::default();
+            if row[columns - 1].flags.contains(Flags::WIDE_CHAR) {
+                row[columns - 1].clear_wide();
+            }
+            self.damage.damage_line(line.0 as usize, col.0, columns - 1);
+        }
+
+        self.grid.cursor.point.column = col + 1;
+        self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR_SPACER);
+        self.write_at_cursor(' ');
+        self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR_SPACER);
+        // The spacer takes the cluster's colors, as a wide character's spacer does.
+        let row = &mut self.grid.screen_mut()[line];
+        let (fg, bg) = (row[col].fg, row[col].bg);
+        row[col + 1].fg = fg;
+        row[col + 1].bg = bg;
+        self.damage.damage_line(line.0 as usize, col.0, col.0 + 1);
+
+        if col.0 + 2 < columns {
+            self.grid.cursor.point.column = col + 2;
+            self.grid.cursor.input_needs_wrap = false;
+        } else {
+            self.grid.cursor.input_needs_wrap = true;
+        }
+    }
+
+    /// Make the wide cluster at `col` narrow, clearing its spacer, and put the cursor in the
+    /// column after it.
+    ///
+    /// feathercritty: not upstream.
+    fn narrow_cluster(&mut self, line: Line, col: Column) {
+        let columns = self.columns();
+        let last = Column(columns - 1);
+
+        // A cluster that moved to this line because it was wide goes back to the end of the
+        // line above, where a narrow one fits, with the wrap pending there.
+        if col.0 == 0
+            && line.0 > 0
+            && self.grid.screen()[line - 1i32][last].flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+        {
+            let screen = self.grid.screen_mut();
+            let mut cluster = screen[line][col].clone();
+            cluster.flags.remove(Flags::WIDE_CHAR);
+            let blank = Cell { bg: cluster.bg, ..Cell::default() };
+            if columns > 1 {
+                screen[line][Column(1)] = blank.clone();
+            }
+            screen[line][col] = blank;
+            screen[line - 1i32][last] = cluster;
+            self.damage.damage_line(line.0 as usize - 1, last.0, last.0);
+            self.damage.damage_line(line.0 as usize, 0, 1);
+            self.grid.cursor.point = Point::new(line - 1i32, last);
+            self.grid.cursor.input_needs_wrap = true;
+            return;
+        }
+
+        let screen = self.grid.screen_mut();
+        screen[line][col].flags.remove(Flags::WIDE_CHAR);
+        // A wide character in the last column has no spacer (the alternate screen does not
+        // reflow, so a shrink can leave one there).
+        if col.0 + 1 < columns {
+            if self.mode.contains(TermMode::INSERT) {
+                // In insert mode the spacer goes and the rest of the line moves back left,
+                // undoing the shift that made room for it.
+                let row = &mut screen[line][..];
+                for i in col.0 + 1..columns - 1 {
+                    row.swap(i, i + 1);
+                }
+                row[columns - 1] = Cell::default();
+            } else {
+                let spacer = &mut screen[line][col + 1];
+                spacer.flags.remove(Flags::WIDE_CHAR_SPACER);
+                spacer.c = ' ';
+            }
+            self.grid.cursor.point.column = col + 1;
+            self.grid.cursor.input_needs_wrap = false;
+        } else {
+            self.grid.cursor.point.column = col;
+            self.grid.cursor.input_needs_wrap = true;
+        }
+        self.damage.damage_line(line.0 as usize, col.0, columns - 1);
+    }
+
     /// Write `c` to the cell at the cursor position.
     #[inline(always)]
     fn write_at_cursor(&mut self, c: char) {
@@ -1172,6 +1372,19 @@ impl<T: EventListener> Handler for Term<T> {
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
+        // feathercritty: grapheme clusters while mode 2027 is set; not upstream. The fast path
+        // (Latin-1, or column 0 without a pending wrap) never looks at the previous cell.
+        if c > '\u{FF}' && self.mode.contains(TermMode::GRAPHEME_CLUSTER) {
+            let cursor = &self.grid.cursor;
+            if (cursor.point.column.0 > 0 || cursor.input_needs_wrap) && self.join_cluster(c) {
+                return;
+            }
+            // A zero-width code point with no cluster to join is dropped.
+            if c.width() == Some(0) {
+                return;
+            }
+        }
+
         // Number of cells the char will occupy.
         let width = match c.width() {
             Some(width) => width,
@@ -1983,6 +2196,8 @@ impl<T: EventListener> Handler for Term<T> {
         // Preserve vi mode across resets.
         self.mode &= TermMode::VI;
         self.mode.insert(TermMode::default());
+        // feathercritty: mode 2027 returns to its configured default; not upstream.
+        self.reset_grapheme_cluster_mode();
 
         self.event_proxy.send_event(Event::CursorBlinkingChange);
         self.mark_fully_damaged();
@@ -2065,6 +2280,11 @@ impl<T: EventListener> Handler for Term<T> {
     fn set_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            // feathercritty: vte has no named variant for mode 2027; not upstream.
+            PrivateMode::Unknown(2027) => {
+                self.mode.insert(TermMode::GRAPHEME_CLUSTER);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2128,6 +2348,11 @@ impl<T: EventListener> Handler for Term<T> {
     fn unset_private_mode(&mut self, mode: PrivateMode) {
         let mode = match mode {
             PrivateMode::Named(mode) => mode,
+            // feathercritty: vte has no named variant for mode 2027; not upstream.
+            PrivateMode::Unknown(2027) => {
+                self.mode.remove(TermMode::GRAPHEME_CLUSTER);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in unset_private_mode");
                 return;
@@ -2215,6 +2440,8 @@ impl<T: EventListener> Handler for Term<T> {
                 NamedPrivateMode::SyncUpdate => ModeState::Reset,
                 NamedPrivateMode::ColumnMode => ModeState::NotSupported,
             },
+            // feathercritty: mode 2027 is reported; not upstream.
+            PrivateMode::Unknown(2027) => self.mode.contains(TermMode::GRAPHEME_CLUSTER).into(),
             PrivateMode::Unknown(_) => ModeState::NotSupported,
         };
 
@@ -3527,5 +3754,434 @@ mod tests {
         assert_eq!(version_number("0.1.2-dev"), 1_02);
         assert_eq!(version_number("1.2.3-dev"), 1_02_03);
         assert_eq!(version_number("999.99.99"), 9_99_99_99);
+    }
+
+    // feathercritty: tests for grapheme clusters (DEC private mode 2027); not upstream.
+    mod clusters {
+        use std::sync::{Arc, Mutex};
+
+        use super::*;
+        use crate::event::{Event, EventListener};
+        use crate::vte::ansi::Processor;
+
+        /// Collects what the terminal writes back to the program.
+        #[derive(Clone, Default)]
+        pub(super) struct Replies(Arc<Mutex<Vec<String>>>);
+
+        impl EventListener for Replies {
+            fn send_event(&self, event: Event) {
+                if let Event::PtyWrite(text) = event {
+                    self.0.lock().unwrap().push(text);
+                }
+            }
+        }
+
+        pub(super) fn term_with(config: Config, cols: usize, lines: usize) -> Term<Replies> {
+            Term::new(config, &TermSize::new(cols, lines), Replies::default())
+        }
+
+        pub(super) fn feed<T: EventListener>(term: &mut Term<T>, bytes: &[u8]) {
+            let mut parser: Processor = Processor::new();
+            parser.advance(term, bytes);
+        }
+
+        fn on(term: &Term<Replies>) -> bool {
+            term.mode().contains(TermMode::GRAPHEME_CLUSTER)
+        }
+
+        use crate::term::cluster::MAX_CLUSTER_PIECES;
+
+        /// A terminal with mode 2027 set.
+        fn clustering(cols: usize, lines: usize) -> Term<Replies> {
+            let mut term = term_with(Config::default(), cols, lines);
+            feed(&mut term, b"\x1b[?2027h");
+            term
+        }
+
+        fn cell<T>(term: &Term<T>, line: i32, col: usize) -> &Cell {
+            &term.grid.screen()[Line(line)][Column(col)]
+        }
+
+        fn pieces<T>(term: &Term<T>, line: i32, col: usize) -> Vec<char> {
+            cell(term, line, col).zerowidth().map(<[char]>::to_vec).unwrap_or_default()
+        }
+
+        fn cursor_col<T>(term: &Term<T>) -> usize {
+            term.grid.cursor.point.column.0
+        }
+
+        /// Asserts `base` + `rest` sits wide in columns `col`..`col + 2` of line 0.
+        fn assert_wide_cluster<T>(term: &Term<T>, col: usize, base: char, rest: &[char]) {
+            let c = cell(term, 0, col);
+            assert_eq!(c.c, base);
+            assert!(c.flags.contains(Flags::WIDE_CHAR), "not wide: {:?}", c.flags);
+            assert_eq!(pieces(term, 0, col), rest);
+            assert!(cell(term, 0, col + 1).flags.contains(Flags::WIDE_CHAR_SPACER));
+        }
+
+        #[test]
+        fn cluster_flag_one_wide_cell() {
+            let mut term = clustering(10, 2);
+            feed(&mut term, "🇮🇹".as_bytes());
+            assert_wide_cluster(&term, 0, '🇮', &['🇹']);
+            assert_eq!(cursor_col(&term), 2);
+        }
+
+        #[test]
+        fn cluster_skin_tone() {
+            let mut term = clustering(10, 2);
+            feed(&mut term, "👍🏽".as_bytes());
+            assert_wide_cluster(&term, 0, '👍', &['\u{1F3FD}']);
+            assert_eq!(cursor_col(&term), 2);
+        }
+
+        #[test]
+        fn cluster_family_zwj() {
+            let mut term = clustering(10, 2);
+            feed(&mut term, "👨\u{200D}👩\u{200D}👧".as_bytes());
+            assert_wide_cluster(&term, 0, '👨', &['\u{200D}', '👩', '\u{200D}', '👧']);
+            assert_eq!(cursor_col(&term), 2);
+        }
+
+        #[test]
+        fn cluster_vs16_widens() {
+            let mut term = clustering(10, 2);
+            feed(&mut term, "❤\u{FE0F}x".as_bytes());
+            assert_wide_cluster(&term, 0, '❤', &['\u{FE0F}']);
+            assert_eq!(cell(&term, 0, 2).c, 'x');
+        }
+
+        #[test]
+        fn cluster_vs15_narrows() {
+            let mut term = clustering(10, 2);
+            feed(&mut term, "⌚\u{FE0E}x".as_bytes());
+            let c = cell(&term, 0, 0);
+            assert_eq!((c.c, pieces(&term, 0, 0)), ('⌚', vec!['\u{FE0E}']));
+            assert!(!c.flags.intersects(Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER));
+            assert_eq!(cell(&term, 0, 1).c, 'x');
+            assert!(!cell(&term, 0, 1).flags.contains(Flags::WIDE_CHAR_SPACER));
+        }
+
+        #[test]
+        fn cluster_vs_on_plain_base_ignored() {
+            let mut term = clustering(10, 2);
+            feed(&mut term, "a\u{FE0F}b".as_bytes());
+            assert!(!cell(&term, 0, 0).flags.contains(Flags::WIDE_CHAR));
+            assert_eq!(cell(&term, 0, 1).c, 'b');
+        }
+
+        #[test]
+        fn cluster_split_across_feeds() {
+            let mut term = clustering(10, 2);
+            let mut parser: Processor = Processor::new();
+            parser.advance(&mut term, "👨\u{200D}".as_bytes());
+            parser.advance(&mut term, "👩".as_bytes());
+            assert_wide_cluster(&term, 0, '👨', &['\u{200D}', '👩']);
+            assert_eq!(cursor_col(&term), 2);
+        }
+
+        #[test]
+        fn cluster_orphan_zero_width_dropped() {
+            let mut term = clustering(10, 2);
+            feed(&mut term, "\u{200D}".as_bytes());
+            assert!(pieces(&term, 0, 0).is_empty());
+            assert_eq!(cursor_col(&term), 0);
+        }
+
+        #[test]
+        fn cluster_piece_cap() {
+            let mut term = clustering(10, 2);
+            feed(&mut term, format!("👨{}", "\u{200D}".repeat(100)).as_bytes());
+            assert_eq!(pieces(&term, 0, 0).len(), MAX_CLUSTER_PIECES);
+        }
+
+        #[test]
+        fn cluster_mode_reset_unchanged() {
+            let mut term = term_with(Config::default(), 10, 2);
+            feed(&mut term, "🇮🇹".as_bytes());
+            assert_eq!(cell(&term, 0, 0).c, '🇮');
+            assert_eq!(cell(&term, 0, 1).c, '🇹');
+            assert_eq!(cursor_col(&term), 2);
+        }
+
+        #[test]
+        fn cluster_mode_enabled_midway() {
+            let mut term = term_with(Config::default(), 10, 2);
+            feed(&mut term, "e\u{301}".as_bytes());
+            feed(&mut term, "\x1b[?2027h\u{302}".as_bytes());
+            assert_eq!(pieces(&term, 0, 0), ['\u{301}', '\u{302}']);
+            assert_eq!(cursor_col(&term), 1);
+        }
+
+        /// Line 0's cells as `(char, wide, spacer)` triples.
+        fn row<T>(term: &Term<T>, line: i32) -> Vec<(char, bool, bool)> {
+            (0..term.columns())
+                .map(|col| {
+                    let c = cell(term, line, col);
+                    let f = c.flags;
+                    (c.c, f.contains(Flags::WIDE_CHAR), f.contains(Flags::WIDE_CHAR_SPACER))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn cluster_widens_in_last_column_wraps() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abcd❤\u{FE0F}".as_bytes());
+            let last = cell(&term, 0, 4);
+            assert!(last.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
+            assert!(last.flags.contains(Flags::WRAPLINE));
+            let wrapped = cell(&term, 1, 0);
+            assert_eq!((wrapped.c, pieces(&term, 1, 0)), ('❤', vec!['\u{FE0F}']));
+            assert!(wrapped.flags.contains(Flags::WIDE_CHAR));
+            assert!(cell(&term, 1, 1).flags.contains(Flags::WIDE_CHAR_SPACER));
+            assert_eq!(term.grid.cursor.point, Point::new(Line(1), Column(2)));
+        }
+
+        #[test]
+        fn cluster_widens_in_last_column_no_wrap() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "\x1b[?7labcd❤\u{FE0F}".as_bytes());
+            let last = cell(&term, 0, 4);
+            assert_eq!((last.c, pieces(&term, 0, 4)), ('❤', vec!['\u{FE0F}']));
+            assert!(!last.flags.contains(Flags::WIDE_CHAR));
+            assert_eq!(cell(&term, 1, 0).c, ' ');
+            assert_eq!(term.grid.cursor.point.line, Line(0));
+        }
+
+        #[test]
+        fn cluster_joins_under_pending_wrap() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abc👍\u{1F3FD}".as_bytes());
+            assert_eq!(pieces(&term, 0, 3), ['\u{1F3FD}']);
+            assert_eq!(cell(&term, 1, 0).c, ' ');
+            assert!(term.grid.cursor.input_needs_wrap);
+        }
+
+        #[test]
+        fn cluster_narrows_clears_spacer() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abc⌚\u{FE0E}".as_bytes());
+            assert!(!cell(&term, 0, 3).flags.contains(Flags::WIDE_CHAR));
+            assert!(!cell(&term, 0, 4).flags.contains(Flags::WIDE_CHAR_SPACER));
+            assert!(!term.grid.cursor.input_needs_wrap);
+            assert_eq!(cursor_col(&term), 4);
+        }
+
+        #[test]
+        fn cluster_widens_in_insert_mode_shifts() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "xyz\r\x1b[4h❤\u{FE0F}".as_bytes());
+            let expected = [
+                ('❤', true, false),
+                (' ', false, true),
+                ('x', false, false),
+                ('y', false, false),
+                ('z', false, false),
+            ];
+            assert_eq!(row(&term, 0), expected);
+        }
+
+        #[test]
+        fn cluster_widens_in_insert_mode_cuts_wide_at_edge() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "xy中\r\x1b[4h❤\u{FE0F}".as_bytes());
+            let expected = [
+                ('❤', true, false),
+                (' ', false, true),
+                ('x', false, false),
+                ('y', false, false),
+                (' ', false, false),
+            ];
+            assert_eq!(row(&term, 0), expected);
+        }
+
+        #[test]
+        fn cluster_overwrite_half_clears() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "🇮🇹\x1b[1;2Hx".as_bytes());
+            assert_eq!((cell(&term, 0, 0).c, pieces(&term, 0, 0)), (' ', vec![]));
+            assert_eq!(row(&term, 0)[1], ('x', false, false));
+
+            let mut term = clustering(5, 3);
+            feed(&mut term, "🇮🇹\x1b[1;1Hx".as_bytes());
+            assert_eq!((cell(&term, 0, 0).c, pieces(&term, 0, 0)), ('x', vec![]));
+            assert_eq!(row(&term, 0)[1], (' ', false, false));
+        }
+
+        #[test]
+        fn cluster_survives_history() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "🇮🇹\r\na\r\nb\r\nc\r\nd".as_bytes());
+            assert!(term.grid.history_size() >= 1);
+            let line = Line(-(term.grid.history_size() as i32));
+            let kept: Cell = term.grid.cell(Point::new(line, Column(0)));
+            assert_eq!(kept.c, '🇮');
+            assert_eq!(kept.zerowidth(), Some(&['🇹'][..]));
+            assert!(kept.flags.contains(Flags::WIDE_CHAR));
+        }
+
+        #[test]
+        fn cluster_survives_reflow() {
+            // The cluster must end up where a plain wide character ends up, whole.
+            let mut term = clustering(6, 3);
+            feed(&mut term, "ab🇮🇹".as_bytes());
+            let mut plain = clustering(6, 3);
+            feed(&mut plain, "ab中".as_bytes());
+            term.resize(TermSize::new(3, 3));
+            term.resize(TermSize::new(6, 3));
+            plain.resize(TermSize::new(3, 3));
+            plain.resize(TermSize::new(6, 3));
+
+            let lines = -(plain.grid.history_size() as i32)..plain.screen_lines() as i32;
+            let at = lines
+                .flat_map(|l| (0..6).map(move |c| Point::new(Line(l), Column(c))))
+                .find(|&p| plain.grid.cell(p).c == '中')
+                .expect("the plain wide character is somewhere");
+            let kept: Cell = term.grid.cell(at);
+            assert_eq!(kept.c, '🇮');
+            assert_eq!(kept.zerowidth(), Some(&['🇹'][..]));
+            assert!(kept.flags.contains(Flags::WIDE_CHAR));
+            let spacer: Cell = term.grid.cell(Point::new(at.line, at.column + 1));
+            assert!(spacer.flags.contains(Flags::WIDE_CHAR_SPACER));
+        }
+
+        #[test]
+        fn cluster_narrows_without_spacer_after_alt_screen_shrink() {
+            // The alternate screen does not reflow: shrinking by one column leaves a wide
+            // character in the last column without its spacer, with a wrap pending.
+            let mut term = clustering(6, 3);
+            feed(&mut term, "\x1b[?1049habcd⌚".as_bytes());
+            term.resize(TermSize::new(5, 3));
+            feed(&mut term, "\u{FE0E}".as_bytes());
+            let c = cell(&term, 0, 4);
+            assert_eq!((c.c, pieces(&term, 0, 4)), ('⌚', vec!['\u{FE0E}']));
+            assert!(!c.flags.contains(Flags::WIDE_CHAR));
+        }
+
+        #[test]
+        fn cluster_widening_in_one_column_stays_narrow() {
+            let mut term = clustering(1, 3);
+            feed(&mut term, "❤\u{FE0F}".as_bytes());
+            assert_eq!((cell(&term, 0, 0).c, pieces(&term, 0, 0)), ('❤', vec!['\u{FE0F}']));
+            assert!(!cell(&term, 0, 0).flags.contains(Flags::WIDE_CHAR));
+        }
+
+        #[test]
+        fn cluster_moved_at_the_edge_keeps_its_colors() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abcd\x1b[31m❤\x1b[0m\u{FE0F}".as_bytes());
+            let moved = cell(&term, 1, 0);
+            assert_eq!(moved.c, '❤');
+            assert!(moved.flags.contains(Flags::WIDE_CHAR));
+            assert_eq!(moved.fg, Color::Named(NamedColor::Red));
+            assert_eq!(cell(&term, 1, 1).fg, Color::Named(NamedColor::Red));
+        }
+
+        #[test]
+        fn cluster_after_a_space_ignores_its_style() {
+            // A visible joiner never joins a space, styled or not.
+            let mut term = clustering(10, 2);
+            feed(&mut term, "a\x1b[4m \x1b[0m\u{1F3FD}".as_bytes());
+            assert_eq!((cell(&term, 0, 1).c, pieces(&term, 0, 1)), (' ', vec![]));
+            assert_eq!(cell(&term, 0, 2).c, '\u{1F3FD}');
+            // A zero-width mark joins a space, styled or not, as it does without the mode.
+            let mut term = clustering(10, 2);
+            feed(&mut term, "a \u{301}b\x1b[4m \x1b[0m\u{200D}".as_bytes());
+            assert_eq!(pieces(&term, 0, 1), ['\u{301}']);
+            assert_eq!(cell(&term, 0, 2).c, 'b');
+            assert_eq!(pieces(&term, 0, 3), ['\u{200D}']);
+        }
+
+        #[test]
+        fn cluster_narrows_in_insert_mode_shifts_back() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abc\r\x1b[4h⌚\u{FE0E}x".as_bytes());
+            let expected = [
+                ('⌚', false, false),
+                ('x', false, false),
+                ('a', false, false),
+                ('b', false, false),
+                ('c', false, false),
+            ];
+            assert_eq!(row(&term, 0), expected);
+        }
+
+        #[test]
+        fn cluster_narrowed_after_a_wrap_moves_back() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abcd⌚\u{FE0E}".as_bytes());
+            let back = cell(&term, 0, 4);
+            assert_eq!((back.c, pieces(&term, 0, 4)), ('⌚', vec!['\u{FE0E}']));
+            assert!(
+                !back.flags.intersects(
+                    Flags::WIDE_CHAR | Flags::LEADING_WIDE_CHAR_SPACER | Flags::WRAPLINE
+                )
+            );
+            assert_eq!(row(&term, 1)[0], (' ', false, false));
+            assert_eq!(row(&term, 1)[1], (' ', false, false));
+            assert_eq!(term.grid.cursor.point, Point::new(Line(0), Column(4)));
+            assert!(term.grid.cursor.input_needs_wrap);
+            feed(&mut term, b"y");
+            assert!(cell(&term, 0, 4).flags.contains(Flags::WRAPLINE));
+            assert_eq!(cell(&term, 1, 0).c, 'y');
+        }
+
+        #[test]
+        fn mode_2027_is_reset_by_default() {
+            let term = term_with(Config::default(), 10, 2);
+            assert!(!on(&term));
+        }
+
+        #[test]
+        fn mode_2027_set_and_reset() {
+            let mut term = term_with(Config::default(), 10, 2);
+            feed(&mut term, b"\x1b[?2027h");
+            assert!(on(&term));
+            feed(&mut term, b"\x1b[?2027l");
+            assert!(!on(&term));
+        }
+
+        #[test]
+        fn mode_2027_reports_state() {
+            let mut term = term_with(Config::default(), 10, 2);
+            let replies = term.event_proxy.clone();
+            feed(&mut term, b"\x1b[?2027$p");
+            feed(&mut term, b"\x1b[?2027h\x1b[?2027$p");
+            assert_eq!(*replies.0.lock().unwrap(), ["\x1b[?2027;2$y", "\x1b[?2027;1$y"]);
+        }
+
+        #[test]
+        fn mode_2027_default_from_config() {
+            let config = Config { grapheme_clusters: true, ..Config::default() };
+            let mut term = term_with(config, 10, 2);
+            assert!(on(&term));
+            feed(&mut term, b"\x1b[?2027l");
+            assert!(!on(&term));
+            feed(&mut term, b"\x1bc");
+            assert!(on(&term));
+        }
+
+        #[test]
+        fn reset_grapheme_cluster_mode_restores_default() {
+            let mut term = term_with(Config::default(), 10, 2);
+            feed(&mut term, b"\x1b[?2027h");
+            term.reset_grapheme_cluster_mode();
+            assert!(!on(&term));
+        }
+
+        #[test]
+        fn set_options_never_flips_mode_2027() {
+            let mut term = term_with(Config::default(), 10, 2);
+            feed(&mut term, b"\x1b[?2027h");
+            term.set_options(Config::default());
+            assert!(on(&term));
+
+            let config = Config { grapheme_clusters: true, ..Config::default() };
+            let mut term = term_with(config.clone(), 10, 2);
+            feed(&mut term, b"\x1b[?2027l");
+            term.set_options(config);
+            assert!(!on(&term));
+        }
     }
 }

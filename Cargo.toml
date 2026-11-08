@@ -4,7 +4,7 @@
 name = "feathercritty"
 # The alacritty_terminal release this fork is based on, plus the fork's own revision as build
 # metadata; see README.md.
-version = "0.26.0+fbterm.5"
+version = "0.26.0+fbterm.6"
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 license = "Apache-2.0"
 description = "Terminal emulation library for featherbit terminal, forked from alacritty_terminal"
@@ -32,6 +32,7 @@ log = "0.4"
 parking_lot = "0.12.0"
 polling = "3.8.0"
 regex-automata = "0.4.3"
+unicode-segmentation = "1.12"
 unicode-width = "0.2.0"
 vte = { version = "0.15.0", default-features = false, features = ["std", "ansi"] }
 serde = { version = "1", features = ["derive", "rc"], optional = true }
