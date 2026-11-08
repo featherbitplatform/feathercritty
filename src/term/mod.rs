@@ -1098,8 +1098,6 @@ impl<T> Term<T> {
         self.damage_cursor();
     }
 
-    /// Write `c` to the cell at the cursor position.
-    #[inline(always)]
     /// Join `c` onto the cluster in the previous cell while mode 2027 is set, changing the
     /// cluster's width when `c` asks for it. Returns false when a grapheme boundary falls
     /// before `c` (or there is no cluster), so `c` is printed as usual.
@@ -1148,6 +1146,10 @@ impl<T> Term<T> {
         T: EventListener,
     {
         let columns = self.columns();
+        // A one-column terminal has no room for a wide cluster anywhere: it stays narrow.
+        if columns < 2 {
+            return;
+        }
         if col.0 + 1 >= columns {
             // No room in this row: like a wide character that does not fit, the cluster moves
             // whole to the start of the next line behind a leading spacer. Without line wrap
@@ -1162,12 +1164,19 @@ impl<T> Term<T> {
             self.grid.cursor.template.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
             self.wrapline();
 
+            // The cluster keeps its own colors, attributes, pieces and hyperlink, not the
+            // current template's.
             self.write_at_cursor(moved.c);
             let line = self.grid.cursor.point.line;
             let cell = &mut self.grid.screen_mut()[line][Column(0)];
-            for &piece in moved.zerowidth().unwrap_or(&[]) {
-                cell.push_zerowidth(piece);
-            }
+            let layout = Flags::WIDE_CHAR
+                | Flags::WIDE_CHAR_SPACER
+                | Flags::LEADING_WIDE_CHAR_SPACER
+                | Flags::WRAPLINE;
+            cell.fg = moved.fg;
+            cell.bg = moved.bg;
+            cell.flags = (cell.flags & layout) | (moved.flags & !layout);
+            cell.extra = moved.extra.clone();
             self.widen_cluster(line, Column(0));
             return;
         }
@@ -1192,6 +1201,11 @@ impl<T> Term<T> {
         self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR_SPACER);
         self.write_at_cursor(' ');
         self.grid.cursor.template.flags.remove(Flags::WIDE_CHAR_SPACER);
+        // The spacer takes the cluster's colors, as a wide character's spacer does.
+        let row = &mut self.grid.screen_mut()[line];
+        let (fg, bg) = (row[col].fg, row[col].bg);
+        row[col + 1].fg = fg;
+        row[col + 1].bg = bg;
         self.damage.damage_line(line.0 as usize, col.0, col.0 + 1);
 
         if col.0 + 2 < columns {
@@ -1207,16 +1221,26 @@ impl<T> Term<T> {
     ///
     /// feathercritty: not upstream.
     fn narrow_cluster(&mut self, line: Line, col: Column) {
+        let columns = self.columns();
         let screen = self.grid.screen_mut();
         screen[line][col].flags.remove(Flags::WIDE_CHAR);
-        let spacer = &mut screen[line][col + 1];
-        spacer.flags.remove(Flags::WIDE_CHAR_SPACER);
-        spacer.c = ' ';
-        self.damage.damage_line(line.0 as usize, col.0, col.0 + 1);
-        self.grid.cursor.point.column = col + 1;
-        self.grid.cursor.input_needs_wrap = false;
+        // A wide character in the last column has no spacer (the alternate screen does not
+        // reflow, so a shrink can leave one there).
+        if col.0 + 1 < columns {
+            let spacer = &mut screen[line][col + 1];
+            spacer.flags.remove(Flags::WIDE_CHAR_SPACER);
+            spacer.c = ' ';
+            self.grid.cursor.point.column = col + 1;
+            self.grid.cursor.input_needs_wrap = false;
+        } else {
+            self.grid.cursor.point.column = col;
+            self.grid.cursor.input_needs_wrap = true;
+        }
+        self.damage.damage_line(line.0 as usize, col.0, columns - 1);
     }
 
+    /// Write `c` to the cell at the cursor position.
+    #[inline(always)]
     fn write_at_cursor(&mut self, c: char) {
         let c = self.grid.cursor.charsets[self.active_charset].map(c);
         let fg = self.grid.cursor.template.fg;
@@ -3984,6 +4008,38 @@ mod tests {
             assert!(kept.flags.contains(Flags::WIDE_CHAR));
             let spacer: Cell = term.grid.cell(Point::new(at.line, at.column + 1));
             assert!(spacer.flags.contains(Flags::WIDE_CHAR_SPACER));
+        }
+
+        #[test]
+        fn cluster_narrows_without_spacer_after_alt_screen_shrink() {
+            // The alternate screen does not reflow: shrinking by one column leaves a wide
+            // character in the last column without its spacer, with a wrap pending.
+            let mut term = clustering(6, 3);
+            feed(&mut term, "\x1b[?1049habcd⌚".as_bytes());
+            term.resize(TermSize::new(5, 3));
+            feed(&mut term, "\u{FE0E}".as_bytes());
+            let c = cell(&term, 0, 4);
+            assert_eq!((c.c, pieces(&term, 0, 4)), ('⌚', vec!['\u{FE0E}']));
+            assert!(!c.flags.contains(Flags::WIDE_CHAR));
+        }
+
+        #[test]
+        fn cluster_widening_in_one_column_stays_narrow() {
+            let mut term = clustering(1, 3);
+            feed(&mut term, "❤\u{FE0F}".as_bytes());
+            assert_eq!((cell(&term, 0, 0).c, pieces(&term, 0, 0)), ('❤', vec!['\u{FE0F}']));
+            assert!(!cell(&term, 0, 0).flags.contains(Flags::WIDE_CHAR));
+        }
+
+        #[test]
+        fn cluster_moved_at_the_edge_keeps_its_colors() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abcd\x1b[31m❤\x1b[0m\u{FE0F}".as_bytes());
+            let moved = cell(&term, 1, 0);
+            assert_eq!(moved.c, '❤');
+            assert!(moved.flags.contains(Flags::WIDE_CHAR));
+            assert_eq!(moved.fg, Color::Named(NamedColor::Red));
+            assert_eq!(cell(&term, 1, 1).fg, Color::Named(NamedColor::Red));
         }
 
         #[test]
