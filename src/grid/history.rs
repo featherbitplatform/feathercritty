@@ -124,7 +124,12 @@
 //!   `set_limit` and switching compression off; an install that warms a cached block, and freeing a
 //!   cold block, drop its entry.
 //! - **Off means off.** With `None` (the default) and no cold block left, no job exists, `has_jobs`
-//!   is false and the paths above cost one `Option` or `cold` check each.
+//!   is false and the paths above cost one `Option` or `cold` check each. Two details keep the warm
+//!   paths as fast as before the cold state (measured against the fork's `main`,
+//!   `benches/RESULTS.md`, "History compression"): every read reaches a record through
+//!   `with_record`, which hands a closure the borrowed bytes of a warm block (an enum carrying an
+//!   `Arc` made warm reads up to 5% slower), and a stored record's entry takes its header bits from
+//!   the encoder (or from the entry it was copied from), never by parsing the record again.
 //!
 //! # Why the records hold no pointers
 //!
@@ -151,7 +156,7 @@
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
-use std::ops::{Deref, Range};
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, mem};
@@ -221,25 +226,6 @@ impl Cache {
     /// Forget the block `seq` (it was warmed or freed).
     fn remove(&mut self, seq: u32) {
         self.entries.retain(|cached| cached.seq != seq);
-    }
-}
-
-/// The bytes of one record: borrowed from a warm block, or held in a decompressed cold block
-/// (which a read can keep while the cache moves on).
-enum Record<'a> {
-    Warm(&'a [u8]),
-    Cold(Arc<Vec<u8>>, Range<usize>),
-}
-
-impl Deref for Record<'_> {
-    type Target = [u8];
-
-    #[inline]
-    fn deref(&self) -> &[u8] {
-        match self {
-            Record::Warm(bytes) => bytes,
-            Record::Cold(block, range) => &block[range.clone()],
-        }
     }
 }
 
@@ -341,20 +327,26 @@ impl Entry {
     const LEN: u32 = Self::CLEAR - 1;
     const WRAPS: u32 = 1 << 31;
 
-    /// An entry for the record `record` of `len` bytes: the header bits are copied from it.
+    /// An entry for a record of `len` bytes whose header has the bits `bits` (from
+    /// [`Entry::bits`], or another entry's [`Entry::header_bits`]). The caller has them at hand
+    /// (the encoder returns the header), so storing a record never parses it again.
     #[inline]
-    fn new(block: u32, offset: usize, record: &[u8], first_extra: u32) -> Entry {
-        let len = record.len();
+    fn new(block: u32, offset: usize, len: usize, bits: u32, first_extra: u32) -> Entry {
         debug_assert!(len < 1 << 30, "history record of {len} bytes");
-        let header = read_header(record);
-        let mut len_flags = len as u32;
-        if header.wraps {
-            len_flags |= Self::WRAPS;
-        }
-        if header.clear {
-            len_flags |= Self::CLEAR;
-        }
-        Entry { block, offset: offset as u32, len_flags, first_extra }
+        debug_assert_eq!(bits & Self::LEN, 0, "header bits overlap the length");
+        Entry { block, offset: offset as u32, len_flags: len as u32 | bits, first_extra }
+    }
+
+    /// The bits [`Entry::new`] takes for a record with header `header`.
+    #[inline]
+    fn bits(header: &RowHeader) -> u32 {
+        (if header.wraps { Self::WRAPS } else { 0 }) | (if header.clear { Self::CLEAR } else { 0 })
+    }
+
+    /// This entry's header bits, for an entry of a copy of its record (`move_oldest_to`).
+    #[inline]
+    fn header_bits(self) -> u32 {
+        self.len_flags & !Self::LEN
     }
 
     /// Length of the record in bytes.
@@ -610,6 +602,13 @@ impl<T: HistoryCell> History<T> {
         sibling
     }
 
+    /// [`History::sibling`] with compression off: a reflow builds its new history warm without
+    /// the per-row warm-row accounting, and sets the compression when the pass is done (one
+    /// count over the warm rows, `set_compression`).
+    pub(crate) fn sibling_warm(&self, limit: usize) -> Self {
+        Self::with_block_size(limit, self.block_bytes)
+    }
+
     /// Whether each block, oldest first, is cold (test hook, not a stable API).
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn cold_blocks(&self) -> Vec<bool> {
@@ -729,8 +728,8 @@ impl<T: HistoryCell> History<T> {
             Some(entry) => entry,
             None => {
                 self.encoded.clear();
-                T::encode(row, &mut self.encoded, &mut self.extras);
-                self.store(first_extra)
+                let header = T::encode(row, &mut self.encoded, &mut self.extras);
+                self.store(first_extra, Entry::bits(&header))
             },
         };
         self.reserve_index();
@@ -754,18 +753,18 @@ impl<T: HistoryCell> History<T> {
             .filter(|block| !block.oversized && self.block_bytes - block.bytes.len() >= bound)?;
 
         let offset = block.bytes.len();
-        T::encode(row, &mut block.bytes, &mut self.extras);
+        let bits = Entry::bits(&T::encode(row, &mut block.bytes, &mut self.extras));
         debug_assert_eq!(block.bytes.capacity(), self.block_bytes, "a block reallocated");
         let len = block.bytes.len() - offset;
         if len > self.block_bytes / 4 {
             self.encoded.clear();
             self.encoded.extend_from_slice(&block.bytes[offset..]);
             block.bytes.truncate(offset);
-            return Some(self.store(first_extra));
+            return Some(self.store(first_extra, bits));
         }
 
         block.live += 1;
-        Some(Entry::new(block_seq, offset, &block.bytes[offset..], first_extra))
+        Some(Entry::new(block_seq, offset, len, bits, first_extra))
     }
 
     /// Make room for one more index entry. The index grows by doubling, as a `VecDeque` does,
@@ -863,9 +862,10 @@ impl<T: HistoryCell> History<T> {
         match self.position(i) {
             Some(pos) => {
                 let entry = self.index[pos];
-                let bytes = self.record(entry);
-                self.with_extras(entry, self.extras_after(pos), |extras| {
-                    T::decode_cell(&bytes, extras, column.0)
+                self.with_record(entry, |bytes| {
+                    self.with_extras(entry, self.extras_after(pos), |extras| {
+                        T::decode_cell(bytes, extras, column.0)
+                    })
                 })
             },
             None => T::default(),
@@ -899,17 +899,18 @@ impl<T: HistoryCell> History<T> {
         let start = entry.first_extra.wrapping_sub(self.extras_base) as usize;
         let old_count = old_end.wrapping_sub(entry.first_extra) as usize;
         self.encoded.clear();
+        let header;
         if pos + 1 == self.index.len() {
             // The newest row's extras end the queue: replace them in place.
             self.extras.truncate(start);
-            T::encode(&row, &mut self.encoded, &mut self.extras);
+            header = T::encode(&row, &mut self.encoded, &mut self.extras);
         } else {
             // The encoder appends the row's extras to the queue; move them into the row's own
             // slots, growing or shrinking those (and moving every newer row's position) when the
             // count changed. O(len) then, but the library's one history write (`Term::input`
             // clearing a flag on the newest row) never gets here.
             let end = self.extras.len();
-            T::encode(&row, &mut self.encoded, &mut self.extras);
+            header = T::encode(&row, &mut self.encoded, &mut self.extras);
             let new: Vec<T::Extra> = self.extras.drain(end..).collect();
             let new_count = new.len();
             if new_count == old_count {
@@ -928,7 +929,7 @@ impl<T: HistoryCell> History<T> {
             }
         }
 
-        let new = self.store(entry.first_extra);
+        let new = self.store(entry.first_extra, Entry::bits(&header));
         self.index[pos] = new;
         if warm {
             self.warm_enter(new.block);
@@ -939,12 +940,12 @@ impl<T: HistoryCell> History<T> {
     /// [`HistoryCell::reflow_info`] of the oldest row, `None` when the history is empty or the
     /// format has no reflow fast path.
     pub(crate) fn oldest_reflow_info(&self) -> Option<ReflowInfo> {
-        self.index.front().and_then(|&entry| T::reflow_info(&self.record(entry)))
+        self.index.front().and_then(|&entry| self.with_record(entry, T::reflow_info))
     }
 
     /// The header of the newest row, `None` when the history is empty.
     pub(crate) fn newest_header(&self) -> Option<RowHeader> {
-        self.index.back().map(|&entry| read_header(&self.record(entry)))
+        self.index.back().map(|&entry| self.with_record(entry, read_header))
     }
 
     /// Move the oldest row to `to` as its newest row without decoding it: its record is copied
@@ -958,7 +959,7 @@ impl<T: HistoryCell> History<T> {
         };
 
         to.encoded.clear();
-        compact::copy_with_width(&self.record(entry), width, &mut to.encoded);
+        self.with_record(entry, |bytes| compact::copy_with_width(bytes, width, &mut to.encoded));
         if self.compression.is_some_and(|keep| self.index.len() < keep) {
             self.warm_leave(entry.block);
         }
@@ -970,12 +971,13 @@ impl<T: HistoryCell> History<T> {
         let end = self.index.front().map_or_else(|| self.extras_end(), |next| next.first_extra);
         let count = end.wrapping_sub(entry.first_extra) as usize;
         self.extras_base = end;
-        to.push_encoded(self.extras.drain(..count));
+        to.push_encoded(entry.header_bits(), self.extras.drain(..count));
     }
 
-    /// Append the record in `encoded`, whose extras are `extras`, as the newest row (evicting the
-    /// oldest at the limit, storing nothing at a limit of 0).
-    fn push_encoded(&mut self, extras: impl Iterator<Item = T::Extra>) {
+    /// Append the record in `encoded`, whose header bits are `bits` (see [`Entry::new`]) and whose
+    /// extras are `extras`, as the newest row (evicting the oldest at the limit, storing nothing
+    /// at a limit of 0).
+    fn push_encoded(&mut self, bits: u32, extras: impl Iterator<Item = T::Extra>) {
         if self.limit == 0 {
             return;
         }
@@ -985,7 +987,7 @@ impl<T: HistoryCell> History<T> {
 
         let first_extra = self.extras_end();
         self.extras.extend(extras);
-        let entry = self.store(first_extra);
+        let entry = self.store(first_extra, bits);
         self.reserve_index();
         self.index.push_back(entry);
         if let Some(keep) = self.compression {
@@ -1086,16 +1088,38 @@ impl<T: HistoryCell> History<T> {
         self.index.get(pos + 1).map_or_else(|| self.extras_end(), |next| next.first_extra)
     }
 
-    /// The record `entry` points to, read through the cache when its block is cold.
+    /// `f` of the record `entry` points to, read through the cache when its block is cold.
     #[inline]
-    fn record(&self, entry: Entry) -> Record<'_> {
+    fn with_record<R>(&self, entry: Entry, f: impl FnOnce(&[u8]) -> R) -> R {
         let block = &self.blocks[entry.block.wrapping_sub(self.front_seq) as usize];
         let range = entry.offset as usize..entry.offset as usize + entry.len();
         if block.cold {
-            Record::Cold(self.decompressed(entry.block, block), range)
+            self.with_cold_record(entry.block, block, range, f)
         } else {
-            Record::Warm(&block.bytes[range])
+            f(&block.bytes[range])
         }
+    }
+
+    /// `f` of the bytes `range` of the cold block `seq`. Most reads hit the block read last (a
+    /// sweep, a screen of rows), which `f` reads in place under a shared borrow of the cache: no
+    /// reordering and no reference counting per record.
+    #[inline(never)]
+    fn with_cold_record<R>(
+        &self,
+        seq: u32,
+        block: &Block,
+        range: Range<usize>,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> R {
+        if let Ok(cache) = self.cache.try_borrow() {
+            let last = cache.entries.last();
+            if let Some(cached) =
+                last.filter(|cached| cached.seq == seq && cached.generation == block.generation)
+            {
+                return f(&cached.bytes[range]);
+            }
+        }
+        f(&self.decompressed(seq, block)[range])
     }
 
     /// The decompressed bytes of the cold block `seq`, from the cache, or decompressed into it
@@ -1103,7 +1127,13 @@ impl<T: HistoryCell> History<T> {
     #[cold]
     #[inline(never)]
     fn decompressed(&self, seq: u32, block: &Block) -> Arc<Vec<u8>> {
-        let mut cache = self.cache.borrow_mut();
+        let Ok(mut cache) = self.cache.try_borrow_mut() else {
+            // A read nested in another cold read's `f` (none does so today): decompress without
+            // touching the cache the outer read is borrowing.
+            let mut buffer = Vec::new();
+            cold::decompress(&block.bytes, &mut buffer);
+            return Arc::new(buffer);
+        };
         let entries = &mut cache.entries;
         let hit = entries
             .iter()
@@ -1155,25 +1185,30 @@ impl<T: HistoryCell> History<T> {
 
     /// Decode the row `entry` points to, whose extras end at position `extras_end`, into `into`.
     fn decode(&self, entry: Entry, extras_end: u32, into: &mut Row<T>) {
-        let bytes = self.record(entry);
+        self.with_record(entry, |bytes| self.decode_record(bytes, entry, extras_end, into));
+    }
+
+    #[inline]
+    fn decode_record(&self, bytes: &[u8], entry: Entry, extras_end: u32, into: &mut Row<T>) {
         // The entry's copies of the header bits must be the record's (`wraps` and `is_clear`
         // answer from them).
         debug_assert!(
             {
-                let header = read_header(&bytes);
+                let header = read_header(bytes);
                 (header.wraps, header.clear) == (entry.wraps(), entry.clear())
             },
             "history entry header bits disagree with its record"
         );
-        let used = self.with_extras(entry, extras_end, |extras| T::decode(&bytes, extras, into));
+        let used = self.with_extras(entry, extras_end, |extras| T::decode(bytes, extras, into));
         // A wrong offset or length must not decode silently.
         debug_assert_eq!(used, entry.len(), "history record length disagrees with index");
     }
 
-    /// Copy the record in `encoded` to a block and return its entry: into the newest block when
+    /// Copy the record in `encoded`, whose header bits are `bits` (see [`Entry::new`]), to a block
+    /// and return its entry: into the newest block when
     /// it fits there, else into a new block (a spare when there is one); a record larger than a
     /// quarter block into a block of its own.
-    fn store(&mut self, first_extra: u32) -> Entry {
+    fn store(&mut self, first_extra: u32, bits: u32) -> Entry {
         let len = self.encoded.len();
         let oversized = len > self.block_bytes / 4;
         let fits = |block: &Block| !block.oversized && block.bytes.len() + len <= self.block_bytes;
@@ -1194,7 +1229,7 @@ impl<T: HistoryCell> History<T> {
         block.live += 1;
         debug_assert!(oversized || block.bytes.len() <= self.block_bytes);
 
-        Entry::new(block_seq, offset, &self.encoded, first_extra)
+        Entry::new(block_seq, offset, len, bits, first_extra)
     }
 
     /// Append a new, empty block with buffer `bytes` as the newest block. The block that was
@@ -1214,24 +1249,41 @@ impl<T: HistoryCell> History<T> {
     /// entry points into it any more, and remove the emptied blocks at either end of the deque.
     /// A block that becomes the newest again gets a new generation, and is warmed now if cold.
     fn release(&mut self, entry: Entry) {
-        let generation = self.generation + 1;
-        let block = &mut self.blocks[entry.block.wrapping_sub(self.front_seq) as usize];
+        let at = entry.block.wrapping_sub(self.front_seq) as usize;
+        let block = &mut self.blocks[at];
         block.live -= 1;
         if !block.cold && entry.offset as usize + entry.len() == block.bytes.len() {
             block.bytes.truncate(entry.offset as usize);
             // A job may hold a copy of the longer bytes.
-            block.generation = generation;
-            self.generation = generation;
+            self.renew(at);
         }
-        if block.live == 0 {
-            // A block in the middle of the deque stays as an empty placeholder (its sequence
-            // number must stay taken) until it reaches an end, but its buffer is reused now.
-            let bytes = mem::take(&mut block.bytes);
-            if mem::take(&mut block.cold) {
-                self.cache.get_mut().remove(entry.block);
-            } else {
-                self.recycle(bytes);
-            }
+        if self.blocks[at].live == 0 {
+            self.empty_block(at);
+        }
+    }
+
+    /// Give the block at `at` a fresh generation.
+    #[cold]
+    #[inline(never)]
+    fn renew(&mut self, at: usize) {
+        let generation = self.next_generation();
+        self.blocks[at].generation = generation;
+    }
+
+    /// The block at `at` lost its last entry (see `release`): reuse or free its buffer, and
+    /// remove the emptied blocks at either end of the deque. Once per block, so kept out of
+    /// `release`'s inlined path.
+    #[cold]
+    #[inline(never)]
+    fn empty_block(&mut self, at: usize) {
+        // A block in the middle of the deque stays as an empty placeholder (its sequence
+        // number must stay taken) until it reaches an end, but its buffer is reused now.
+        let block = &mut self.blocks[at];
+        let bytes = mem::take(&mut block.bytes);
+        if mem::take(&mut block.cold) {
+            self.cache.get_mut().remove(self.front_seq.wrapping_add(at as u32));
+        } else {
+            self.recycle(bytes);
         }
 
         while self.blocks.front().is_some_and(|block| block.live == 0) {
@@ -1301,7 +1353,7 @@ impl History<Cell> {
     /// because a cold row's record lives in the read cache only while it is read.
     pub(crate) fn plain_text<R>(&self, i: usize, f: impl FnOnce(PlainText<'_>) -> R) -> Option<R> {
         let pos = self.position(i)?;
-        compact::plain_text(&self.record(self.index[pos])).map(f)
+        self.with_record(self.index[pos], |bytes| compact::plain_text(bytes).map(f))
     }
 }
 
@@ -2299,7 +2351,7 @@ mod tests {
         assert!(answers.iter().any(|a| a.1) && answers.iter().any(|a| !a.1));
 
         for (i, &(wraps, clear)) in answers.iter().enumerate() {
-            let header = read_header(&history.record(history.index[history.len() - 1 - i]));
+            let header = history.with_record(history.index[history.len() - 1 - i], read_header);
             assert_eq!((header.wraps, header.clear), (wraps, clear), "row {i}");
         }
     }
@@ -2601,6 +2653,26 @@ mod tests {
         let mut history = varied(100);
         history.index[50].len_flags ^= Entry::CLEAR;
         read(&history, 49);
+    }
+
+    /// A cold read nested in another cold read's closure reads the right bytes, whether the
+    /// outer read hit the cache's newest block (a shared borrow) or not.
+    #[test]
+    fn nested_cold_reads() {
+        let mut history = varied(2000);
+        let warm = history.clone();
+        history.set_compression(Some(10));
+        run_and_check(&mut history);
+        let (a, b) = (history.index[0], history.index[1500]);
+        assert_ne!(a.block, b.block);
+        assert!(history.cold_blocks()[0]);
+        let bytes = |h: &History<usize>, e: Entry| h.with_record(e, <[u8]>::to_vec);
+        let (wa, wb) = (bytes(&warm, a), bytes(&warm, b));
+        for _ in 0..2 {
+            let (ra, rb) = history.with_record(a, |ra| (ra.to_vec(), bytes(&history, b)));
+            assert_eq!((ra, rb), (wa.clone(), wb.clone()));
+        }
+        check_store(&history);
     }
 
     /// `run_jobs` stops at a refused install instead of offering the same job forever.
