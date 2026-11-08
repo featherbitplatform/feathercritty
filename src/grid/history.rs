@@ -101,6 +101,11 @@
 //!   Whatever can make a block disagree lowers `scan` to it: a block's warm count reaching zero, a
 //!   cold block's leaving zero, a new block making the previous newest one eligible, and a setting
 //!   change (from the front). A job left uninstalled is offered again.
+//! - **Batches.** [`History::next_jobs`] takes up to `max` such blocks at once, oldest first
+//!   (`next_job` is a batch of one); they are independent and install in any order. A worker that
+//!   installs one batch and takes the next in a single lock hold needs one hold per batch: with one
+//!   job per hold, a parser that holds the lock almost all the time (a sustained flood) starved the
+//!   worker and the backlog grew without bound (`benches/RESULTS.md`, "History compression").
 //! - **The identity rule.** A job carries its block's sequence number and `generation`, a value
 //!   from a history-wide counter that never repeats (not even across `clear`, which resets
 //!   `front_seq`). A block gets a new generation when it is created, changes state, loses bytes (a
@@ -518,20 +523,51 @@ impl<T: HistoryCell> History<T> {
     /// block is in the state the setting asks for. Taking a job changes nothing: until it is
     /// installed, the next call offers the same block again.
     pub fn next_job(&mut self) -> Option<Job> {
-        let start = self.position_of(self.scan?);
-        let Some(at) = (start..self.blocks.len()).find(|&at| self.disagrees(at)) else {
-            self.scan = None;
-            return None;
-        };
+        self.next_jobs(1).pop()
+    }
 
-        let seq = self.front_seq.wrapping_add(at as u32);
-        self.scan = Some(seq);
+    /// Up to `max` blocks that need to change state, oldest first, each with a copy of its bytes
+    /// (the first is the one [`History::next_job`] offers). A worker that takes a batch in one
+    /// lock hold keeps up with output that holds the lock almost all the time. Taking jobs
+    /// changes nothing; they can be installed in any order.
+    pub fn next_jobs(&mut self, max: usize) -> Vec<Job> {
+        let mut jobs = Vec::new();
+        let Some(scan) = self.scan else {
+            return jobs;
+        };
+        if max == 0 {
+            return jobs;
+        }
+
+        for at in self.position_of(scan)..self.blocks.len() {
+            if !self.disagrees(at) {
+                continue;
+            }
+            let seq = self.front_seq.wrapping_add(at as u32);
+            if jobs.is_empty() {
+                // Every older block agrees.
+                self.scan = Some(seq);
+                jobs.reserve_exact(max.min(self.blocks.len() - at));
+            }
+            jobs.push(self.job(at, seq));
+            if jobs.len() == max {
+                return jobs;
+            }
+        }
+        if jobs.is_empty() {
+            self.scan = None;
+        }
+        jobs
+    }
+
+    /// The job for the block at `at` (sequence number `seq`), with a copy of its bytes.
+    fn job(&self, at: usize, seq: u32) -> Job {
         let block = &self.blocks[at];
         let capacity = match block {
             Block { cold: true, oversized: true, bytes, .. } => cold::uncompressed_len(bytes),
             _ => self.block_bytes,
         };
-        Some(Job {
+        Job {
             history: self.id,
             seq,
             generation: block.generation,
@@ -539,7 +575,7 @@ impl<T: HistoryCell> History<T> {
             to_cold: !block.cold,
             bytes: block.bytes.clone(),
             capacity,
-        })
+        }
     }
 
     /// Swap the result of a job in, if it was taken from this history, its block still exists
@@ -2673,6 +2709,49 @@ mod tests {
             assert_eq!((ra, rb), (wa.clone(), wb.clone()));
         }
         check_store(&history);
+    }
+
+    /// `next_jobs` hands out several blocks at once (a worker copies a batch in one lock hold):
+    /// the first is `next_job`'s, they are distinct and oldest first, taking them changes
+    /// nothing, and installing them in any order reaches the same state as `run_jobs`.
+    #[test]
+    fn next_jobs_takes_a_batch() {
+        let mut history = varied(2000);
+        let mut reference = history.clone();
+        history.set_compression(Some(10));
+        reference.set_compression(Some(10));
+
+        let first = history.next_job().expect("a job");
+        let batch = history.next_jobs(5);
+        assert_eq!(batch.len(), 5);
+        assert_eq!((batch[0].seq, batch[0].generation), (first.seq, first.generation));
+        assert!(batch.windows(2).all(|pair| pair[0].seq.wrapping_sub(history.front_seq)
+            < pair[1].seq.wrapping_sub(history.front_seq)));
+        // Taking changes nothing: the same batch is offered again.
+        let again: Vec<u32> = history.next_jobs(5).iter().map(|job| job.seq).collect();
+        assert_eq!(again, batch.iter().map(|job| job.seq).collect::<Vec<_>>());
+
+        // Installed newest first: every one is accepted.
+        let done: Vec<Done> = batch.into_iter().map(Job::run).collect();
+        for done in done.into_iter().rev() {
+            assert!(history.install(done));
+        }
+        while history.has_jobs() {
+            let batch = history.next_jobs(7);
+            if batch.is_empty() {
+                break;
+            }
+            for job in batch {
+                assert!(history.install(job.run()));
+            }
+        }
+        assert!(!history.has_jobs());
+        assert!(history.next_jobs(3).is_empty());
+        run_and_check(&mut history);
+        run_and_check(&mut reference);
+        assert_eq!(history.cold_blocks(), reference.cold_blocks());
+        assert_same_rows(&history, &reference);
+        assert!(history.next_jobs(0).is_empty());
     }
 
     /// `run_jobs` stops at a refused install instead of offering the same job forever.

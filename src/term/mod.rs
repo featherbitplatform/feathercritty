@@ -856,6 +856,27 @@ impl<T> Term<T> {
         None
     }
 
+    /// Up to `max` history blocks that need to be compressed or decompressed, oldest first, each
+    /// with a copy of its bytes (feathercritty). Like [`Term::next_history_job`], taking jobs
+    /// changes nothing; run each with [`HistoryJob::run`] outside the lock and install the
+    /// results with [`Term::install_history_job`], in any order. A worker that takes a batch, and
+    /// installs one batch and takes the next in a single lock hold, keeps up with output that
+    /// holds the lock almost all the time; each block copied costs a few microseconds of that
+    /// hold.
+    pub fn next_history_jobs(&mut self, max: usize) -> Vec<HistoryJob> {
+        let mut jobs = Vec::new();
+        for which in [HistoryGrid::Normal, HistoryGrid::Alternate] {
+            let grid = self.history_grid_mut(which);
+            let epoch = grid.history_epoch();
+            let more = grid.history_mut().next_jobs(max - jobs.len());
+            jobs.extend(more.into_iter().map(|job| HistoryJob { grid: which, epoch, job }));
+            if jobs.len() == max {
+                break;
+            }
+        }
+        jobs
+    }
+
     /// Install the result of a [`HistoryJob`] (feathercritty). Returns whether it did: a result
     /// is refused, and dropped, when its grid's history was rebuilt since the job was taken (a
     /// column reflow) or its block changed, was evicted or cleared, or the setting changed

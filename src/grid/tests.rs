@@ -1092,6 +1092,35 @@ mod compression {
         assert!(term.install_history_job(job.run()));
     }
 
+    /// A worker can take a batch of jobs in one lock hold and install them in one more; the
+    /// terminal ends up as with `run_history_jobs`.
+    #[test]
+    fn history_jobs_in_batches() {
+        let mut reference = term(Some(50), 126, 40);
+        let mut term = term(Some(50), 126, 40);
+        feed(&mut term, &wrapping_lines(3000));
+        feed(&mut reference, &wrapping_lines(3000));
+        assert!(term.next_history_jobs(0).is_empty());
+        let mut batches = 0;
+        loop {
+            let jobs = term.next_history_jobs(8);
+            if jobs.is_empty() {
+                break;
+            }
+            assert!(jobs.len() <= 8);
+            let done: Vec<_> = jobs.into_iter().map(crate::term::HistoryJob::run).collect();
+            for done in done {
+                assert!(term.install_history_job(done));
+            }
+            batches += 1;
+        }
+        reference.run_history_jobs();
+        assert!(batches > 2);
+        assert!(!term.has_history_jobs());
+        assert_eq!(cold(&term), cold(&reference));
+        assert!(cold(&term) > 20);
+    }
+
     /// A job belongs to the normal grid wherever it sits: switching to the alternate screen
     /// between taking and installing it does not misroute it.
     #[test]
