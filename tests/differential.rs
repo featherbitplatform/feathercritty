@@ -12,9 +12,14 @@
 //! pass, default 0; `ref_recordings` ignores it, its seeds name recordings), `DIFF_TINY`
 //! (feathercritty's history uses 256-byte blocks instead of 64 KiB ones, so block boundaries, spare
 //! blocks and oversized rows are crossed constantly, and its column reflow keeps a window of one
-//! dense row instead of `2 * lines + 2`). A failure prints the seed, the `DIFF_STEPS` (and
-//! `DIFF_TINY`) value the pass used and a minimized step list. Each pass prints coverage statistics
-//! (see them with `--nocapture`).
+//! dense row instead of `2 * lines + 2`), `DIFF_COLD=<n>` (feathercritty runs with
+//! `history_compression: Some(n)`, 0 included, and after every step runs every history job, runs
+//! some and drops some results, or takes one and installs it only after the next step has been
+//! applied, so resizes, limit changes, `CSI 3 J`, RIS and evictions land in between and installs
+//! are refused; the choice comes from its own RNG seeded from the case (`fc::Jobs`), so the steps
+//! and the oracle's side are the same with and without it). A failure prints the seed, the
+//! `DIFF_STEPS` (and `DIFF_TINY`, `DIFF_COLD`) value the pass used and a minimized step list. Each
+//! pass prints coverage statistics (see them with `--nocapture`).
 //!
 //! Intended behavioral differences (README change list), modeled as described in
 //! `tests/support/mod.rs`:

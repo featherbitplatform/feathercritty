@@ -339,6 +339,12 @@ pub struct Stats {
     /// Moved windows that feathercritty also searched as drawn, checked on its own (fork
     /// change 5; 0.26.0 would hang there).
     pub change5_windows: usize,
+    /// History job results installed (`DIFF_COLD`; `fc::Jobs`).
+    pub jobs_installed: usize,
+    /// History job results the terminal refused (taken before a step that changed their block).
+    pub jobs_refused: usize,
+    /// History job results run and dropped without installing them.
+    pub jobs_dropped: usize,
 }
 
 impl Stats {
@@ -353,6 +359,9 @@ impl Stats {
         self.no_termination += other.no_termination;
         self.change5_answers += other.change5_answers;
         self.change5_windows += other.change5_windows;
+        self.jobs_installed += other.jobs_installed;
+        self.jobs_refused += other.jobs_refused;
+        self.jobs_dropped += other.jobs_dropped;
     }
 }
 
@@ -375,7 +384,15 @@ impl fmt::Display for Stats {
             self.no_termination,
             self.change5_answers,
             self.change5_windows,
-        )
+        )?;
+        if self.jobs_installed + self.jobs_refused + self.jobs_dropped > 0 {
+            write!(
+                f,
+                "; history jobs: {} installed, {} refused, {} dropped",
+                self.jobs_installed, self.jobs_refused, self.jobs_dropped
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -471,6 +488,7 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
             qb.iter().filter(|(_, q)| *q == project::QAns::NoTermination).count();
     }
     stats.reached_limit = usize::from(reached);
+    (stats.jobs_installed, stats.jobs_refused, stats.jobs_dropped) = a.jobs.counts();
 
     Ok(stats)
 }
@@ -499,6 +517,19 @@ pub fn tiny_blocks() -> bool {
 
 /// History block size under `DIFF_TINY`.
 pub const TINY_BLOCK_BYTES: usize = 256;
+
+/// `DIFF_COLD`: when set to a row count `n` (0 included), feathercritty's terminals run with
+/// `Config::history_compression: Some(n)`, and after every step `fc::Jobs` runs, drops or holds
+/// history jobs (`fc::Jobs::after_step`); unset (or empty), compression stays off. The oracle side
+/// and the generators ignore it, so every seed's steps are the same either way.
+pub fn cold_history() -> Option<usize> {
+    let value = std::env::var("DIFF_COLD").ok()?;
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(value.parse().unwrap_or_else(|_| panic!("DIFF_COLD must be a row count: {value:?}")))
+}
 
 /// `DIFF_SEEDS`, or `default`.
 pub fn seed_count(default: u64) -> u64 {
@@ -565,6 +596,9 @@ where
     let mut steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
     if tiny_blocks() {
         steps += " DIFF_TINY=1";
+    }
+    if let Some(cold) = cold_history() {
+        steps += &format!(" DIFF_COLD={cold}");
     }
     if divergence.hang {
         // Minimizing would rerun the hanging query many times, leaving a spinning thread each
