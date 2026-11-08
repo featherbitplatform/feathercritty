@@ -158,6 +158,11 @@ pub struct Grid<T: HistoryCell> {
     /// positions stable while output scrolls).
     scrolled_lines: i64,
 
+    /// Bumped whenever the history is replaced by a rebuilt one (a column reflow,
+    /// `initialize_all`), so history jobs taken before are refused (feathercritty, see
+    /// `Term::install_history_job`).
+    history_epoch: u64,
+
     /// Rows the column reflow keeps dense, when a test sets it (feathercritty: a test hook, see
     /// `set_reflow_window`; `None` is the default window of `resize.rs`).
     #[cfg(any(test, feature = "test-hooks"))]
@@ -243,6 +248,7 @@ impl<T: HistoryCell> Grid<T> {
             lines,
             columns,
             scrolled_lines: 0,
+            history_epoch: 0,
             #[cfg(any(test, feature = "test-hooks"))]
             reflow_window: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -275,6 +281,13 @@ impl<T: HistoryCell> Grid<T> {
     /// the screen grows or shrinks. Can be negative (a grow pulled lines back from history).
     pub fn scrolled_lines(&self) -> i64 {
         self.scrolled_lines
+    }
+
+    /// Keep the `keep_warm` newest history rows uncompressed and compress older blocks through
+    /// history jobs; `None` never compresses (feathercritty, see "Cold blocks" in `history.rs`
+    /// and `Term::next_history_job`). Only marks blocks: nothing is compressed here.
+    pub fn set_history_compression(&mut self, keep_warm: Option<usize>) {
+        self.history.set_compression(keep_warm);
     }
 
     /// Update the size of the scrollback history.
@@ -584,8 +597,7 @@ impl<T: HistoryCell> Grid<T> {
         // history until it reached `max_scroll_limit`; the history is rebuilt with them first.
         let missing = self.history.limit() - self.history_size();
         if missing != 0 {
-            let mut history =
-                History::with_block_size(self.history.limit(), self.history.block_bytes());
+            let mut history = self.history.sibling(self.history.limit());
             let blank = Row::new(self.columns);
             for _ in 0..missing {
                 history.push_newest(&blank);
@@ -595,6 +607,7 @@ impl<T: HistoryCell> Grid<T> {
                 history.push_newest(&row);
             }
             self.history = history;
+            self.history_epoch += 1;
         }
     }
 
@@ -671,6 +684,19 @@ impl<T: HistoryCell> Grid<T> {
     #[inline]
     pub(crate) fn history(&self) -> &History<T> {
         &self.history
+    }
+
+    /// The rows above the screen, for history jobs (feathercritty: `Term`'s job API).
+    #[inline]
+    pub(crate) fn history_mut(&mut self) -> &mut History<T> {
+        &mut self.history
+    }
+
+    /// Bumped whenever the history is replaced by a rebuilt one (feathercritty: jobs taken from
+    /// the old history carry the old value).
+    #[inline]
+    pub(crate) fn history_epoch(&self) -> u64 {
+        self.history_epoch
     }
 
     /// The history's blocks as bytes, oldest first (test hook, see
@@ -909,6 +935,7 @@ mod serde_proxy {
                 lines,
                 display_offset,
                 scrolled_lines: 0,
+                history_epoch: 0,
                 #[cfg(any(test, feature = "test-hooks"))]
                 reflow_window: None,
                 #[cfg(any(test, feature = "test-hooks"))]

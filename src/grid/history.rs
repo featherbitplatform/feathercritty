@@ -107,7 +107,11 @@
 //!   truncated last record) or becomes the newest block again; bytes are only appended to a block
 //!   while it is the newest, which no job targets. So an unchanged identity means the job's copy is
 //!   still the block's bytes. `install` also requires the same setting and that the block still
-//!   wants the job's state; otherwise it drops the result and returns `false`.
+//!   wants the job's state; otherwise it drops the result and returns `false`. Sequence numbers and
+//!   generations are only unique within one history: a clone copies them, and a reflow's new
+//!   history (`sibling`) starts over at 0. So a job also carries its history's `id`, a process-wide
+//!   unique value given to every new history, clone and sibling (kept by `clear`), and `install`
+//!   refuses a job from any other history.
 //! - **Leaving the cold state.** A cold block whose `live` reaches 0 is freed, never kept as a
 //!   spare. A cold block that becomes the newest again (popping rows past the warm window) is
 //!   decompressed at once. `update` of a cold row decodes it through the cache and re-encodes it
@@ -149,6 +153,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::ops::{Deref, Range};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt, mem};
 
 use crate::grid::compact::{self, PlainText, RowHeader, read_header};
@@ -168,6 +173,12 @@ const MIN_INDEX_CAPACITY: usize = 64;
 
 /// Most decompressed cold blocks a history keeps for reads (design spec 5.5).
 pub(crate) const CACHE_BLOCKS: usize = 4;
+
+/// A value no other history in the process has, for `History::id`.
+fn new_history_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A byte block holding records back to back.
 struct Block {
@@ -236,6 +247,8 @@ impl Deref for Record<'_> {
 /// from [`History::next_job`], run anywhere with [`Job::run`], installed with
 /// [`History::install`].
 pub struct Job {
+    /// The history the job was taken from (`History::id`).
+    history: u64,
     seq: u32,
     generation: u64,
     compression: Option<usize>,
@@ -248,6 +261,7 @@ pub struct Job {
 
 /// The result of a [`Job`], for [`History::install`].
 pub struct Done {
+    history: u64,
     seq: u32,
     generation: u64,
     compression: Option<usize>,
@@ -270,6 +284,7 @@ impl Job {
             warm
         };
         Done {
+            history: self.history,
             seq: self.seq,
             generation: self.generation,
             compression: self.compression,
@@ -282,6 +297,7 @@ impl Job {
 impl fmt::Debug for Job {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Job")
+            .field("history", &self.history)
             .field("seq", &self.seq)
             .field("generation", &self.generation)
             .field("to_cold", &self.to_cold)
@@ -293,6 +309,7 @@ impl fmt::Debug for Job {
 impl fmt::Debug for Done {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Done")
+            .field("history", &self.history)
             .field("seq", &self.seq)
             .field("generation", &self.generation)
             .field("to_cold", &self.to_cold)
@@ -394,6 +411,10 @@ pub struct History<T: HistoryCell> {
     /// The last block generation handed out.
     generation: u64,
 
+    /// This history's identity for jobs: unique in the process, fresh for a clone and for a
+    /// `sibling`, kept by `clear` (see "The identity rule" in the module docs).
+    id: u64,
+
     /// Sequence number of the oldest block that may disagree with its eligibility; every older
     /// block agrees. `None` when every block agrees (`has_jobs` is false).
     scan: Option<u32>,
@@ -429,6 +450,7 @@ impl<T: HistoryCell> History<T> {
             updated: Row::default(),
             compression: None,
             generation: 0,
+            id: new_history_id(),
             scan: None,
             cache: RefCell::default(),
         }
@@ -450,12 +472,6 @@ impl<T: HistoryCell> History<T> {
     #[inline]
     pub fn limit(&self) -> usize {
         self.limit
-    }
-
-    /// Capacity of a normal block, for a new history built like this one.
-    #[inline]
-    pub(crate) fn block_bytes(&self) -> usize {
-        self.block_bytes
     }
 
     /// Change the maximum number of rows; a lower limit evicts the oldest rows now and frees
@@ -524,6 +540,7 @@ impl<T: HistoryCell> History<T> {
             _ => self.block_bytes,
         };
         Some(Job {
+            history: self.id,
             seq,
             generation: block.generation,
             compression: self.compression,
@@ -533,11 +550,16 @@ impl<T: HistoryCell> History<T> {
         })
     }
 
-    /// Swap the result of a job in, if its block still exists with the same identity, the
-    /// setting is the one the job was taken under and the block still wants that state. Returns
-    /// whether it did; otherwise the result is dropped (the block was evicted, cleared, changed or
-    /// the setting changed meanwhile). Never compresses, decompresses or copies a block.
+    /// Swap the result of a job in, if it was taken from this history, its block still exists
+    /// with the same identity, the setting is the one the job was taken under and the block still
+    /// wants that state. Returns whether it did; otherwise the result is dropped (the job came
+    /// from another history, or the block was evicted, cleared, changed or the setting changed
+    /// meanwhile). Never compresses, decompresses or copies a block.
     pub fn install(&mut self, done: Done) -> bool {
+        if done.history != self.id {
+            return false;
+        }
+
         let at = done.seq.wrapping_sub(self.front_seq) as usize;
         let current = self.blocks.get(at).is_some_and(|block| {
             block.live > 0 && block.generation == done.generation && block.cold != done.to_cold
@@ -564,10 +586,28 @@ impl<T: HistoryCell> History<T> {
 
     /// Run and install every job now (tests, and hosts that want no background work).
     pub fn run_jobs(&mut self) {
+        self.run_jobs_with(Job::run);
+    }
+
+    /// `run_jobs`, running each job with `run`. Nothing changes between taking a job and
+    /// installing it here, so an install is never refused; if one ever were, the same job would
+    /// be offered again forever, so it stops there instead (the tests' `run_and_check` asserts
+    /// that no job is left).
+    fn run_jobs_with(&mut self, mut run: impl FnMut(Job) -> Done) {
         while let Some(job) = self.next_job() {
-            let installed = self.install(job.run());
-            debug_assert!(installed, "an inline job was refused");
+            if !self.install(run(job)) {
+                break;
+            }
         }
+    }
+
+    /// An empty history built like this one: the same block size and compression setting, with
+    /// limit `limit` (a reflow's new history, or the empty one standing in while it runs). It has
+    /// its own identity, so jobs taken from this history are refused there. Allocates nothing.
+    pub(crate) fn sibling(&self, limit: usize) -> Self {
+        let mut sibling = Self::with_block_size(limit, self.block_bytes);
+        sibling.compression = self.compression;
+        sibling
     }
 
     /// Whether each block, oldest first, is cold (test hook, not a stable API).
@@ -1116,6 +1156,15 @@ impl<T: HistoryCell> History<T> {
     /// Decode the row `entry` points to, whose extras end at position `extras_end`, into `into`.
     fn decode(&self, entry: Entry, extras_end: u32, into: &mut Row<T>) {
         let bytes = self.record(entry);
+        // The entry's copies of the header bits must be the record's (`wraps` and `is_clear`
+        // answer from them).
+        debug_assert!(
+            {
+                let header = read_header(&bytes);
+                (header.wraps, header.clear) == (entry.wraps(), entry.clear())
+            },
+            "history entry header bits disagree with its record"
+        );
         let used = self.with_extras(entry, extras_end, |extras| T::decode(&bytes, extras, into));
         // A wrong offset or length must not decode silently.
         debug_assert_eq!(used, entry.len(), "history record length disagrees with index");
@@ -1290,6 +1339,7 @@ impl<T: HistoryCell> Clone for History<T> {
             updated: Row::default(),
             compression: self.compression,
             generation: self.generation,
+            id: new_history_id(),
             scan: self.scan,
             cache: RefCell::default(),
         }
@@ -1545,17 +1595,34 @@ mod tests {
             assert_eq!(spare.capacity(), history.block_bytes);
         }
 
+        // Each block's uncompressed bytes, decompressed here (not through the read cache, which
+        // tests count).
+        let warm: Vec<Vec<u8>> = history
+            .blocks
+            .iter()
+            .map(|block| match block.cold {
+                true => {
+                    let mut warm = Vec::new();
+                    cold::decompress(&block.bytes, &mut warm);
+                    assert_eq!(warm.len(), cold::uncompressed_len(&block.bytes));
+                    warm
+                },
+                false => block.bytes.clone(),
+            })
+            .collect();
+
         let mut live = vec![0; history.blocks.len()];
         let mut warm_live = vec![0; history.blocks.len()];
         for (pos, entry) in history.index.iter().enumerate() {
             let at = entry.block.wrapping_sub(history.front_seq) as usize;
-            let block = &history.blocks[at];
             let end = entry.offset as usize + entry.len();
-            let len = match block.cold {
-                true => cold::uncompressed_len(&block.bytes),
-                false => block.bytes.len(),
-            };
-            assert!(end <= len, "a record reaches past its block");
+            assert!(end <= warm[at].len(), "a record reaches past its block");
+            let header = read_header(&warm[at][entry.offset as usize..end]);
+            assert_eq!(
+                (header.wraps, header.clear),
+                (entry.wraps(), entry.clear()),
+                "index entry {pos}: header bits disagree with its record"
+            );
             live[at] += 1;
             if history.compression.is_some_and(|keep| history.index.len() - pos <= keep) {
                 warm_live[at] += 1;
@@ -2406,6 +2473,151 @@ mod tests {
         assert_eq!(history.cached_blocks(), 1);
         history.set_compression(None);
         assert_eq!(history.cached_blocks(), 0);
+    }
+
+    /// A job is installed only into the history it was taken from: a clone, whose blocks have
+    /// the same sequence numbers and generations, refuses it.
+    #[test]
+    fn job_refused_by_a_clone() {
+        let (mut history, warm, job) = with_job();
+        let mut clone = history.clone();
+        let at = job.seq.wrapping_sub(clone.front_seq) as usize;
+        assert_eq!(clone.blocks[at].generation, job.generation, "same identity in the clone");
+        assert!(!clone.install(job.run()));
+        assert_same_rows(&clone, &warm);
+        run_and_check(&mut clone);
+        assert_same_rows(&clone, &warm);
+
+        let job = history.next_job().expect("the same block again");
+        assert!(history.install(job.run()));
+        assert_same_rows(&history, &warm);
+    }
+
+    /// A reflow's new history (`sibling`) starts over at sequence number 0 and generation 0, so
+    /// its first block can carry the identity of a job taken from the old history, with other
+    /// bytes. It refuses that job.
+    #[test]
+    fn job_refused_by_a_sibling() {
+        let (history, _, job) = with_job();
+        let mut sibling = history.sibling(5000);
+        assert_eq!(sibling.compression(), Some(10));
+        assert_eq!(sibling.block_bytes, TINY);
+        assert!(sibling.is_empty());
+
+        let mut rng = ChaCha8Rng::seed_from_u64(0x5eed);
+        for _ in 0..600 {
+            sibling.push_newest(&varied_row(&mut rng));
+        }
+        let warm = sibling.clone();
+        let at = job.seq.wrapping_sub(sibling.front_seq) as usize;
+        assert_eq!(sibling.blocks[at].generation, job.generation, "same identity in the sibling");
+        assert!(sibling.wants_cold(at));
+        assert!(!sibling.install(job.run()));
+        assert_same_rows(&sibling, &warm);
+        run_and_check(&mut sibling);
+        assert_same_rows(&sibling, &warm);
+    }
+
+    /// The reflow's byte copy (`move_oldest_to`, `push_encoded`) with compression on in both
+    /// histories: cold source rows are read through the cache and their blocks freed as the last
+    /// row leaves, the new history (with a lower limit, so it evicts too) only marks jobs, and
+    /// every counter and block state stays exact.
+    #[test]
+    fn move_oldest_to_with_compression() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0x0b1e);
+        let links = cell_links();
+        let mut old = History::<Cell>::with_block_size(3000, 1024);
+        for _ in 0..3000 {
+            let width = rng.gen_range(1..=80);
+            let mut row = cell_row(&mut rng, &links, width);
+            if rng.gen_bool(0.3) {
+                row[Column(width - 1)].flags.insert(crate::term::cell::Flags::WRAPLINE);
+            }
+            old.push_newest(&row);
+        }
+        let warm = old.clone();
+        old.set_compression(Some(37));
+        run_and_check(&mut old);
+        assert!(old.cold_blocks().iter().filter(|&&cold| cold).count() > 10);
+
+        let mut new = old.sibling(2000);
+        assert_eq!(new.compression(), Some(37));
+        let (mut row, mut moved) = (Row::default(), 0);
+        for step in 1.. {
+            if old.is_empty() {
+                break;
+            }
+            let cold_before = new.cold_blocks().iter().filter(|&&cold| cold).count();
+            match old.oldest_reflow_info() {
+                Some(info) if rng.gen_bool(0.8) => {
+                    old.move_oldest_to(&mut new, info.width);
+                    moved += 1;
+                },
+                _ => {
+                    assert!(old.pop_oldest(&mut row));
+                    new.push_newest(&row);
+                },
+            }
+            let cold_after = new.cold_blocks().iter().filter(|&&cold| cold).count();
+            assert!(cold_after <= cold_before, "a push compressed a block inline");
+            if step % 7 == 0 {
+                check_store(&old);
+                check_store(&new);
+            }
+            if step % 449 == 0 {
+                run_and_check(&mut new);
+            }
+        }
+        assert!(moved > 1000, "{moved} rows copied as bytes");
+        assert_eq!(old.blocks_held(), 0);
+        check_store(&old);
+        check_store(&new);
+        assert!(new.has_jobs());
+        run_and_check(&mut new);
+        assert!(new.cold_blocks().iter().any(|&cold| cold));
+
+        let mut reference = History::<Cell>::with_block_size(2000, 1024);
+        for i in (0..warm.len()).rev() {
+            warm.read(i, &mut row);
+            reference.push_newest(&row);
+        }
+        assert_same_rows(&new, &reference);
+    }
+
+    /// `check_store` and `decode` catch an index entry whose header bits disagree with its
+    /// record (every path that rewrites entries runs under them in the randomized tests).
+    #[test]
+    #[should_panic(expected = "header bits")]
+    fn check_store_catches_wrong_header_bits() {
+        let mut history = varied(100);
+        history.index[50].len_flags ^= Entry::WRAPS;
+        check_store(&history);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "header bits")]
+    fn decode_catches_wrong_header_bits() {
+        let mut history = varied(100);
+        history.index[50].len_flags ^= Entry::CLEAR;
+        read(&history, 49);
+    }
+
+    /// `run_jobs` stops at a refused install instead of offering the same job forever.
+    #[test]
+    fn run_jobs_stops_when_install_refuses() {
+        let mut history = varied(600);
+        history.set_compression(Some(10));
+        let mut runs = 0;
+        history.run_jobs_with(|job| {
+            runs += 1;
+            let mut done = job.run();
+            done.generation = u64::MAX;
+            done
+        });
+        assert_eq!(runs, 1);
+        assert!(history.has_jobs());
+        run_and_check(&mut history);
     }
 
     #[test]

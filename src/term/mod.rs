@@ -16,7 +16,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener};
-use crate::grid::{Dimensions, Grid, GridIterator, PlainText, RowReader, Scroll};
+use crate::grid::{Dimensions, Done, Grid, GridIterator, Job, PlainText, RowReader, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
 use crate::term::cell::{Cell, Flags, LineLength};
@@ -363,6 +363,13 @@ pub struct Config {
     ///
     /// feathercritty: not upstream.
     pub grapheme_clusters: bool,
+
+    /// Compress history blocks older than this many rows (`None`: never compress). Blocks change
+    /// state only through history jobs (see [`Term::next_history_job`]); any value is accepted,
+    /// 0 included.
+    ///
+    /// feathercritty: not upstream.
+    pub history_compression: Option<usize>,
 }
 
 impl Default for Config {
@@ -375,7 +382,48 @@ impl Default for Config {
             kitty_keyboard: Default::default(),
             osc52: Default::default(),
             grapheme_clusters: false,
+            history_compression: None,
         }
+    }
+}
+
+/// Which of a [`Term`]'s grids a history job belongs to (feathercritty).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HistoryGrid {
+    /// The normal screen's grid, wherever it sits: `grid`, or `inactive_grid` while the alternate
+    /// screen is shown.
+    Normal,
+
+    /// The alternate screen's grid. Its history limit is 0, so it never has jobs.
+    Alternate,
+}
+
+/// A history block to compress or decompress, from [`Term::next_history_job`] (feathercritty).
+///
+/// It holds a copy of the block's bytes and needs no access to the terminal, so
+/// [`HistoryJob::run`] can run outside the terminal's lock; [`Term::install_history_job`] then
+/// installs the result.
+#[derive(Debug)]
+pub struct HistoryJob {
+    grid: HistoryGrid,
+
+    /// The grid's history epoch when the job was taken (`Grid::history_epoch`).
+    epoch: u64,
+    job: Job,
+}
+
+/// The result of a [`HistoryJob`], for [`Term::install_history_job`] (feathercritty).
+#[derive(Debug)]
+pub struct HistoryDone {
+    grid: HistoryGrid,
+    epoch: u64,
+    done: Done,
+}
+
+impl HistoryJob {
+    /// Compress or decompress the copied block (no lock needed).
+    pub fn run(self) -> HistoryDone {
+        HistoryDone { grid: self.grid, epoch: self.epoch, done: self.job.run() }
     }
 }
 
@@ -425,8 +473,11 @@ impl<T> Term<T> {
         let num_lines = dimensions.screen_lines();
 
         let history_size = config.scrolling_history;
-        let grid = Grid::new(num_lines, num_cols, history_size);
-        let inactive_grid = Grid::new(num_lines, num_cols, 0);
+        let mut grid = Grid::new(num_lines, num_cols, history_size);
+        let mut inactive_grid = Grid::new(num_lines, num_cols, 0);
+        // feathercritty: history compression (see `set_options`).
+        grid.set_history_compression(config.history_compression);
+        inactive_grid.set_history_compression(config.history_compression);
 
         let tabs = TabStops::new(grid.columns());
 
@@ -539,6 +590,12 @@ impl<T> Term<T> {
         } else {
             self.grid.update_history(self.config.scrolling_history);
         }
+
+        // feathercritty: history compression, on both grids (the alternate one has a history
+        // limit of 0, so it never has jobs). Only marks blocks for jobs.
+        let compression = self.config.history_compression;
+        self.grid.set_history_compression(compression);
+        self.inactive_grid.set_history_compression(compression);
 
         if self.config.kitty_keyboard != old_config.kitty_keyboard {
             self.keyboard_mode_stack = Vec::new();
@@ -767,6 +824,52 @@ impl<T> Term<T> {
     /// Mutable access to the raw grid data structure.
     pub fn grid_mut(&mut self) -> &mut Grid<Cell> {
         &mut self.grid
+    }
+
+    /// The grid `which` names, wherever it sits now (feathercritty).
+    fn history_grid_mut(&mut self, which: HistoryGrid) -> &mut Grid<Cell> {
+        let alt = self.mode.contains(TermMode::ALT_SCREEN);
+        match (which, alt) {
+            (HistoryGrid::Normal, false) | (HistoryGrid::Alternate, true) => &mut self.grid,
+            _ => &mut self.inactive_grid,
+        }
+    }
+
+    /// Whether [`Term::next_history_job`] may have a job (feathercritty: history compression,
+    /// [`Config::history_compression`]). O(1): a host can check it after every batch of output.
+    /// Always false with compression off and no compressed block left.
+    pub fn has_history_jobs(&self) -> bool {
+        self.grid.history().has_jobs() || self.inactive_grid.history().has_jobs()
+    }
+
+    /// The next history block that needs to be compressed or decompressed, with a copy of its
+    /// bytes, or `None` (feathercritty). Taking a job changes nothing: until its result is
+    /// installed, the next call offers the same block again. Run it with [`HistoryJob::run`],
+    /// outside the lock, and install the result with [`Term::install_history_job`].
+    pub fn next_history_job(&mut self) -> Option<HistoryJob> {
+        for which in [HistoryGrid::Normal, HistoryGrid::Alternate] {
+            let grid = self.history_grid_mut(which);
+            if let Some(job) = grid.history_mut().next_job() {
+                return Some(HistoryJob { grid: which, epoch: grid.history_epoch(), job });
+            }
+        }
+        None
+    }
+
+    /// Install the result of a [`HistoryJob`] (feathercritty). Returns whether it did: a result
+    /// is refused, and dropped, when its grid's history was rebuilt since the job was taken (a
+    /// column reflow) or its block changed, was evicted or cleared, or the setting changed
+    /// meanwhile. Swapping the result in is cheap: it never compresses or decompresses.
+    pub fn install_history_job(&mut self, done: HistoryDone) -> bool {
+        let grid = self.history_grid_mut(done.grid);
+        grid.history_epoch() == done.epoch && grid.history_mut().install(done.done)
+    }
+
+    /// Run and install every history job now (feathercritty: tests, and hosts that want no
+    /// background work).
+    pub fn run_history_jobs(&mut self) {
+        self.grid.history_mut().run_jobs();
+        self.inactive_grid.history_mut().run_jobs();
     }
 
     /// Resize terminal to new dimensions.
