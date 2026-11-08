@@ -672,6 +672,13 @@ impl<T: HistoryCell> Grid<T> {
         &self.history
     }
 
+    /// The history's blocks as bytes, oldest first (test hook, see
+    /// `History::block_bytes_for_test`).
+    #[cfg(feature = "test-hooks")]
+    pub fn history_blocks_for_test(&self) -> Vec<&[u8]> {
+        self.history.block_bytes_for_test()
+    }
+
     /// Change history row `line` (`line < 0`) (feathercritty: the one history write, see
     /// `Term::input`; the row is decoded, changed and re-encoded, see `History::update`).
     ///

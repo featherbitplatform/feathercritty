@@ -672,6 +672,15 @@ impl<T: HistoryCell> History<T> {
     }
 }
 
+#[cfg(feature = "test-hooks")]
+impl<T: HistoryCell> History<T> {
+    /// The bytes of every block, oldest first, partly filled ones included (test hook, not a
+    /// stable API: it exists so tests can measure compressors on real block contents).
+    pub fn block_bytes_for_test(&self) -> Vec<&[u8]> {
+        self.blocks.iter().map(|block| block.bytes.as_slice()).collect()
+    }
+}
+
 impl History<Cell> {
     /// Row `i` (0 is the newest) as plain text read straight from its record, when it
     /// qualifies (see `compact::plain_text`); `None` when it does not or is not there.

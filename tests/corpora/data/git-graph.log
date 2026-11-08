@@ -1,0 +1,562 @@
+*   [33m026ea07[m Merge pull request #5 from featherbitplatform/feature/grapheme-clusters
+[31m|[m[32m\[m  
+[31m|[m * [33mc2f99fd[m fix(term): finer grapheme cluster edges and a quick check for plain text
+[31m|[m * [33m9dffed4[m fix(term): restore write_at_cursor inlining; harden cluster width changes
+[31m|[m * [33mbe2b7ba[m docs: grapheme clusters in the change list; 0.26.0+fbterm.6
+[31m|[m * [33m5848b86[m feat(term): move and resize grapheme clusters at the line edges
+[31m|[m * [33m09c9935[m feat(term): keep grapheme clusters in one cell while mode 2027 is set
+[31m|[m * [33mf1ea4cb[m feat(term): DEC private mode 2027 with its report and a Config default
+[31m|[m[31m/[m  
+*   [33m3c290b8[m Merge pull request #4 from featherbitplatform/feature/compact-history
+[33m|[m[34m\[m  
+[33m|[m * [33m3882317[m docs(bench): update commit references after history rewrite
+[33m|[m * [33md20b145[m test(search): give the termination tests a 120 s timeout
+[33m|[m * [33m440de9f[m fix(search): count rule 3 up to the first repeated match; pin it in the harness
+[33m|[m * [33m8f1dc2c[m fix(search): stop where 0.26.0 panics going left from a column-0 spacer
+[33m|[m * [33m918534d[m test(differential): accept 0.26.0's own matches in the fork-alone check
+[33m|[m * [33m6de45a8[m fix(search): document the bound's cost and its dependency on regex-automata
+[33m|[m * [33m658bb19[m docs(bench): drop internal task names from the results
+[33m|[m * [33m725292e[m test(differential): grid probe against 0.26.0, re-review seeds
+[33m|[m * [33m34ab337[m fix(search): run 0.26.0's search verbatim, change only its final answer
+[33m|[m * [33me696ce7[m docs(bench): five accepted ingest misses, and review fixes to the results
+[33m|[m * [33mf4870eb[m ci: run the 100,000-line oracle comparison on macOS too
+[33m|[m * [33m038c3ef[m test(differential): replay soak seeds 2003541 and 3001698
+[33m|[m * [33m17dfa1d[m docs(search): merge comment at Term::regex_search's new parameter
+[33m|[m * [33m8d2fc65[m fix(search): stop a leftward iteration where 0.26.0 stops after a cut
+[33m|[m * [33m7f2312d[m test(differential): do not probe 0.26.0 from an origin that leaves the grid
+[33m|[m * [33m6d22d86[m fix(search): cut a leftward match that runs past its range's start
+[33m|[m * [33mf53627e[m test(differential): model bottom-line spacer origins and runaround matches
+[33m|[m * [33m84d3b90[m fix(search): keep a rightward search_next origin inside the grid
+[33m|[m * [33mad2c9d2[m test(differential): do not run 0.26.0 searches that step over their end
+[33m|[m * [33md5d2668[m fix(search): read past the origin in a leftward match's second search
+[33m|[m * [33m64e87d0[m test(differential): read search matches like the search does
+[33m|[m * [33m2201048[m fix(search): keep 0.26.0's match at a stale spacer range end
+[33m|[m * [33m86e28a9[m feat: compact scrollback history
+[33m|[m * [33m253c16c[m ci: release differential with tiny blocks and large-history tests
+[33m|[m * [33m8c701cd[m test: gate refusals, soak seed ranges and large-history checks
+[33m|[m * [33m269d7f3[m docs(grid): credit the compact history idea and record review notes
+[33m|[m * [33m8766119[m docs(bench): large-history results after the phase 4 tuning
+[33m|[m * [33m77e45e5[m perf(grid): write a short run's style as one fixed-size copy
+[33m|[m * [33mfafb185[m test: scroll rows with extras in the steady-state allocation check
+[33m|[m * [33meecdb99[m perf(grid): keep the one history write out of Term::input
+[33m|[m * [33maf763c9[m test(bench): A/A comparison for the 1% ingest rows
+[33m|[m * [33mbc7972d[m test: measure history memory as a full Term minus a new Term
+[33m|[m * [33me9dc0d3[m perf(grid): copy untouched history rows as bytes during reflow
+[33m|[m * [33m37744f9[m perf(grid): read plain history rows as text for selection
+[33m|[m * [33m0a963ef[m perf(grid): encode history rows straight into their block
+[33m|[m * [33m9c94194[m perf(grid): faster history row encoder and decoder
+[33m|[m * [33m8d52255[m perf(grid): keep occ low after an erase to the end of the line
+[33m|[m * [33ma59393b[m test: large history correctness and cost
+[33m|[m * [33m10363b0[m feat(grid): reflow history through a streaming source and sink
+[33m|[m * [33m6a82dba[m feat(grid): store history rows in pooled compact blocks
+[33m|[m * [33mca0f23d[m feat(grid): compact row codec
+[33m|[m[33m/[m  
+*   [33m7cc656b[m Merge pull request #3 from featherbitplatform/feature/compact-history
+[35m|[m[36m\[m  
+[35m|[m * [33m3be66cf[m docs: point entry 5 at the differential test in tests/
+[35m|[m * [33mba1f7fb[m docs: describe the screen and history split; release 0.26.0+fbterm.4
+[35m|[m * [33m31825c9[m fix(grid): no-row reads everywhere, merge markers, absolute resize gates
+[35m|[m * [33m176eec6[m refactor(grid): split screen and history behind an explicit read API
+[35m|[m * [33m2a102f3[m test(differential): model how searches read leading spacers (fork change 5 complete)
+[35m|[m *   [33mf8a03b6[m Merge main (regex search bound, +fbterm.3) into feature/compact-history
+[35m|[m [1;31m|[m[35m\[m  
+[35m|[m [1;31m|[m[35m/[m  
+[35m|[m[35m/[m[1;31m|[m   
+* [1;31m|[m   [33ma64fbbd[m Merge pull request #2 from featherbitplatform/fix/regex-search-stale-spacer
+[1;33m|[m[1;34m\[m [1;31m\[m  
+[1;33m|[m * [1;31m|[m [33mb0a0f4c[m fix(search): never repeat a RegexIter match
+[1;33m|[m * [1;31m|[m [33m93e747d[m fix(search): keep iterating past matches that end beyond their origin
+[1;33m|[m * [1;31m|[m [33m56cc92a[m fix(search): bound regex search and keep matches in range over stale spacers
+[1;33m|[m[1;33m/[m [1;31m/[m  
+[1;33m|[m * [33ma63f405[m test(differential): check the fork whenever 0.26.0 is off, time out fork queries
+[1;33m|[m * [33meaa8bff[m test(differential): model fork change 5 (regex search over wrapped wide chars)
+[1;33m|[m *   [33mc1484d8[m Merge main (regex search hang fix) into feature/compact-history
+[1;33m|[m [1;35m|[m[1;33m\[m  
+[1;33m|[m [1;35m|[m[1;33m/[m  
+[1;33m|[m[1;33m/[m[1;35m|[m   
+* [1;35m|[m   [33m4098525[m Merge pull request #1 from featherbitplatform/fix/regex-search-wide-wrap
+[31m|[m[32m\[m [1;35m\[m  
+[31m|[m * [1;35m|[m [33m5e35b26[m fix(search): terminate regex search over wrapped wide characters
+[31m|[m[31m/[m [1;35m/[m  
+[31m|[m * [33m9c303b1[m test: ingest, read and memory benchmarks against 0.26.0
+[31m|[m * [33m05dd594[m test(differential): cover full and hidden history, narrow search workaround
+[31m|[m * [33m268b208[m test: differential test against alacritty_terminal 0.26.0
+[31m|[m[31m/[m  
+* [33mbc59f06[m ci: check formatting, clippy and tests on Linux, macOS and Windows
+* [33m24d10eb[m docs: add the README
+* [33m5419424[m build: allow clippy::question_mark flagged by newer toolchains
+* [33m49cf162[m build!: rename the crate to feathercritty and make it standalone
+* [33m8a14588[m feat(term): expose the inactive grid
+* [33m97781ad[m feat(grid): count lines scrolled into history
+* [33m29eff7e[m Fix Kitty keyboard mode stack size limit
+* [33ma6b23e8[m Alacritty version 0.17.0
+* [33md3c7ff2[m Alacritty version 0.17.0-rc2
+* [33m414aa8e[m Alacritty version 0.17.0-rc1
+* [33mece6e05[m Fix resource cleanup for signal shutdown
+* [33mf140668[m Use ExitStatus for tty shutdown events
+* [33m1e00f57[m Fix some non-async-signal-safety in pre_exec
+* [33md09ff2a[m Bump development version to 0.17.0-dev
+* [33medf3288[m Add alacritty_terminal option to escape pty args
+* [33m4072a6a[m Fix DECOM cursor motion
+* [33md4b9696[m Migrate to 2024 edition
+* [33mfe438c7[m Add size_hint to GridIterator
+* [33mc4030c9[m Remove cstr! macro in favor of literal notation
+* [33ma57e616[m Bump all dependencies
+* [33m313f35e[m Fix clippy warnings
+* [33mc48dbf0[m Bump MSRV to 1.81.0
+* [33m5b70d83[m Fix search for fullwidth chars in the last column
+* [33md20589a[m Add * # { } vi motions
+* [33m81b3b1a[m Hide macOS login message with ~/.hushlogin present
+* [33m533077b[m Add latest release to changelog
+* [33m253b271[m Dont fail exec() on deleted directories
+* [33m6d54c60[m Bump vte to 0.15.0
+* [33mdb3050c[m Add option to drain PTY on shutdown
+* [33meed350c[m Bump vte to 0.14.1
+* [33me94481e[m Bump VTE to 0.14.0
+* [33mcd16998[m Bump development version to 0.16.0-dev
+* [33m990ea51[m Add CSI Ps I support
+* [33m8f699d2[m Fix vi motion with wide semantic escape chars
+* [33mdc44aca[m Bump all dependencies
+* [33md868df1[m Fix racing condition in hint triggering
+* [33m07c083a[m Do not pull serde without serde feature
+* [33m13a27b6[m Bump development version to 0.15.0-dev
+* [33m7c9bb9c[m Revert "Add unicode 16 support"
+* [33m0cdd28e[m Add unicode 16 support
+* [33m70443b4[m Fix highlight invalidation on grid scroll
+* [33m7e0c592[m Remove unused `Clone` requirements
+* [33m7ab2df9[m Remove startup notify variables only for shell
+* [33m406ca09[m Move root config fields to `[general]` section
+* [33m4142134[m Fix fullwidth semantic escape characters
+* [33mac968d0[m Improve TermMode bitflags initialization
+* [33macadcf4[m Make `ConPty` creation fallible
+* [33mcb4f80d[m Bump MSRV to 1.74.0
+* [33ma871773[m Fix search bug with wrapline on first character
+* [33m78a9b74[m Fix spelling errors
+* [33m37a6187[m Fix IO safety violation from consequent dropping `OwnedFd`
+* [33m1cfed15[m Fix FD leak after closing child windows
+* [33m3d10882[m Ignore shell RCs for macOS zsh wrapper
+* [33m62351e0[m Bump winit to 0.30.0
+* [33m1638863[m Bump alacritty_terminal to 0.24.1-dev
+* [33m2872397[m Add `from_file_descriptors()` to `tty::unix`
+* [33m2c6a5bc[m Fix window being focused by default
+* [33m9e92922[m Update homepage and repository in Cargo manifests
+* [33mb91dee6[m Allow setting terminal env vars via PTY options
+* [33m4090782[m Bump dependencies
+* [33mec02c2b[m Fix hint `Select` action for hyperlink escape
+* [33m436101b[m Set PTY's pixel size on startup
+* [33m2bfd187[m Send exit code events on child process exit
+* [33mff66409[m Expose more process info on Windows
+* [33ma3b2592[m Fix log typos
+* [33mdfe8b25[m Fix feature = "cargo-clippy" deprecation
+* [33mc10f47f[m Fix regional scrolling leaking into history
+* [33m326d251[m Fix row indexing with inclusive ranges
+* [33m4563d7f[m Remove extra TIOCSWINSZ ioctl on startup
+* [33m95786d9[m Bump alacritty_terminal to 0.22.1
+* [33meb0759c[m Fix unnecessary explicit panic in PTY
+* [33m60af429[m Fix invalid bounds in selection range conversion
+* [33m626f1ff[m Fix inline search expanding across newlines
+* [33me581f82[m Fix serde tests without default features
+* [33meab896c[m Passthrough potential errors for `EventLoopSender`
+* [33maca9d2f[m Derive `Clone` for `EventLoopSender`
+* [33m8acd137[m Update alacritty versions
+* [33m6d31e4e[m Implement kitty's keyboard protocol
+* [33m9176701[m Fix DECRPM reporting
+* [33m07e0e17[m Bump dependencies
+* [33m21e00c3[m Damage only terminal inside `alacritty_terminal`
+* [33m9445a5b[m Add support for DECRPM/DECRQM
+* [33mc13cb9f[m Update VTE to 0.13.0
+* [33m6eff37b[m Add `--option` argument to `create-window`
+* [33mec59462[m Remove `alacritty_config` from alacritty_terminal
+* [33mba8d910[m Fix clippy warnings
+* [33me9f04ba[m Fix typos
+* [33m486fadb[m Add inline vi mode search
+* [33ma1808fd[m Use openpty-rustix instead of nix
+* [33m21f8c59[m Fix regex patterns allowing for empty strings
+* [33m32ad09d[m Fix regex matches ending on multiline
+* [33m575bf92[m Fix PTY being closed on creation
+* [33m35e5648[m Update dependencies
+* [33m32883b5[m Port from mio to polling
+* [33m6ebd114[m Bump VTE to 0.12.0
+* [33m02e41b7[m Fix regex memory usage
+* [33mb59581b[m Fix crash with anchored searches
+* [33m755504a[m Update regex-automata to v0.3.6
+* [33m7dea0fc[m Add `terminal` config section to control OSCs
+* [33m06e2860[m Remove unnecessary mutable references
+* [33m336d144[m Mention all the actions in the man page
+* [33mc699dca[m Unset `XDG_ACTIVATION_TOKEN` in alacritty_terminal
+* [33m3550a1c[m Add version 0.12.2 to CHANGELOG
+* [33mb833de5[m Update wix on the release CI
+* [33mb509a67[m Add support for loading conpty.dll
+* [33m2e50d4d[m Fix the crash when shrinking scrolled terminal
+* [33m6d09df2[m Add errors for deserializing with unknown fields
+* [33m7c845fe[m Fix `alacritty msg config` toml replacement
+* [33m66eb9e0[m Switch to TOML configuration format
+* [33m433a067[m Bump dependencies
+* [33mf2f3c7b[m Switch to VTE's built-in ansi feature
+* [33mdb50796[m Add version 0.12.1 to CHANGELOG
+* [33mead8ee9[m Update patch dependencies
+* [33m3dbc173[m Update xdg and dirs crate
+* [33m7f7888c[m Update bitflags to 2.2.1
+* [33m4dad16a[m Fix selection rotation on the last line
+* [33md7ad578[m Fix `;` character in URI OSC 8 payload
+* [33m9bed145[m Bump development version to 0.13.0-dev
+* [33m6f22e67[m Update winit to 0.28
+* [33m8389b3a[m Prefer environment variables over passwd
+* [33m2248136[m Preserve last column with erase in line right
+* [33mfe1f5bc[m Fix multi-line bracket selection
+* [33mf7b16c9[m Update glutin to 0.30.0
+* [33mc26b343[m Fix startup failure on macOS with dash as /bin/sh
+* [33m9f3c371[m Fix clippy warnings
+* [33mc7e39e6[m Migrate from winapi to windows-sys
+* [33m330c570[m Fix IPC config overriding previous values
+* [33mf66f893[m Bump development version to 0.12.0-dev
+* [33m5df5d14[m Add IPC config subcommand
+* [33mdf3786e[m Bump glutin to 0.29.1
+* [33m49c8de4[m Make grid mutably accessible to libraries
+* [33m3fa602f[m Fix clippy warnings
+* [33m036a11f[m Fix inverted condition for cell's extra clearing
+* [33mb3057bf[m Register Alacritty shells as tty sessions on macOS
+* [33mbfa427c[m Remove panics from UNIX PTY initialization
+* [33mf5f6497[m Replace `map().unwrap_or()` with `map_or()`
+* [33m916c61b[m Fix hyperlinks not being keyboard actionable
+* [33m11a9ad7[m Add support for hyperlink escape sequence
+* [33ma14a5b8[m Add `cursor.blink_timeout` config option
+* [33m0f1e961[m Bump dirs to 4.0.0
+* [33maa11085[m Bump copypasta to 0.8.0
+* [33m8dd164f[m Use `MaybeUninit<usize>` instead of `usize` in `Storage::swap`
+* [33me1ecd25[m Fix flickering during resize on Wayland
+* [33m7c500b4[m Fix old vi cursor not being properly damaged
+* [33ma93212d[m Fix a few minor clippy lints
+* [33m655cfd5[m Fix DEC Special Character Set (Line drawing)
+* [33m7bd2bd0[m Fix Vi cursor not being damaged on scroll
+* [33mfef8ebe[m Enable damage tracking only on Wayland
+* [33m0cec252[m Extract `SizeInfo` from alacritty_terminal
+* [33m687930a[m Fix OSC 4 color response format
+* [33m2ad6497[m Add colored underline support
+* [33mfe565f7[m Fix crash when searching during reset
+* [33m77efa81[m Add support for dashed and dotted underlines
+* [33mfaa6060[m Add support for drawing undercurls
+* [33m0bb044d[m Fix alacritty_terminal not emitting damage on color change
+* [33meb6d385[m Add damage tracking and reporting to compatible compositors
+* [33mc5172cd[m Fix typo in SizeInfo padding_y rustdoc
+* [33m6b4a56c[m Fix OSC 104 with empty second parameter
+* [33m33cb0e4[m Add ´?´ support to OSC 4
+* [33m774cfc2[m Fix fullwidth char regex search infinite loop
+* [33m3b39334[m Fix last column block selection
+* [33m3083733[m Trim \n from hints/semantic-/simple selection
+* [33m3abb361[m Migrate to 2021 edition
+* [33me0897ec[m Bump development version to 0.11.0-dev
+* [33m9747e19[m Fix CreateNewWindow CLI fallback
+* [33mc777250[m Remove shared PID/FD variables
+* [33mdb1df4a[m Keep history position when viewport is cleared
+* [33mdfe79b1[m Remove trailing whitespace from block selection
+* [33mc0ae28d[m Remove outdated Rust compatibility code
+* [33m63dc319[m Fix vi cursor moving incorrectly with new output
+* [33m9ab6bfe[m Fix crash when vi cursor in history during clear
+* [33m95889c7[m Add parameters to `msg create-window` subcommand
+* [33m1265add[m Update signal-hook to 0.3.10
+* [33m2276642[m Fix libxkbcommon-devel package name for openSUSE
+* [33m3331972[m Add multi-window support
+* [33m7f1a0c0[m Update rustfmt configuration
+* [33mf68fb3f[m Handle PTY EIO error for Rust 1.55+
+* [33maa3f8ae[m Remove unused struct fields
+* [33m68eaf79[m Fix alacitty_terminal build on windows
+* [33m4baa436[m Fix fullwidth character crash on resize
+* [33md402c02[m Fix insert mode crash with fullwidth characters
+* [33mcb9f492[m Bump development version to 0.10.0-dev
+* [33m98ed86c[m Fix vi cursor tracking during scrolling
+* [33m78e1c3b[m Fix copying interrupted tab characters
+* [33md5e017a[m Update dependencies
+* [33m7fb850b[m Fix search regressions
+* [33mff6881c[m Update mio-anonymous-pipes to 0.2.0
+* [33m10c4eb7[m Fix PTY performance regressions
+* [33mb3e7c72[m Fix vi cursor motion with ScrollPage* actions
+* [33m9fd1d9d[m Fix crash when resizing during vi mode
+* [33ma06b4af[m Add buffer for PTY reads during terminal lock
+* [33m49b9da4[m Fix clippy warnings
+* [33med8984e[m Fix regex search regression
+* [33m65f2a7b[m Fix ScrollHalfPageUp vi cursor motion regression
+* [33m8f52bf0[m Fix crashes with cut-off fullwidth characters
+* [33mc637201[m Improve rendering performance
+* [33m5b95238[m Fix crash when copying out of bounds selections
+* [33m976a452[m Fix release mode tests
+* [33m9486cef[m Fix single column block selection
+* [33m065bd56[m Bump development version to 0.9.0-dev
+* [33me4096f6[m Fix replacement of fullwidth characters
+* [33m70a99ee[m Fix cursor expansion across wide chars
+* [33m554d08d[m Fix out of order terminal query responses
+* [33mb580a15[m Update dependencies
+* [33me55d07e[m Fix initial vi cursor position while in scrollback
+* [33m19802cf[m Add vi/mouse hint highlighting support
+* [33m0213fb3[m Fix automatic scrolling on resize
+* [33m6c6404d[m Add copy/paste/select hint actions
+* [33mc80f9d1[m Keep viewport in place during resize
+* [33m3f8f59c[m Unify the grid line indexing types
+* [33mbf16faa[m Add regex terminal hints
+* [33m8bbd05d[m Bump base64 to 0.13.0
+* [33m1297591[m Add support for synchronized updates
+* [33m6002bf8[m Match intermediates directly in CSI parser
+* [33m81c0e99[m Fix search freezing Alacritty
+* [33m41cb02b[m Fix cursor position when scrolled into history
+* [33m99022a1[m Update dependencies
+* [33m434c92f[m Move renderable cell transformation to alacritty
+* [33m22926f6[m Remove all rustc benchmarks
+* [33m8865533[m Fix assertion crash on 32-bit systems
+* [33mf3cc0f2[m Fix inefficient search initialization
+* [33m99553b4[m Bump development version to 0.8.0-dev
+* [33mbd607f0[m Fix debug mode crash in vi-less search
+* [33m84c89d9[m Update vte to 0.10.0
+* [33m5e748a6[m Fix deserialization of untagged enums
+* [33m16b024d[m Add vi/search line indicator
+* [33m59389fb[m Remove Windows WinPTY backend
+* [33m39f61be[m Use ConfigDeserialize for all config enums
+* [33m2cf750c[m Draw cursor with rect renderer
+* [33m4e27278[m Remove terminfo dependency
+* [33mfc6f6d9[m Replace serde's derive with custom proc macro
+* [33m1ca4d69[m Fix invalid ESC escape sequence parsing
+* [33m9c3c244[m Fix draining of PTY when holding on exit
+* [33m649c024[m Fix scrolling region performance with fixed lines
+* [33m3605ee5[m Fix dimming of indexed colors
+* [33md815742[m Draw selection below Vi cursor when it's hidden
+* [33m1696324[m Fix DoS caused by excessive CSI parameter values
+* [33mba00766[m Add blinking cursor support
+* [33m57dd114[m Fix vi mode terminal reset
+* [33me0b388d[m Fix wide characters being cut off
+* [33m28cf513[m Bump development version to 0.7.0-dev
+* [33m37e79ca[m Fix zerowidth characters in the last column
+* [33mec07702[m Update vte to 0.9.0
+* [33m4524577[m Add ability to select text during search
+* [33m46e0278[m Fix use after free when dropping zerowidth data
+* [33mf6a8d86[m Deprecate the WinPTY backend
+* [33mede522d[m Use dynamic storage for zerowidth characters
+* [33m74f66cd[m Error on warnings when running clippy
+* [33m25a8e65[m Add license symlinks for crates
+* [33mdf1e98b[m Add support for urgency hints CSI
+* [33m0f68d75[m Bump glutin to 0.25.0
+* [33m268eba5[m Add support for single line terminals
+* [33meec51ab[m Fix selection incorrectly expanding when scrolled in history
+* [33meb8a301[m Remove unused Linear newtype. (#4248)
+* [33m1ef872e[m Pass existing CLI parameters to SpawnNewInstance
+* [33m74b0d9f[m Disable WinPTY with windows-gnu toolchain
+* [33m7f51a34[m Add escape to report text area size
+* [33m18e88cf[m Unify term dimension calls
+* [33md7ea76d[m Add configuration file imports
+* [33m4572cf7[m Use yellow/red from the config for message bar colors
+* [33m55e71f1[m Add support for double underlines
+* [33mf4d3219[m Fix handling of wrapline flag in last line
+* [33m7eed31c[m Add support for colon separated SGR parameters
+* [33m4a16566[m Use `tcgetpgrp` to get PID for SpawnNewInstance
+* [33me976483[m Bump minimum supported Rust version to 1.43.0
+* [33m822952c[m Fix CellForeground and CellBackground cursor colors
+* [33mf36079e[m Invert fixed color cursor if it's close to cell bg
+* [33m05193fa[m Add secondary DA support
+* [33m563f962[m Bump version to 0.6.0-dev
+* [33mbaaa8d3[m Bump alacritty_terminal version
+* [33m4cf75d9[m Add support for searching without vi mode
+* [33medc3369[m Fix cursor reflow
+* [33mc1b5f52[m Fallback to SHELL instead of passwd if present
+* [33m73a8d10[m Fix crash on cursor resize
+* [33m476cf25[m Remove gui dependencies from alacritty_terminal
+* [33mbb0daac[m Add option to run command on bell
+* [33m796c20a[m Fail compilation if Fontconfig is not installed on Linux/BSD
+* [33m642075b[m Add regex scrollback buffer search
+* [33m3dcaada[m Fix cursor reflow
+* [33m030ccf3[m Fix saved cursor handling
+* [33mfb4dcce[m Preserve linewrap flag across alt screen switches
+* [33m65e4a99[m Document supported escape sequences
+* [33m990f815[m Fix reflow of empty wrapped cursor line
+* [33m3c4f211[m Fix foreground dimming with truecolor text
+* [33m31d3396[m Rename alt_grid to inactive_grid
+* [33m352d219[m Clear selection on clear line/screen escapes
+* [33m6e3911d[m Fix scroll down escape pulling lines from history
+* [33md7e0e05[m Add automatic scrolling during selection
+* [33m0e4e49d[m Update dependencies
+* [33medab3d1[m Remove copypasta dependency from alacritty_terminal
+* [33mbd6fd84[m Remove copyright notice from files
+* [33mb7b256c[m Fix class and cursor thickness deserialization
+* [33m3064338[m Refactor Shell, Command, and Launcher to share impl
+* [33mb2c26b0[m Add cargo feature for WinPTY
+* [33m91d4803[m Refactor Term/Grid separation
+* [33m58bb3cc[m Set IUTF8 input setting on supported platforms
+* [33m37ac640[m Remove unused dependencies
+* [33m9710389[m Update copypasta to v0.7.0
+* [33mab09f2d[m Fix crash when writing wide char in last column
+* [33m4dd37fd[m Change default color scheme to 'Tomorrow Night'
+* [33m6201eba[m Fix OSCs terminated by \x9c byte in unicode
+* [33m86b5ee2[m Extend style guideline documentation
+* [33m72a1b06[m Fix clippy warnings
+* [33m93ff991[m Fix startup locale on macOS
+* [33m7e576f7[m Clear selection on grid swap
+* [33m1335690[m Update depedencies
+* [33md805454[m Add config option to set cursor thickness
+* [33ma6321a3[m Use config colors to theme Wayland decorations
+* [33mab59d97[m Fix tabstops not being reset with 'reset'
+* [33mf0e9270[m Remove `fs::read_to_string` reimplementations
+* [33m0cd5218[m Remove std::fs::read_to_string reimplementation from tests
+* [33m8280196[m Fix cursor position after alt screen resize
+* [33me88e8f3[m Fix invisible selection
+* [33m7a5adbf[m Add modal keyboard motion mode
+* [33m8992af8[m Bump version to 0.5.0-dev
+* [33m20ef319[m Fix live config reload for window title
+* [33m35dbc2b[m Add option to pick Linux/BSD backends
+* [33mbc205db[m Fix crash when selecting last column
+* [33m4416710[m Fix selection with invisible start and end
+* [33m6b6bd8f[m Remove `ref_test` option from configuration file
+* [33m769b8de[m Remove HollowBlock/Hidden config cursor styles
+* [33m03778df[m Remove `tabspaces` config option
+* [33mfa9888c[m Fix tabs across linewrap
+* [33mbe2edbf[m Update terminfo dependency
+* [33mfada316[m Fix log target of color config errors
+* [33m397236b[m Remove docs for 0xRRGGBB color notation
+* [33mad80e65[m Fix config reload updating incorrect grid
+* [33m10c8d12[m Fix block selection including last column
+* [33m5e8bbe0[m Extract winpty crate
+* [33m01e0352[m Fix parser stopping at unknown modes
+* [33md09133e[m Fix incorrect display offset after rotation
+* [33mdfcc1c9[m Bump vte and urlocator
+* [33m6e181c8[m Revert "Fix backspace deleting chars when IME is open"
+* [33m079a27d[m Fix selection expansion across full-width glyphs
+* [33m66e7171[m Mirror OSC query terminator
+* [33m59ff4e8[m Fix inconsistent test module naming
+* [33m3db7670[m Fix incorrect grid.len() and grid.history_size()
+* [33m91dda0b[m Fix selection rotating outside of scrolling region
+* [33mbbd4f69[m Fix build error on OpenBSD
+* [33m26f4cca[m Fix oob error during selection
+* [33m95681f6[m Fix first cell when selection is off screen
+* [33m25db8ec[m Disable drawing bold text bright by default
+* [33mad96bf7[m Remove scrolling.auto_scroll feature
+* [33m06e9ef0[m Expand line selection across wrapped lines
+* [33mdd30401[m Remove Windows working directory canonicalization
+* [33m71c37f9[m Bump VTE to 0.5.0
+* [33m258194c[m Fix crash with invalid working directory
+* [33m1be679e[m Move Alacritty to organization
+* [33m375dee1[m Bump glutin to 0.22.0
+* [33m8951aef[m Fix cut off full width glyphs in last column
+* [33mc8e00c7[m Bump version to 0.4.2-dev
+* [33m375ec19[m Update outdated reftests
+* [33mb2b4ee8[m Clean up Windows PTY string handling
+* [33m92678fa[m Remove C1 escape support
+* [33m0036fc2[m Move live-shader-reload feature to alacritty
+* [33mbff2dec[m Remove outdated information from README
+* [33mf0c5b03[m Fix screen reset not clearing cell flags
+* [33mf9a8471[m Fix crash on clear when scrolled up in history
+* [33meb3b0d6[m Remove unneeded NamedPipe::connect() calls
+* [33md8672b4[m Default to ConPTY instead of WinPTY
+* [33m6312dc0[m Fix Windows CI build failure
+* [33mba3ea03[m Add conpty dynamic loading restrictions docs
+* [33m9ecebff[m Send PTY resize messages through event loop
+* [33m0792fc2[m Fix storage rotation error
+* [33mccf8bca[m Fix crash when resizing Alacritty
+* [33m17116aa[m Fix deadlock when closing on Windows using Conpty
+* [33med76e2a[m Fix colored row reset performance
+* [33maed24d5[m Remove unnecessary lifetimes from winpty
+* [33m12fe603[m Fix `OSC 52` with empty clipboard param
+* [33mf34a203[m Fix modifiers not getting released with XWayland
+* [33m8e29cee[m Move renderer from alacritty_terminal to alacritty
+* [33m5aa2041[m Bump master to 0.4.1-dev
+* [33m58b6839[m Remove tests failing in release mode
+* [33mfa58349[m Fix deletion of lines when clearing the screen
+* [33m3dec560[m Fix ESC escapes not ignoring invalid intermediates
+* [33md366087[m Fix cell reset not clearing flags and foreground
+* [33m1c2d722[m Fix WinPTY freeze on termination
+* [33m2a905ca[m Add reftest for line deletion
+* [33m83dd1ea[m Fix `CSI Ps M` deleting lines above cursor
+* [33mfff61ff[m Fix division by zero without any cols or lines
+* [33m1eb3f3a[m Fix mouse modes not being mutually exclusive
+* [33m3a35e8f[m Add escape for reading clipboard
+* [33m42e0991[m Add ref test for verifying colored clear behavior
+* [33mc1d0964[m Add UTF-8 mouse mode support
+* [33m660766e[m Fix incorrect cell foreground when clearing screen
+* [33mf3e0856[m Fix URL highlighting
+* [33m58a4026[m Fix clippy warnings
+* [33m93ace4b[m Fix visual bell rendering mode
+* [33m23976e7[m Update dependencies
+* [33m84dcf94[m Fix XEmbed compilation error on 32-bit platforms
+* [33m7261449[m Fix window title not filled by default
+* [33mcbb779e[m Print launch command name on failure
+* [33mfb1a748[m Add support for alternate scroll escape
+* [33m3482fc0[m Add support for title stack escape sequences
+* [33m6942642[m Add --hold CLI flag
+* [33mea14686[m Remove automatic config generation
+* [33mc5f1df2[m Update to winit/glutin EventLoop 2.0
+* [33m98ea3d4[m Add live config reload for font size
+* [33m1f9451e[m Concatenate parameters of title OSC
+* [33m7a27ed7[m Add `ReceiveChar` action for passing key's text
+* [33ma5a6099[m Fix selection not inverting terminal background
+* [33mbd52c80[m Fix cell opacity when color matches terminal bg
+* [33m73957d5[m Fix overflow on wrong scroll region setting
+* [33m1f6a2a2[m Add Xembed support
+* [33m9818d6c[m Remove outdated TODO/FIXME comments
+* [33md2e14ea[m Initialize only visible characters
+* [33ma32cd5a[m Rework default bindings
+* [33maf83c56[m Remove code for setting _NET_WM_PID
+* [33ma9d6a79[m Fix bindings incorrectly getting replaced
+* [33m332244c[m Fix empty block selection detection
+* [33md4f804d[m Replace uninitialized with MaybeUninit
+* [33ma732fed[m Reset the Mouse Cursor While Selecting
+* [33m21beeed[m Update and dedupe parking_lot to 0.9
+* [33mf9ad9ed[m Fix legacy xparsecolor regression
+* [33mcb176bc[m Fix url highlight not showing with required modifiers
+* [33m16382e7[m Add bold italic font support
+* [33m4624149[m Show text cursor when pressing shift in mouse mode
+* [33mc9f65b8[m Follow xparsecolor spec in escape sequences
+* [33m17b2e25[m Update depedencies
+* [33m8cea107[m Fix clippy issues
+* [33m84e59d2[m Fix smithay-clipboard integration
+* [33m37855ef[m Format code
+* [33m241731e[m Ignore unsupported CSI sequences
+* [33md877232[m Fix multiple underlines/strikeouts on the same line
+* [33m1733597[m Remove errno depedency
+* [33m6f16347[m Fix lines in last line not rendered when scrolled up
+* [33m7a24015[m Fix crash when hovering over message bar
+* [33m7082fc9[m Move modifier check before URL search
+* [33m7f9d90b[m Switch to rfind_url for URL detection
+* [33md4296dc[m Remove color from log output
+* [33mda6d42e[m Bump minimum supported Rust version to 1.34.0
+* [33me74d6e3[m Fix cursor flickering on url hover
+* [33md9a6b61[m Update gl_generator to 0.13
+* [33m331fb1d[m Fix double-click selecting trailing tab
+* [33md565df9[m Fix NetBSD build failure
+* [33m44a2fb2[m Remove redundant use statement on macOS
+* [33m3193323[m Override default bindings with subset mode match
+* [33m63ec39b[m Fix cursor color setting with escape sequence
+* [33md97a52b[m Fix row occ not set during new and reset
+* [33maf8f2d7[m Fix mouse move handling
+* [33m4e77136[m Change mouse cursor when hovering over the message bar
+* [33m682ab09[m Fix saving of ref tests
+* [33m5a3b6b1[m Fix doc box drawing symbols
+* [33m16d5da6[m Allow setting gtk variant and general class on X11
+* [33m7310d2c[m Fix rows only resetting partially
+* [33m29e121b[m Perform clear and buffer swap before showing window
+* [33m0250180[m Fix first unfullscreen on fullscreen mode launched window
+* [33m6e4840c[m Fix performance issues with text reflow
+* [33mfc4464b[m Fix inconsitent cursor position when scrolling
+* [33m7bf3d9e[m Add block selection
+* [33m271249a[m Fix redundant static lifetime clippy lint
+* [33mafd6d1c[m Unset DESKTOP_STARTUP_ID environment variable
+* [33m8d0eaab[m Bump version to 0.3.3
+* [33m6772c49[m Bump version to 0.3.3-rc2
+* [33m0cf1875[m Bump smithay-clipboard dependency version
+* [33m9567cd1[m Fix dynamic color escape response
+* [33mf0eb2e5[m Bump version to 0.3.3-rc1
+* [33m4533c2b[m Fix dynamic multi-color escape codes
+* [33m32bd730[m Fix compiler warnings
+* [33m42c76b8[m Add wayland primary selection clipboard support
+* [33m458371b[m Fix index out of bounds during selection
+* [33me6ce45a[m Re-invert cursor when in selection
+* [33m5d74545[m Add foreground/background request escape codes
+* [33m947300d[m Allow URLs to end with trailing slash
+* [33m92796a9[m Fix URL detection matching invalid URLs
+* [33m5c276de[m Fix message bar not updating PTY size on hide
+* [33me8ef994[m Add support for double-click bracket-pair selection
+* [33mf2ba71a[m Fix cursor only showing up over left half of wide characters
+* [33m973436f[m Refactor config parsing files
+* [33mfb7c036[m Add git hash to version string, and fix crate name (#2397)
+* [33m437f875[m Remove clipboard loading error logging
+* [33md93112e[m Fix selection of double-width characters
+* [33m6310b84[m Fix mouse mode generate events without cell change
+* [33ma0c0dfd[m Fix spelling mistakes
+* [33m9e525ac[m Switch from copypasta to rust-clipboard
+* [33mfd6a8b3[m Set _NET_WM_ICON on X11
+* [33ma60fb61[m Fix double-width characters in URLs only highlighting halfway
+* [33m2509235[m Split alacritty into a separate crates

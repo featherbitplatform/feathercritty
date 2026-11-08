@@ -68,6 +68,10 @@ rand_chacha = "0.3"
 # Checks that a match the fork returns where 0.26.0 cannot answer is a real match (the library
 # already depends on this crate).
 regex-automata = "0.4.3"
+# Candidates of tests/compress_choice.rs (the winner moves to [dependencies] with the compression
+# itself; see benches/RESULTS.md, "Compressor choice").
+lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
+zstd = "0.14.3"
 
 # Benchmarks print their own tables (and take `--gate`), so they bring their own `main`.
 [[bench]]

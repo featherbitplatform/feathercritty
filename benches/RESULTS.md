@@ -254,6 +254,93 @@ took 31.4 ms (126->100) and 37.0 ms (100->126) in the fork against 26.0 and 18.1
 the trim to 10,000 lines 0.5 ms against 30.4 ms. The first measurement of this table (before
 the byte copy) had 100,000-line rewraps of 44 to 69 ms.
 
+## Compressor choice (history compression, phase 0)
+
+Which compressor and level the cold-block compression of the design (spec 5.3, 6.3) uses.
+Command: `cargo test --release --test compress_choice -- --ignored --nocapture` (about 4 s).
+Each corpus (`tests/corpora/`) goes through `Processor::advance` into a 126-column terminal with a
+1,000,000-line history; every 64 KiB history block (partly filled ones included) is compressed and
+decompressed on its own, best of 3 passes, and checked to round trip. The three generated corpora
+have 300,000 rows (seeds 1, 2 and 3); the two recorded streams (a `cargo build` log of this
+workspace, 417 lines, and `git log --graph` of this repository, 562 lines, redacted to `/work`) fit
+in one partly filled block each, so their ratios are for a block of 28 and 55 KB (smaller than
+the 64 KiB a full block has, so a little worse than a full block would give). "Projected vs off"
+is (compressed block bytes + 16 bytes of row index per row) over (block bytes + the same index);
+the rule below allows 40%.
+
+Machine as above (Apple M5 Max), zstd 0.14.3 (C library 1.5.7), lz4_flex 0.14.0 (`safe-encode`,
+`safe-decode`, with `std` for the size-prefixed block functions; the 4-byte prefix is counted).
+
+### build log: 14182801 input bytes, 299965 history rows, 313 blocks, 20494665 block bytes (68.3 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.178 | 1944 | 6001 | 33.4% |
+| zstd level 1 | no | 0.114 | 1473 | 3675 | 28.2% |
+| zstd level 3 | no | 0.111 | 1373 | 3700 | 28.0% |
+
+### service log: 36075261 input bytes, 299964 history rows, 840 blocks, 54968639 block bytes (183.3 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.248 | 1450 | 4552 | 30.8% |
+| zstd level 1 | no | 0.146 | 1295 | 2942 | 21.5% |
+| zstd level 3 | no | 0.143 | 1156 | 2998 | 21.2% |
+
+### shell session: 18059993 input bytes, 299984 history rows, 400 blocks, 26172485 block bytes (87.2 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.253 | 1384 | 4757 | 36.9% |
+| zstd level 1 | no | 0.152 | 1210 | 2709 | 28.3% |
+| zstd level 3 | no | 0.152 | 1046 | 2834 | 28.3% |
+
+### recorded cargo build: 19481 input bytes, 385 history rows, 1 blocks, 27967 block bytes (72.6 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.278 | 2245 | 8949 | 40.8% |
+| zstd level 1 | no | 0.182 | 1203 | 2881 | 33.0% |
+| zstd level 3 | no | 0.178 | 1128 | 2893 | 32.6% |
+
+### recorded git graph: 33811 input bytes, 526 history rows, 1 blocks, 54811 block bytes (104.2 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.389 | 1720 | 6294 | 47.1% |
+| zstd level 1 | no | 0.266 | 1177 | 2685 | 36.3% |
+| zstd level 3 | no | 0.257 | 837 | 2621 | 35.6% |
+
+`ruzstd` 0.8.2, the pure-Rust zstd, was measured in a first run and then dropped from the test:
+its encoder only implements the fastest level, `cargo deny` reports RUSTSEC-2026-0344 on it
+(fixed in 0.9.1, which needs a newer Rust than this crate's 1.85), and it misses the 40% rule on
+the git graph anyway. Its rows (ratio, compress MB/s, decompress MB/s, projected vs off): build log
+0.149 / 336 / 1012 / 31.1%, service log 0.206 / 271 / 782 / 26.9%, shell session 0.200 / 269 /
+768 / 32.4%, recorded cargo build 0.222 / 287 / 735 / 36.3%, recorded git graph 0.341 / 221 / 541 /
+42.9%.
+
+### Decision (spec 5.3 rule)
+
+1. At most 40% of off on every realistic corpus: **lz4_flex fails** (recorded cargo build 40.8%,
+   recorded git graph 47.1%); ruzstd fails (git graph 42.9%). **zstd level 1 and level 3 pass**
+   (worst case 36.3% and 35.6%, both on the git graph).
+2. Fastest decompression among those: level 3 is ahead by 0.4% to 4.6% on four corpora and behind by 2.4% on one (git graph), run to run spreads were about 2.5%, so it is a tie. Level 1
+   compresses 7% to 41% faster, and compression runs on the ingest path (spec 6.3), so the tie goes
+   to level 1; level 3 buys at most 0.7 points of projected size.
+3. Pure Rust within 20%: no pure-Rust candidate passes step 1, so it does not apply.
+
+**Chosen: `zstd`, level 1** (the `zstd` crate, which builds the C library; MIT or Apache-2.0).
+`cargo deny check` passes with it under the terminal repository's `deny.toml` (advisories, bans,
+licenses and sources ok; this repository has no `deny.toml` of its own, and with cargo-deny's
+empty default every license is rejected, with or without the new crates).
+
+Projected compressed history against off (level 1, block bytes plus index): build log 28.2%, service
+log 21.5%, shell session 28.3%, recorded cargo build 33.0%, recorded git graph 36.3%. For a
+1,000,000-row history at the measured bytes per row (68 to 183 for the generated corpora) that is
+68 to 183 MB of blocks plus 16 MB of index off, against 8 to 27 MB of blocks plus the same index
+compressed. The index (16 bytes per row) is uncompressed and caps the saving: at 68 bytes per row
+it is 19% of off.
+
 ## Baseline on identical code (formerly `benches/BASELINE.md`)
 
 Before the compact store (commit `05dd594`, the fork's library identical to 0.26.0 apart from
