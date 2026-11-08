@@ -207,6 +207,38 @@ The sites classified as history-capable in 0.26.0: `Term::line_to_string`, `Term
 - **Dependency.** `unicode-segmentation` (MIT or Apache-2.0).
 - **Tests.** `src/term/cluster.rs` (boundaries, width effects) and the `clusters` module in `src/term/mod.rs`: the mode and its report, joining (flags, skin tones, ZWJ sequences, selectors, split reads, the cap, the mode set midway), the edges (last column with and without wrap, pending wrap, insert mode), overwriting half a cluster, and clusters kept through the compact history and a reflow.
 
+### 9. Cold history compression
+
+`0.26.0+fbterm.7`. Opt-in: history blocks far enough from the newest row are kept compressed ("cold"), so a long scrollback of ordinary output takes a fraction of the memory of change 7. With the option off (the default) nothing changes. featherbit terminal lets users keep up to millions of history lines per tab, and on realistic output (build logs, service logs, shell sessions) the compact records of change 7 still compress about 4 to 9 times; this change takes that saving without touching the parser's path or the read API.
+
+**What** (`src/grid/history.rs`, module docs "Cold blocks"; `src/grid/cold.rs`)
+- `Config::history_compression: Option<usize>`: keep that many of the newest history rows uncompressed and compress every block whose rows are all older (`None`, the default, never compresses; any value is accepted, 0 included). `Term::set_options` applies it to both grids, like `scrolling_history`. The newest block is never cold.
+- A cold block is the zstd level 1 frame of the block's bytes behind a one-byte format tag and the uncompressed length (`cold.rs`). Index entries are unchanged: an offset still counts in the uncompressed bytes. The compressor was chosen by measurement (`benches/RESULTS.md`, "Compressor choice"): the `zstd` crate (MIT or Apache-2.0), the only candidate that met the memory gate on every corpus.
+- Blocks change state only through jobs, never inline, so the host decides where the work runs: `Term::has_history_jobs` (O(1)), `Term::next_history_job` and `Term::next_history_jobs(max)` (a copy of one or up to `max` blocks, taken under the terminal's lock), `HistoryJob::run` (compresses or decompresses the copy, no lock needed), `Term::install_history_job` (swaps the result in under the lock; never compresses or copies). `Term::run_history_jobs` runs everything inline (tests, hosts without a worker).
+- Reads decompress through a cache of at most 4 blocks per history (`RefCell`; `History` stays `Send`). `wraps` and `is_clear` answer from two bits in the index entry and never decompress.
+- A column reflow builds the new history warm and leaves its compression to jobs afterwards; it reads each old cold block once and frees it as its last row leaves.
+
+**Why.** History memory at long scrollback is dominated by block bytes once change 7 has made rows compact; realistic output repeats itself (paths, timestamps, log templates, colors) and compresses well per 64 KiB block. Doing the work in jobs keeps the parser's lock holds short and lets a host run them on a low-priority thread.
+
+**Invariants** (the module docs of `history.rs` are authoritative)
+- Eligibility: a block should be cold when compression is on, it holds rows, none of them is among the `keep_warm` newest, and it is not the newest block. Per-block warm counts make this exact; they are kept only while compression is on.
+- Identity rule: a job carries its history's process-unique id, the block's sequence number and generation (from a counter that never repeats). `install` refuses a job from another history, for a block that changed, was evicted or cleared, or under another setting; the grid's history epoch refuses jobs taken before a reflow. Refused results are dropped and the block is offered again.
+- Off means off: with `None` and no cold block left there are no jobs, and the added paths cost one `Option` or `cold` check each. Reads reach records through a closure (`with_record`), and stored entries take their header bits from the encoder, so warm reads and the byte-copy reflow run as fast as before.
+- A cold block whose last row goes is freed (never kept as a spare); a cold block that becomes the newest again is decompressed at once; `update` of a cold row re-encodes it into the newest block.
+
+**Changed upstream files, and what to watch when merging.** Nothing upstream corresponds to this change.
+- `src/term/mod.rs`: the `Config` field, `set_options` applying it, and the job API (`HistoryJob`, `HistoryDone`, `has_history_jobs`, `next_history_job`, `next_history_jobs`, `install_history_job`, `run_history_jobs`). An upstream change to `Config` or `set_options` only needs the field carried along.
+- `src/grid/mod.rs`: `set_history_compression`, the history epoch, `history_plain_text` taking a closure (a cold record lives in the cache only while it is read), and test hooks. `src/grid/resize.rs`: the reflow's new history is the old one's `sibling` (same block size and setting).
+- New: `src/grid/cold.rs`. `src/grid/history.rs` gained the cold state, the cache, the job API and its tests. `Cargo.toml`: the `zstd` dependency.
+- Tests and benchmarks: `tests/corpora/` (three seeded generators and two recorded streams), `tests/compress_choice.rs`, compressed variants in `tests/large_history.rs`, `tests/alloc.rs` and `tests/differential.rs` (`DIFF_COLD`, jobs run, dropped or held across steps), and the compression sections of `benches/ingest.rs` and `benches/reads.rs`.
+
+**Measured results** (Apple M5 Max, release; full tables, method and commands in `benches/RESULTS.md`, "History compression")
+- Memory at 1,000,000 history lines, 126 columns, 10,000 rows kept warm: build log 31.1% of off (86.8 to 27.0 MB), service log 23.3%, shell session 30.8%, the recorded cargo build and `git log --graph` streams 28.1% and 36.1%, random content 45.7% (gate: realistic content at most 40%, random never above off). At 100,000 lines the index and fixed overhead weigh more (37.5% to 51.1%).
+- Speed with compression on, 1,000,000 lines: regex search 1.12x of off, an export-style read of every row 1.43x (gate 2x); the worker's lock holds p99 0.007 ms over a fill (gate 0.1 ms); a 60 s flood keeps the backlog at the warm window plus at most 9 blocks for about 21% of one core; switching on takes 137 ms and off 79 ms. Parser-side ingest with the worker running 1.030 to 1.041x of off (gate 1.03).
+- Decompressing a 64 KiB block takes about 28 microseconds.
+
+**Open items for the owner** (the gates are unchanged; numbers and reasoning in `benches/RESULTS.md`, "History compression"): with compression off, some rows sit 1% to 3% above the fork's `main` in some sessions (dense cells, the 10,000-row reflow) and live bytes are 16 bytes per block slot higher (0.03%); with it on, parser-side ingest is borderline at 3%, the reflow comes 1.6% to 1.9% above "off plus one decompression of the old history", and switching on goes about two blocks (128 KiB) above the uncompressed size before it comes down.
+
 ## Development
 
 ```sh
@@ -220,7 +252,9 @@ CI runs the same on Linux, macOS and Windows, plus the differential test in rele
 
 ```sh
 DIFF_TINY=1 cargo test --release --test differential
-cargo test --release --test large_history -- --ignored --exact large_history_matches_oracle_at_100k large_history_invariants_at_1m
+DIFF_COLD=1 DIFF_TINY=1 cargo test --release --test differential   # change 9: cold history, jobs at random points
+DIFF_COLD=37 cargo test --release --test differential
+cargo test --release --test large_history -- --ignored --exact large_history_matches_oracle_at_100k large_history_invariants_at_1m large_history_matches_oracle_at_100k_compressed large_history_invariants_at_1m_compressed
 ```
 
 ### The differential test's oracle

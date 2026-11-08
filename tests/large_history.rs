@@ -27,14 +27,17 @@
 //!   `large_history_invariants_at_1m_compressed` run the two above with `history_compression:
 //!   Some(10_000)`, `run_history_jobs()` after the fill and each step, and check that most blocks
 //!   are compressed.
-//! - `large_history_cost_table` measures (does not gate; the realistic corpora also with
-//!   compression on, in their own table): live bytes, resident set size, resize and trim times for
-//!   short, log-style and full-width lines at 100,000 and 1,000,000 history lines, and prints the
-//!   tables recorded in `benches/RESULTS.md`. Each cell runs in a fresh child process
-//!   (`large_history_cost_cell`, which does nothing unless the parent sets `LARGE_HISTORY_CELL`),
-//!   so the resident set size of one cell does not include the freed memory of the previous one.
-//!   Live bytes come from a counting `#[global_allocator]` that counts only the calling thread, so
-//!   the other tests' threads do not disturb it. The tests serialize on a lock for the same reason.
+//! - `large_history_cost_table` measures (it prints, never asserts): live bytes, resident set size,
+//!   resize and trim times for short, log-style and full-width lines at 100,000 and 1,000,000
+//!   history lines, and the tables recorded in `benches/RESULTS.md`. Its last table is the history
+//!   compression memory gate (that design's 6.3 and the peaks of its 6.4): the realistic
+//!   generators, the recorded streams (repeated to fill the history) and the random content,
+//!   compression off against on, with the peaks during column resizes and while switching
+//!   compression on and off. Each cell runs in a fresh child process (`large_history_cost_cell`,
+//!   which does nothing unless the parent sets `LARGE_HISTORY_CELL`), so the resident set size of
+//!   one cell does not include the freed memory of the previous one. Live bytes come from a
+//!   counting `#[global_allocator]` that counts only the calling thread, so the other tests'
+//!   threads do not disturb it. The tests serialize on a lock for the same reason.
 //!
 //! The allocator below is the only `unsafe` code of this file, as in `tests/alloc.rs`: it
 //! forwards every call to `System` and keeps counters in `const` thread-locals.
@@ -64,13 +67,19 @@ thread_local! {
     /// Bytes allocated minus bytes freed by this thread while `COUNTING` is set.
     static LIVE: StdCell<isize> = const { StdCell::new(0) };
     static COUNTING: StdCell<bool> = const { StdCell::new(false) };
+    /// The highest `LIVE` since `reset_peak`.
+    static PEAK: StdCell<isize> = const { StdCell::new(0) };
 }
 
 fn note(delta: isize) {
     // `try_with`: the allocator also runs while thread-locals are being torn down.
     let _ = COUNTING.try_with(|counting| {
         if counting.get() {
-            let _ = LIVE.try_with(|live| live.set(live.get() + delta));
+            let _ = LIVE.try_with(|live| {
+                let now = live.get() + delta;
+                live.set(now);
+                let _ = PEAK.try_with(|peak| peak.set(peak.get().max(now)));
+            });
         }
     });
 }
@@ -114,6 +123,16 @@ fn start_counting() {
 
 fn live_bytes() -> usize {
     LIVE.with(StdCell::get).max(0) as usize
+}
+
+/// Start a new high-water mark at the current live bytes.
+fn reset_peak() {
+    PEAK.with(|peak| peak.set(LIVE.with(StdCell::get)));
+}
+
+/// The highest live bytes since `reset_peak`.
+fn peak_bytes() -> usize {
+    PEAK.with(StdCell::get).max(0) as usize
 }
 
 fn stop_counting() {
@@ -951,18 +970,68 @@ fn spread(stat: &str) -> String {
     format!("{} ({}-{})", p[0], p[1], p[2])
 }
 
-/// The realistic corpora of the compressed columns: name and generator.
+/// The corpora of the compressed columns: name and generator.
 type Generator = fn(u64, usize) -> Vec<u8>;
 
-const CORPORA: [(&str, Generator); 3] = [
+/// A recorded stream repeated until it has `rows` lines (the streams have a few hundred lines;
+/// a 64 KiB block holds about one copy, so the repetition helps a block's compression little,
+/// see `benches/RESULTS.md`).
+fn repeated(name: &str, rows: usize) -> Vec<u8> {
+    let stream = corpora::recorded(name);
+    let per_copy = stream.iter().filter(|&&b| b == b'\n').count();
+    let copies = rows.div_ceil(per_copy);
+    stream.repeat(copies)
+}
+
+fn recorded_cargo_build(_seed: u64, rows: usize) -> Vec<u8> {
+    repeated("cargo-build", rows)
+}
+
+fn recorded_git_graph(_seed: u64, rows: usize) -> Vec<u8> {
+    repeated("git-graph", rows)
+}
+
+/// The uniform random log lines of the tables above (`Content::Log`), which hardly compress.
+fn random_log(_seed: u64, rows: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..rows {
+        out.extend(Content::Log.line(i));
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+/// The corpora: the realistic generators and recorded streams (gate: compressed at most 40% of
+/// off), then the random content (gate: never above off).
+const CORPORA: [(&str, Generator); 6] = [
     ("build log", corpora::build_log),
     ("service log", corpora::service_log),
     ("shell session", corpora::shell_session),
+    ("recorded cargo build (repeated)", recorded_cargo_build),
+    ("recorded git graph (repeated)", recorded_git_graph),
+    ("random log lines (large_history.rs)", random_log),
 ];
 
-/// Live bytes of a `history`-row history of corpus `corpus` after the fill and after ten column
-/// resizes (jobs run after each), with compression `compression`.
-fn corpus_live(corpus: usize, history: usize, compression: Option<usize>) -> (usize, usize) {
+/// Index of the random content in [`CORPORA`].
+const RANDOM: usize = 5;
+
+/// Live bytes of a `history`-row history of one corpus, as measured by [`corpus_live`].
+#[derive(Clone, Copy, Default)]
+struct CorpusLive {
+    /// After the fill (with compression on, the jobs run after every 64 KiB of input).
+    filled: usize,
+    /// The highest live bytes during ten column resizes (jobs run after each).
+    resize_peak: usize,
+    /// After the resizes.
+    resized: usize,
+    /// Switching compression to the other state after the resizes: the highest live bytes
+    /// while switching and running every job, and the live bytes afterwards.
+    switch_peak: usize,
+    switched: usize,
+}
+
+/// Live bytes of a `history`-row history of corpus `corpus` with compression `compression`.
+fn corpus_live(corpus: usize, history: usize, compression: Option<usize>) -> CorpusLive {
     // Generated before counting, so the text is not part of the live bytes.
     let bytes = (CORPORA[corpus].1)(corpus as u64 + 1, history + LINES + 10);
     start_counting();
@@ -974,17 +1043,24 @@ fn corpus_live(corpus: usize, history: usize, compression: Option<usize>) -> (us
     }
     assert_eq!(side.term.grid().history_size(), history);
     let filled = live_bytes();
+    reset_peak();
     for _ in 0..5 {
         apply(&mut side, &resize(LINES, 100), compression);
         apply(&mut side, &resize(LINES, 126), compression);
     }
+    let resize_peak = peak_bytes();
     let resized = live_bytes();
+    reset_peak();
+    let other = if compression.is_some() { None } else { Some(WARM) };
+    set_history(&mut side, history, other);
+    let switch_peak = peak_bytes();
+    let switched = live_bytes();
     stop_counting();
-    (filled, resized)
+    CorpusLive { filled, resize_peak, resized, switch_peak, switched }
 }
 
 /// Runs only as a child of `large_history_cost_table`: `LARGE_HISTORY_CORPUS=<index>,<lines>`.
-/// Prints one `CCELL|...` line: live bytes off and compressed, after the fill and the resizes.
+/// Prints one `CCELL|...` line: [`CorpusLive`] off, then compressed.
 #[test]
 #[ignore = "child of large_history_cost_table"]
 fn large_history_cost_corpus_cell() {
@@ -995,13 +1071,16 @@ fn large_history_cost_corpus_cell() {
     let _serial = SERIAL.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let (corpus, lines) = cell.split_once(',').expect("<index>,<lines>");
     let (corpus, history): (usize, usize) = (corpus.parse().unwrap(), lines.parse().unwrap());
-    let (off, off_resized) = corpus_live(corpus, history, None);
-    let (on, on_resized) = corpus_live(corpus, history, Some(WARM));
-    println!("CCELL|{corpus}|{history}|{off}|{off_resized}|{on}|{on_resized}");
+    let off = corpus_live(corpus, history, None);
+    let on = corpus_live(corpus, history, Some(WARM));
+    let fields = |c: CorpusLive| {
+        format!("{}|{}|{}|{}|{}", c.filled, c.resize_peak, c.resized, c.switch_peak, c.switched)
+    };
+    println!("CCELL|{corpus}|{history}|{}|{}", fields(off), fields(on));
 }
 
-/// One corpus cell as the child printed it: (off filled, off resized, on filled, on resized).
-fn run_corpus_cell(corpus: usize, history: usize) -> [usize; 4] {
+/// One corpus cell as the child printed it: (off, compressed).
+fn run_corpus_cell(corpus: usize, history: usize) -> (CorpusLive, CorpusLive) {
     let exe = std::env::current_exe().expect("test binary");
     let out = Command::new(exe)
         .args([
@@ -1025,7 +1104,14 @@ fn run_corpus_cell(corpus: usize, history: usize) -> [usize; 4] {
         .find_map(|l| l.find("CCELL|").map(|at| &l[at..]))
         .unwrap_or_else(|| panic!("no CCELL line in:\n{stdout}"));
     let f: Vec<usize> = line.split('|').skip(3).map(|v| v.parse().unwrap()).collect();
-    [f[0], f[1], f[2], f[3]]
+    let live = |f: &[usize]| CorpusLive {
+        filled: f[0],
+        resize_peak: f[1],
+        resized: f[2],
+        switch_peak: f[3],
+        switched: f[4],
+    };
+    (live(&f[..5]), live(&f[5..]))
 }
 
 /// Measures and prints the tables of `benches/RESULTS.md`, "Large histories".
@@ -1088,26 +1174,62 @@ fn large_history_cost_table() {
     }
 
     println!(
-        "\nRealistic corpora, compression off against on (keep {WARM} rows warm; live MB, after \
-         the fill and after 10 column resizes with the jobs run):\n"
+        "\nCorpora, compression off against on (keep {WARM} rows warm; live MB; gate at 1,000,000 \
+         lines: compressed at most 40% of off, random content never above off; peaks over ten \
+         column resizes, jobs run after each; switching: off to on for the off column, on to off \
+         for the compressed one):\n"
     );
     println!(
-        "| corpus | history lines | off MB | compressed MB | compressed / off | off MB after \
-         resizes | compressed MB after resizes |"
+        "| corpus | history lines | off MB | compressed MB | compressed / off | gate | off peak \
+         MB in resizes | compressed peak MB in resizes | off MB after resizes | compressed MB \
+         after resizes | switching on: peak MB / after | switching off: peak MB / after |"
     );
-    println!("|---|---:|---:|---:|---:|---:|---:|");
+    println!("|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|");
+    let mut failed = Vec::new();
     for history in [100_000, 1_000_000] {
         for (i, (name, _)) in CORPORA.iter().enumerate() {
-            let [off, off_resized, on, on_resized] = run_corpus_cell(i, history);
+            let (off, on) = run_corpus_cell(i, history);
+            let ratio = on.filled as f64 / off.filled as f64;
+            let gate = if history != 1_000_000 {
+                "-".to_owned()
+            } else {
+                let (ok, rule) = if i == RANDOM {
+                    (on.filled <= off.filled, "<= off")
+                } else {
+                    (ratio <= 0.40, "<= 40%")
+                };
+                // Spec 6.4: the reflow's peak never above compression off's, and switching on
+                // never above the uncompressed size (reported in bytes when it is).
+                let reflow_ok = on.resize_peak <= off.resize_peak;
+                let over = off.switch_peak.saturating_sub(off.resized);
+                if !ok || !reflow_ok || over > 0 {
+                    failed.push(format!("{name} at {history}"));
+                }
+                format!(
+                    "{} ({rule}); reflow peak {}; switching on {}",
+                    if ok { "pass" } else { "FAIL" },
+                    if reflow_ok { "pass" } else { "FAIL" },
+                    if over == 0 { "pass".to_owned() } else { format!("FAIL (+{over} B)") },
+                )
+            };
             println!(
-                "| {name} | {history} | {} | {} | {:.0}% | {} | {} |",
-                mb(off),
-                mb(on),
-                on as f64 * 100.0 / off as f64,
-                mb(off_resized),
-                mb(on_resized),
+                "| {name} | {history} | {} | {} | {:.1}% | {gate} | {} | {} | {} | {} | {} / {} | \
+                 {} / {} |",
+                mb(off.filled),
+                mb(on.filled),
+                ratio * 100.0,
+                mb(off.resize_peak),
+                mb(on.resize_peak),
+                mb(off.resized),
+                mb(on.resized),
+                mb(off.switch_peak),
+                mb(off.switched),
+                mb(on.switch_peak),
+                mb(on.switched),
             );
         }
     }
     println!("\nmeasured in {:.0} s", started.elapsed().as_secs_f64());
+    // A measurement, like the tables above: misses are printed, not asserted.
+    println!("memory gates missed: {failed:?}");
 }
