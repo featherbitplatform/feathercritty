@@ -1105,7 +1105,10 @@ impl<T> Term<T> {
     /// before `c` (or there is no cluster), so `c` is printed as usual.
     ///
     /// feathercritty: not upstream.
-    fn join_cluster(&mut self, c: char) -> bool {
+    fn join_cluster(&mut self, c: char) -> bool
+    where
+        T: EventListener,
+    {
         let line = self.grid.cursor.point.line;
         let mut col = self.grid.cursor.point.column;
         if !self.grid.cursor.input_needs_wrap {
@@ -1140,13 +1143,51 @@ impl<T> Term<T> {
     /// cursor after it.
     ///
     /// feathercritty: not upstream.
-    fn widen_cluster(&mut self, line: Line, col: Column) {
+    fn widen_cluster(&mut self, line: Line, col: Column)
+    where
+        T: EventListener,
+    {
         let columns = self.columns();
         if col.0 + 1 >= columns {
+            // No room in this row: like a wide character that does not fit, the cluster moves
+            // whole to the start of the next line behind a leading spacer. Without line wrap
+            // it stays narrow.
+            if !self.mode.contains(TermMode::LINE_WRAP) {
+                return;
+            }
+            let moved = self.grid.screen()[line][col].clone();
+            self.grid.cursor.point.column = col;
+            self.grid.cursor.template.flags.insert(Flags::LEADING_WIDE_CHAR_SPACER);
+            self.write_at_cursor(' ');
+            self.grid.cursor.template.flags.remove(Flags::LEADING_WIDE_CHAR_SPACER);
+            self.wrapline();
+
+            self.write_at_cursor(moved.c);
+            let line = self.grid.cursor.point.line;
+            let cell = &mut self.grid.screen_mut()[line][Column(0)];
+            for &piece in moved.zerowidth().unwrap_or(&[]) {
+                cell.push_zerowidth(piece);
+            }
+            self.widen_cluster(line, Column(0));
             return;
         }
 
         self.grid.screen_mut()[line][col].flags.insert(Flags::WIDE_CHAR);
+
+        // In insert mode the spacer pushes the rest of the line right by one; a wide character
+        // whose spacer falls off the end is cleared.
+        if self.mode.contains(TermMode::INSERT) {
+            let row = &mut self.grid.screen_mut()[line][..];
+            for i in (col.0 + 1..columns - 1).rev() {
+                row.swap(i + 1, i);
+            }
+            row[col.0 + 1] = Cell::default();
+            if row[columns - 1].flags.contains(Flags::WIDE_CHAR) {
+                row[columns - 1].clear_wide();
+            }
+            self.damage.damage_line(line.0 as usize, col.0, columns - 1);
+        }
+
         self.grid.cursor.point.column = col + 1;
         self.grid.cursor.template.flags.insert(Flags::WIDE_CHAR_SPACER);
         self.write_at_cursor(' ');
@@ -3810,6 +3851,139 @@ mod tests {
             feed(&mut term, "\x1b[?2027h\u{302}".as_bytes());
             assert_eq!(pieces(&term, 0, 0), ['\u{301}', '\u{302}']);
             assert_eq!(cursor_col(&term), 1);
+        }
+
+        /// Line 0's cells as `(char, wide, spacer)` triples.
+        fn row<T>(term: &Term<T>, line: i32) -> Vec<(char, bool, bool)> {
+            (0..term.columns())
+                .map(|col| {
+                    let c = cell(term, line, col);
+                    let f = c.flags;
+                    (c.c, f.contains(Flags::WIDE_CHAR), f.contains(Flags::WIDE_CHAR_SPACER))
+                })
+                .collect()
+        }
+
+        #[test]
+        fn cluster_widens_in_last_column_wraps() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abcd❤\u{FE0F}".as_bytes());
+            let last = cell(&term, 0, 4);
+            assert!(last.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER));
+            assert!(last.flags.contains(Flags::WRAPLINE));
+            let wrapped = cell(&term, 1, 0);
+            assert_eq!((wrapped.c, pieces(&term, 1, 0)), ('❤', vec!['\u{FE0F}']));
+            assert!(wrapped.flags.contains(Flags::WIDE_CHAR));
+            assert!(cell(&term, 1, 1).flags.contains(Flags::WIDE_CHAR_SPACER));
+            assert_eq!(term.grid.cursor.point, Point::new(Line(1), Column(2)));
+        }
+
+        #[test]
+        fn cluster_widens_in_last_column_no_wrap() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "\x1b[?7labcd❤\u{FE0F}".as_bytes());
+            let last = cell(&term, 0, 4);
+            assert_eq!((last.c, pieces(&term, 0, 4)), ('❤', vec!['\u{FE0F}']));
+            assert!(!last.flags.contains(Flags::WIDE_CHAR));
+            assert_eq!(cell(&term, 1, 0).c, ' ');
+            assert_eq!(term.grid.cursor.point.line, Line(0));
+        }
+
+        #[test]
+        fn cluster_joins_under_pending_wrap() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abc👍\u{1F3FD}".as_bytes());
+            assert_eq!(pieces(&term, 0, 3), ['\u{1F3FD}']);
+            assert_eq!(cell(&term, 1, 0).c, ' ');
+            assert!(term.grid.cursor.input_needs_wrap);
+        }
+
+        #[test]
+        fn cluster_narrows_clears_spacer() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "abc⌚\u{FE0E}".as_bytes());
+            assert!(!cell(&term, 0, 3).flags.contains(Flags::WIDE_CHAR));
+            assert!(!cell(&term, 0, 4).flags.contains(Flags::WIDE_CHAR_SPACER));
+            assert!(!term.grid.cursor.input_needs_wrap);
+            assert_eq!(cursor_col(&term), 4);
+        }
+
+        #[test]
+        fn cluster_widens_in_insert_mode_shifts() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "xyz\r\x1b[4h❤\u{FE0F}".as_bytes());
+            let expected = [
+                ('❤', true, false),
+                (' ', false, true),
+                ('x', false, false),
+                ('y', false, false),
+                ('z', false, false),
+            ];
+            assert_eq!(row(&term, 0), expected);
+        }
+
+        #[test]
+        fn cluster_widens_in_insert_mode_cuts_wide_at_edge() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "xy中\r\x1b[4h❤\u{FE0F}".as_bytes());
+            let expected = [
+                ('❤', true, false),
+                (' ', false, true),
+                ('x', false, false),
+                ('y', false, false),
+                (' ', false, false),
+            ];
+            assert_eq!(row(&term, 0), expected);
+        }
+
+        #[test]
+        fn cluster_overwrite_half_clears() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "🇮🇹\x1b[1;2Hx".as_bytes());
+            assert_eq!((cell(&term, 0, 0).c, pieces(&term, 0, 0)), (' ', vec![]));
+            assert_eq!(row(&term, 0)[1], ('x', false, false));
+
+            let mut term = clustering(5, 3);
+            feed(&mut term, "🇮🇹\x1b[1;1Hx".as_bytes());
+            assert_eq!((cell(&term, 0, 0).c, pieces(&term, 0, 0)), ('x', vec![]));
+            assert_eq!(row(&term, 0)[1], (' ', false, false));
+        }
+
+        #[test]
+        fn cluster_survives_history() {
+            let mut term = clustering(5, 3);
+            feed(&mut term, "🇮🇹\r\na\r\nb\r\nc\r\nd".as_bytes());
+            assert!(term.grid.history_size() >= 1);
+            let line = Line(-(term.grid.history_size() as i32));
+            let kept: Cell = term.grid.cell(Point::new(line, Column(0)));
+            assert_eq!(kept.c, '🇮');
+            assert_eq!(kept.zerowidth(), Some(&['🇹'][..]));
+            assert!(kept.flags.contains(Flags::WIDE_CHAR));
+        }
+
+        #[test]
+        fn cluster_survives_reflow() {
+            // The cluster must end up where a plain wide character ends up, whole.
+            let mut term = clustering(6, 3);
+            feed(&mut term, "ab🇮🇹".as_bytes());
+            let mut plain = clustering(6, 3);
+            feed(&mut plain, "ab中".as_bytes());
+            term.resize(TermSize::new(3, 3));
+            term.resize(TermSize::new(6, 3));
+            plain.resize(TermSize::new(3, 3));
+            plain.resize(TermSize::new(6, 3));
+
+            let lines = -(plain.grid.history_size() as i32)..plain.screen_lines() as i32;
+            let at = lines
+                .flat_map(|l| (0..6).map(move |c| Point::new(Line(l), Column(c))))
+                .find(|&p| plain.grid.cell(p).c == '中')
+                .expect("the plain wide character is somewhere");
+            let kept: Cell = term.grid.cell(at);
+            assert_eq!(kept.c, '🇮');
+            assert_eq!(kept.zerowidth(), Some(&['🇹'][..]));
+            assert!(kept.flags.contains(Flags::WIDE_CHAR));
+            let spacer: Cell = term.grid.cell(Point::new(at.line, at.column + 1));
+            assert!(spacer.flags.contains(Flags::WIDE_CHAR_SPACER));
         }
 
         #[test]
