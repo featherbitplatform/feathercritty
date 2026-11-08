@@ -39,11 +39,13 @@
 //!   room for the largest record such a row can make (`HistoryCell::max_record_bytes`); otherwise,
 //!   near a block's end, into a reused scratch buffer and copied from there to wherever it fits.
 //! - **Index.** One 16-byte [`Entry`] per row, oldest first, in a `VecDeque`: the block's sequence
-//!   number, the record's offset and length in it, and the position of the row's first extra. It
-//!   grows by doubling but never past the limit, so a full history's index holds at most `limit`
-//!   entries. After a column reflow it can hold up to `limit + lines`: the reflow builds the new
-//!   history with a limit of `limit + lines` (upstream's final trim) and lowers the limit at the
-//!   end without shrinking the index (`trim_to_limit`), about 16 bytes per screen line.
+//!   number, the record's offset and length in it (30 bits, the other two hold copies of the record
+//!   header's `WRAPS` and `CLEAR` bits, so `wraps` and `is_clear` never decompress), and the
+//!   position of the row's first extra. It grows by doubling but never past the limit, so a full
+//!   history's index holds at most `limit` entries. After a column reflow it can hold up to `limit`
+//!   plus `lines` entries: the reflow builds the new history with a limit of that sum (upstream's
+//!   final trim) and lowers the limit at the end without shrinking the index (`trim_to_limit`),
+//!   about 16 bytes per screen line.
 //! - **Extras.** The `T::Extra` values (for `Cell`, its `Arc<CellExtra>`) a row's record refers to
 //!   sit in one `VecDeque` shared by the whole history, in index order; positions are wrapping
 //!   `u32` counters (`extras_base` is the position of the queue's front). Row `k`'s extras are
@@ -308,11 +310,53 @@ struct Entry {
     /// Start of the record in the block.
     offset: u32,
 
-    /// Length of the record in bytes (the record header holds no byte length).
-    len: u32,
+    /// Length of the record in bytes in the low 30 bits (the record header holds no byte
+    /// length), with the header's `WRAPS` bit at bit 31 and `CLEAR` bit at bit 30, so that
+    /// `wraps` and `is_clear` never read (or decompress) a record. Use the accessors.
+    len_flags: u32,
 
     /// Position of the row's first extra in the extras queue (a wrapping counter).
     first_extra: u32,
+}
+
+impl Entry {
+    const CLEAR: u32 = 1 << 30;
+    const LEN: u32 = Self::CLEAR - 1;
+    const WRAPS: u32 = 1 << 31;
+
+    /// An entry for the record `record` of `len` bytes: the header bits are copied from it.
+    #[inline]
+    fn new(block: u32, offset: usize, record: &[u8], first_extra: u32) -> Entry {
+        let len = record.len();
+        debug_assert!(len < 1 << 30, "history record of {len} bytes");
+        let header = read_header(record);
+        let mut len_flags = len as u32;
+        if header.wraps {
+            len_flags |= Self::WRAPS;
+        }
+        if header.clear {
+            len_flags |= Self::CLEAR;
+        }
+        Entry { block, offset: offset as u32, len_flags, first_extra }
+    }
+
+    /// Length of the record in bytes.
+    #[inline]
+    fn len(self) -> usize {
+        (self.len_flags & Self::LEN) as usize
+    }
+
+    /// The record header's `WRAPS` bit.
+    #[inline]
+    fn wraps(self) -> bool {
+        self.len_flags & Self::WRAPS != 0
+    }
+
+    /// The record header's `CLEAR` bit.
+    #[inline]
+    fn clear(self) -> bool {
+        self.len_flags & Self::CLEAR != 0
+    }
 }
 
 /// The rows above the screen, at most `limit` of them, as compact records in pooled blocks (see
@@ -538,6 +582,12 @@ impl<T: HistoryCell> History<T> {
         self.cache.borrow().entries.len()
     }
 
+    /// Drop every decompressed block from the read cache (tests).
+    #[cfg(test)]
+    pub(crate) fn clear_cache(&mut self) {
+        self.cache.get_mut().entries = Vec::new();
+    }
+
     /// Whether the block at `at` in `blocks` should be cold: compression is on, it holds rows,
     /// none of them is among the `keep_warm` newest, and it is not the newest block.
     #[inline]
@@ -675,7 +725,7 @@ impl<T: HistoryCell> History<T> {
         }
 
         block.live += 1;
-        Some(Entry { block: block_seq, offset: offset as u32, len: len as u32, first_extra })
+        Some(Entry::new(block_seq, offset, &block.bytes[offset..], first_extra))
     }
 
     /// Make room for one more index entry. The index grows by doubling, as a `VecDeque` does,
@@ -942,13 +992,13 @@ impl<T: HistoryCell> History<T> {
     /// Whether row `i` (0 is the newest) continues on the next line (the record header's
     /// `WRAPS` bit); "no row" past the end does not.
     pub fn wraps(&self, i: usize) -> bool {
-        self.position(i).is_some_and(|pos| read_header(&self.record(self.index[pos])).wraps)
+        self.position(i).is_some_and(|pos| self.index[pos].wraps())
     }
 
     /// Whether every cell of row `i` (0 is the newest) is empty (the record header's `CLEAR`
     /// bit); "no row" past the end is.
     pub fn is_clear(&self, i: usize) -> bool {
-        self.position(i).is_none_or(|pos| read_header(&self.record(self.index[pos])).clear)
+        self.position(i).is_none_or(|pos| self.index[pos].clear())
     }
 
     /// Blocks that still hold a buffer (tests: the old store's blocks are freed while a reflow
@@ -1000,7 +1050,7 @@ impl<T: HistoryCell> History<T> {
     #[inline]
     fn record(&self, entry: Entry) -> Record<'_> {
         let block = &self.blocks[entry.block.wrapping_sub(self.front_seq) as usize];
-        let range = entry.offset as usize..entry.offset as usize + entry.len as usize;
+        let range = entry.offset as usize..entry.offset as usize + entry.len();
         if block.cold {
             Record::Cold(self.decompressed(entry.block, block), range)
         } else {
@@ -1068,7 +1118,7 @@ impl<T: HistoryCell> History<T> {
         let bytes = self.record(entry);
         let used = self.with_extras(entry, extras_end, |extras| T::decode(&bytes, extras, into));
         // A wrong offset or length must not decode silently.
-        debug_assert_eq!(used, entry.len as usize, "history record length disagrees with index");
+        debug_assert_eq!(used, entry.len(), "history record length disagrees with index");
     }
 
     /// Copy the record in `encoded` to a block and return its entry: into the newest block when
@@ -1095,7 +1145,7 @@ impl<T: HistoryCell> History<T> {
         block.live += 1;
         debug_assert!(oversized || block.bytes.len() <= self.block_bytes);
 
-        Entry { block: block_seq, offset: offset as u32, len: len as u32, first_extra }
+        Entry::new(block_seq, offset, &self.encoded, first_extra)
     }
 
     /// Append a new, empty block with buffer `bytes` as the newest block. The block that was
@@ -1118,7 +1168,7 @@ impl<T: HistoryCell> History<T> {
         let generation = self.generation + 1;
         let block = &mut self.blocks[entry.block.wrapping_sub(self.front_seq) as usize];
         block.live -= 1;
-        if !block.cold && entry.offset as usize + entry.len as usize == block.bytes.len() {
+        if !block.cold && entry.offset as usize + entry.len() == block.bytes.len() {
             block.bytes.truncate(entry.offset as usize);
             // A job may hold a copy of the longer bytes.
             block.generation = generation;
@@ -1500,7 +1550,7 @@ mod tests {
         for (pos, entry) in history.index.iter().enumerate() {
             let at = entry.block.wrapping_sub(history.front_seq) as usize;
             let block = &history.blocks[at];
-            let end = entry.offset as usize + entry.len as usize;
+            let end = entry.offset as usize + entry.len();
             let len = match block.cold {
                 true => cold::uncompressed_len(&block.bytes),
                 false => block.bytes.len(),
@@ -1587,7 +1637,7 @@ mod tests {
         let oversized = &history.blocks[1];
         assert!(oversized.oversized);
         assert_eq!(oversized.live, 1);
-        assert_eq!(oversized.bytes.len(), history.index[1].len as usize);
+        assert_eq!(oversized.bytes.len(), history.index[1].len());
         assert_eq!(oversized.bytes.capacity(), oversized.bytes.len());
         assert_eq!(read(&history, 1), big);
         assert_eq!(read(&history, 0), wide(2, 2));
@@ -1631,7 +1681,7 @@ mod tests {
             history.push_newest(&wide(3, value));
         }
         let used = history.blocks[0].bytes.len();
-        let last = history.index.back().unwrap().len as usize;
+        let last = history.index.back().unwrap().len();
 
         let mut into = Row::default();
         assert!(history.pop_newest(&mut into));
@@ -1669,7 +1719,7 @@ mod tests {
         check_store(&history);
         let entry = history.index[5];
         assert_eq!(entry.block, history.front_seq.wrapping_add(1));
-        assert_eq!(entry.offset as usize + entry.len as usize, history.blocks[1].bytes.len());
+        assert_eq!(entry.offset as usize + entry.len(), history.blocks[1].bytes.len());
         assert_eq!(history.blocks[0].live, 31);
         assert_eq!(history.blocks[0].bytes.len(), first_len, "never edited in place");
         let mut expected = wide(2, 5);
@@ -1940,7 +1990,7 @@ mod tests {
         check_store(&history);
         assert_eq!(history.blocks.len(), 1);
         let (first, second) = (history.index[0], history.index[1]);
-        assert_eq!(second.offset, first.offset + first.len);
+        assert_eq!(second.offset, first.offset + first.len() as u32);
         assert!(history.encoded.capacity() > 0, "the first row went through the scratch buffer");
 
         // Fill the block until less than `bound` is left: the next small row takes the scratch
@@ -1972,7 +2022,7 @@ mod tests {
         check_store(&history);
         assert_eq!(history.blocks.len(), 3);
         assert!(history.blocks[1].oversized);
-        assert!(history.index[1].len as usize > block_bytes / 4);
+        assert!(history.index[1].len() > block_bytes / 4);
         let mut into = Row::default();
         history.read(1, &mut into);
         assert_eq!(into, dense);
@@ -2154,6 +2204,37 @@ mod tests {
         assert_same_rows(&history, &warm);
         run_and_check(&mut history);
         assert_same_rows(&history, &warm);
+    }
+
+    #[test]
+    fn wraps_and_clear_never_decompress() {
+        let mut rng = ChaCha8Rng::seed_from_u64(0xbee5);
+        let links = cell_links();
+        let mut history = History::<Cell>::with_block_size(1000, 4096);
+        for _ in 0..1000 {
+            let width = rng.gen_range(1..=80);
+            let mut row = cell_row(&mut rng, &links, width);
+            if rng.gen_bool(0.4) {
+                row[Column(width - 1)].flags.insert(crate::term::cell::Flags::WRAPLINE);
+            }
+            history.push_newest(&row);
+        }
+        history.set_compression(Some(10));
+        history.run_jobs();
+        assert!(history.cold_blocks().iter().any(|&cold| cold));
+        history.clear_cache();
+        assert_eq!(history.cached_blocks(), 0);
+
+        let answers: Vec<(bool, bool)> =
+            (0..history.len()).map(|i| (history.wraps(i), history.is_clear(i))).collect();
+        assert_eq!(history.cached_blocks(), 0, "wraps or is_clear decompressed a block");
+        assert!(answers.iter().any(|a| a.0) && answers.iter().any(|a| !a.0));
+        assert!(answers.iter().any(|a| a.1) && answers.iter().any(|a| !a.1));
+
+        for (i, &(wraps, clear)) in answers.iter().enumerate() {
+            let header = read_header(&history.record(history.index[history.len() - 1 - i]));
+            assert_eq!((header.wraps, header.clear), (wraps, clear), "row {i}");
+        }
     }
 
     #[test]
