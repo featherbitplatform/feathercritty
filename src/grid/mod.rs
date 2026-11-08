@@ -22,7 +22,7 @@ mod tests;
 // stores, next to their row codec (see `compact.rs`).
 pub(crate) use self::compact::PlainText;
 pub use self::compact::{HistoryCell, ReflowInfo};
-pub use self::history::{History, RowReader};
+pub use self::history::{Done, History, Job, RowReader};
 pub use self::row::Row;
 use self::storage::Storage;
 
@@ -759,16 +759,20 @@ impl<T: HistoryCell> Grid<T> {
 }
 
 impl Grid<Cell> {
-    /// History line `line` as plain text read straight from its record, without decoding its
-    /// cells (feathercritty: the text fast path; see `compact::plain_text` for which rows
+    /// `f` of history line `line` as plain text read straight from its record, without decoding
+    /// its cells (feathercritty: the text fast path; see `compact::plain_text` for which rows
     /// qualify). `None` for a screen line, a line outside the grid, or a row that does not
     /// qualify; read those through [`RowReader`].
     #[inline]
-    pub(crate) fn history_plain_text(&self, line: Line) -> Option<PlainText<'_>> {
+    pub(crate) fn history_plain_text<R>(
+        &self,
+        line: Line,
+        f: impl FnOnce(PlainText<'_>) -> R,
+    ) -> Option<R> {
         if line.0 >= 0 || line < self.topmost_line() {
             return None;
         }
-        self.history.plain_text((-line.0 - 1) as usize)
+        self.history.plain_text((-line.0 - 1) as usize, f)
     }
 }
 

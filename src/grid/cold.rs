@@ -7,9 +7,6 @@
 //! the zstd frame. Cold bytes are only ever produced by [`compress`], so a bad tag or a length
 //! mismatch is a bug and panics.
 
-// The history uses the codec from the next change on; until then only the tests call it.
-#![allow(dead_code)]
-
 /// Format tag of the only cold layout: zstd level 1 behind a `u32` length.
 const TAG: u8 = 1;
 const HEADER: usize = 1 + 4;

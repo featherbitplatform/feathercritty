@@ -622,8 +622,9 @@ impl<T> Term<T> {
         // feathercritty: text fast path (no upstream counterpart). A history row that is plain
         // text (`Grid::history_plain_text`) is read straight from its record instead of being
         // decoded into cells; `plain_line_to_string` gives the same result as the body below.
-        if let Some(plain) = self.grid.history_plain_text(line) {
-            return self.plain_line_to_string(plain, cols);
+        let plain = |row: PlainText<'_>| self.plain_line_to_string(row, cols.clone());
+        if let Some(text) = self.grid.history_plain_text(line, plain) {
+            return text;
         }
 
         self.cells_line_to_string(reader, line, cols, include_wrapped_wide)
@@ -3724,23 +3725,26 @@ mod tests {
             let (mut plain, mut other) = (0, 0);
             let mut reader = RowReader::new();
             for line in (term.topmost_line().0..0).map(Line) {
-                let Some(row) = term.grid.history_plain_text(line) else {
-                    other += 1;
-                    continue;
-                };
-                plain += 1;
-                for _ in 0..4 {
-                    let start = Column(rng.gen_range(0..columns));
-                    let end = Column(rng.gen_range(start.0..columns));
-                    let wide = rng.r#gen();
-                    let expected = term.cells_line_to_string(&mut reader, line, start..end, wide);
-                    let fast = term.plain_line_to_string(row, start..end);
-                    assert_eq!(
-                        fast, expected,
-                        "{columns} columns, line {}, {start:?}..{end:?}",
-                        line.0
-                    );
-                    assert_eq!(term.line_to_string(&mut reader, line, start..end, wide), expected);
+                let checked = term.grid.history_plain_text(line, |row| {
+                    for _ in 0..4 {
+                        let start = Column(rng.gen_range(0..columns));
+                        let end = Column(rng.gen_range(start.0..columns));
+                        let wide = rng.r#gen();
+                        let expected =
+                            term.cells_line_to_string(&mut reader, line, start..end, wide);
+                        let fast = term.plain_line_to_string(row, start..end);
+                        assert_eq!(
+                            fast, expected,
+                            "{columns} columns, line {}, {start:?}..{end:?}",
+                            line.0
+                        );
+                        let text = term.line_to_string(&mut reader, line, start..end, wide);
+                        assert_eq!(text, expected);
+                    }
+                });
+                match checked {
+                    Some(()) => plain += 1,
+                    None => other += 1,
                 }
             }
             assert!(plain > 10 && other > 10, "{columns} columns: {plain} plain, {other} other");

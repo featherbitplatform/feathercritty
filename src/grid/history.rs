@@ -53,15 +53,17 @@
 //! # Invariants
 //!
 //! - `index.len() <= limit`. Every entry's block is in `blocks`, and its record lies inside the
-//!   block's bytes. A block's `live` is the number of entries pointing into it; the blocks at both
-//!   ends of the deque are never empty (`live > 0`), and an empty one in between has no buffer. A
-//!   normal block never holds more than `block_bytes` bytes, so it never reallocates.
+//!   block's bytes (a cold block's uncompressed bytes). A block's `live` is the number of entries
+//!   pointing into it; the blocks at both ends of the deque are never empty (`live > 0`), and an
+//!   empty one in between has no buffer and is warm. A normal warm block never holds more than
+//!   `block_bytes` bytes, so it never reallocates. The newest block is never cold.
 //! - `first_extra` never decreases from one entry to the next (the extras are in index order).
 //! - Records are never edited in place. Bytes no entry points to any more ("dead" bytes, left by
 //!   `update`) are reclaimed with their block: when its `live` count reaches zero its buffer goes
 //!   to the pool (or is freed) at once, and the emptied block, a placeholder keeping its sequence
 //!   number, leaves the deque when it reaches an end. A released record that is the last one in its
-//!   block gives its bytes back at once (`pop_newest`, `update` of the newest row).
+//!   warm block gives its bytes back at once (`pop_newest`, `update` of the newest row); a cold
+//!   block is never truncated.
 //!
 //! # Eviction and the pool
 //!
@@ -75,6 +77,48 @@
 //! at most the usual spares; dropping the history frees everything. Returning freed memory to
 //! the operating system is the host's decision (design spec 5.9): nothing here calls into the
 //! allocator beyond ordinary allocation and deallocation.
+//!
+//! # Cold blocks (history compression design spec 5.1, 5.2, 5.5)
+//!
+//! With [`History::set_compression`]`(Some(keep_warm))`, blocks whose rows are all old enough are
+//! kept compressed (`cold.rs`): the block's `bytes` hold the compressed form, shrunk to fit, and
+//! `cold` is set. Entries are unchanged; offsets still count in the uncompressed bytes.
+//!
+//! - **Eligibility.** A block should be cold when compression is on, it holds rows, none of them is
+//!   among the `keep_warm` newest (every row has `i >= keep_warm`), and it is not the newest block
+//!   (new records only go there). Each block counts its rows in that warm window (`warm_live`), so
+//!   eligibility is exact even when `update` moved old rows into newer blocks. The counts are kept
+//!   only while compression is on: every path that adds or removes an entry adjusts them behind one
+//!   `Option` check, and switching compression on recounts them.
+//! - **Jobs, never inline.** Blocks change state only through jobs: [`History::next_job`] copies
+//!   the bytes of the oldest block whose state disagrees with its eligibility, [`Job::run`]
+//!   compresses or decompresses the copy with no access to the history, and [`History::install`]
+//!   swaps the result in (a `Vec` swap: it never compresses, decompresses or copies). Setting
+//!   changes only mark blocks. `scan` is the oldest block that may disagree (every older one
+//!   agrees), so [`History::has_jobs`] is one comparison and the search resumes where it stopped.
+//!   Whatever can make a block disagree lowers `scan` to it: a block's warm count reaching zero, a
+//!   cold block's leaving zero, a new block making the previous newest one eligible, and a setting
+//!   change (from the front). A job left uninstalled is offered again.
+//! - **The identity rule.** A job carries its block's sequence number and `generation`, a value
+//!   from a history-wide counter that never repeats (not even across `clear`, which resets
+//!   `front_seq`). A block gets a new generation when it is created, changes state, loses bytes (a
+//!   truncated last record) or becomes the newest block again; bytes are only appended to a block
+//!   while it is the newest, which no job targets. So an unchanged identity means the job's copy is
+//!   still the block's bytes. `install` also requires the same setting and that the block still
+//!   wants the job's state; otherwise it drops the result and returns `false`.
+//! - **Leaving the cold state.** A cold block whose `live` reaches 0 is freed, never kept as a
+//!   spare. A cold block that becomes the newest again (popping rows past the warm window) is
+//!   decompressed at once. `update` of a cold row decodes it through the cache and re-encodes it
+//!   into the newest block; its old bytes stay as dead bytes in the cold block.
+//! - **Read cache.** Every read ends at `record`, which for a cold block takes the bytes from a
+//!   cache of at most [`CACHE_BLOCKS`] decompressed blocks keyed by identity, least recently used
+//!   first, in a `RefCell` (reads take `&self`; `History` stays `Send`, not `Sync`). A cached block
+//!   is an `Arc<Vec<u8>>`, so a read holds its record without holding the `RefCell` borrow, and an
+//!   evicted buffer is reused when no read still holds it. The cache is cleared by `clear`, a lower
+//!   `set_limit` and switching compression off; an install that warms a cached block, and freeing a
+//!   cold block, drop its entry.
+//! - **Off means off.** With `None` (the default) and no cold block left, no job exists, `has_jobs`
+//!   is false and the paths above cost one `Option` or `cold` check each.
 //!
 //! # Why the records hold no pointers
 //!
@@ -99,11 +143,14 @@
 //! code that grows or shrinks the history (its `increase_scroll_limit`, `decrease_scroll_limit`,
 //! `raw.shrink_lines`) maps to `push_newest`, `remove_oldest` and `set_limit`.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::ops::{Deref, Range};
+use std::sync::Arc;
 use std::{fmt, mem};
 
 use crate::grid::compact::{self, PlainText, RowHeader, read_header};
-use crate::grid::{Dimensions, Grid, HistoryCell, ReflowInfo, Row};
+use crate::grid::{Dimensions, Grid, HistoryCell, ReflowInfo, Row, cold};
 use crate::index::{Column, Line};
 use crate::term::cell::Cell;
 
@@ -117,15 +164,139 @@ pub(crate) const MAX_SPARES: usize = 2;
 /// up to the limit).
 const MIN_INDEX_CAPACITY: usize = 64;
 
+/// Most decompressed cold blocks a history keeps for reads (design spec 5.5).
+pub(crate) const CACHE_BLOCKS: usize = 4;
+
 /// A byte block holding records back to back.
 struct Block {
+    /// The records (warm), or their compressed form shrunk to fit (cold, see `cold.rs`).
     bytes: Vec<u8>,
 
     /// Index entries pointing into this block.
     live: u32,
 
+    /// Index entries pointing into this block whose rows are among the `keep_warm` newest. Kept
+    /// only while compression is on (`set_compression` recounts it when switched on).
+    warm_live: u32,
+
+    /// Identity, with the sequence number, for jobs: a fresh value from the history's counter
+    /// whenever the block is created, changes state, loses bytes or becomes the newest block
+    /// again.
+    generation: u64,
+
     /// Holds a single record larger than a quarter block, in an allocation of exactly its size.
     oversized: bool,
+
+    /// `bytes` is the compressed form of the records.
+    cold: bool,
+}
+
+/// A decompressed cold block, in [`History`]'s read cache.
+struct Cached {
+    seq: u32,
+    generation: u64,
+    bytes: Arc<Vec<u8>>,
+}
+
+/// Decompressed cold blocks for reads, least recently used first, at most [`CACHE_BLOCKS`].
+#[derive(Default)]
+struct Cache {
+    entries: Vec<Cached>,
+}
+
+impl Cache {
+    /// Forget the block `seq` (it was warmed or freed).
+    fn remove(&mut self, seq: u32) {
+        self.entries.retain(|cached| cached.seq != seq);
+    }
+}
+
+/// The bytes of one record: borrowed from a warm block, or held in a decompressed cold block
+/// (which a read can keep while the cache moves on).
+enum Record<'a> {
+    Warm(&'a [u8]),
+    Cold(Arc<Vec<u8>>, Range<usize>),
+}
+
+impl Deref for Record<'_> {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &[u8] {
+        match self {
+            Record::Warm(bytes) => bytes,
+            Record::Cold(block, range) => &block[range.clone()],
+        }
+    }
+}
+
+/// A block that needs to change state (go cold, or come back warm), with a copy of its bytes:
+/// from [`History::next_job`], run anywhere with [`Job::run`], installed with
+/// [`History::install`].
+pub struct Job {
+    seq: u32,
+    generation: u64,
+    compression: Option<usize>,
+    to_cold: bool,
+    bytes: Vec<u8>,
+
+    /// Capacity of the warm block a warming job makes.
+    capacity: usize,
+}
+
+/// The result of a [`Job`], for [`History::install`].
+pub struct Done {
+    seq: u32,
+    generation: u64,
+    compression: Option<usize>,
+    to_cold: bool,
+    bytes: Vec<u8>,
+}
+
+impl Job {
+    /// Compress or decompress the copied block. Needs no access to the history, so it can run
+    /// outside the terminal's lock.
+    pub fn run(self) -> Done {
+        let bytes = if self.to_cold {
+            let mut cold = Vec::new();
+            cold::compress(&self.bytes, &mut cold);
+            cold.shrink_to_fit();
+            cold
+        } else {
+            let mut warm = Vec::with_capacity(self.capacity);
+            cold::decompress(&self.bytes, &mut warm);
+            warm
+        };
+        Done {
+            seq: self.seq,
+            generation: self.generation,
+            compression: self.compression,
+            to_cold: self.to_cold,
+            bytes,
+        }
+    }
+}
+
+impl fmt::Debug for Job {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Job")
+            .field("seq", &self.seq)
+            .field("generation", &self.generation)
+            .field("to_cold", &self.to_cold)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
+}
+
+impl fmt::Debug for Done {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Done")
+            .field("seq", &self.seq)
+            .field("generation", &self.generation)
+            .field("to_cold", &self.to_cold)
+            .field("bytes", &self.bytes.len())
+            .finish()
+    }
 }
 
 /// Where one history row is stored.
@@ -172,6 +343,19 @@ pub struct History<T: HistoryCell> {
 
     /// Reused row `update` decodes into.
     updated: Row<T>,
+
+    /// Rows kept warm (see "Cold blocks" in the module docs); `None` never compresses.
+    compression: Option<usize>,
+
+    /// The last block generation handed out.
+    generation: u64,
+
+    /// Sequence number of the oldest block that may disagree with its eligibility; every older
+    /// block agrees. `None` when every block agrees (`has_jobs` is false).
+    scan: Option<u32>,
+
+    /// Decompressed cold blocks for reads.
+    cache: RefCell<Cache>,
 }
 
 impl<T: HistoryCell> History<T> {
@@ -199,6 +383,10 @@ impl<T: HistoryCell> History<T> {
             limit,
             encoded: Vec::new(),
             updated: Row::default(),
+            compression: None,
+            generation: 0,
+            scan: None,
+            cache: RefCell::default(),
         }
     }
 
@@ -235,6 +423,202 @@ impl<T: HistoryCell> History<T> {
         if lower {
             self.index.shrink_to(limit);
             self.extras.shrink_to_fit();
+            self.cache.get_mut().entries.clear();
+        }
+    }
+
+    /// Keep the `keep_warm` newest rows uncompressed and compress the blocks older than that;
+    /// `None` never compresses (and warms the cold blocks there are). It only marks blocks for
+    /// jobs ([`History::next_job`]): nothing is compressed or decompressed here.
+    pub fn set_compression(&mut self, keep_warm: Option<usize>) {
+        if keep_warm == self.compression {
+            return;
+        }
+
+        self.compression = keep_warm;
+        match keep_warm {
+            Some(keep) => {
+                // Recount the warm rows of every block (not kept while compression was off).
+                self.blocks.iter_mut().for_each(|block| block.warm_live = 0);
+                for entry in self.index.iter().rev().take(keep) {
+                    self.blocks[entry.block.wrapping_sub(self.front_seq) as usize].warm_live += 1;
+                }
+            },
+            None => self.cache.get_mut().entries.clear(),
+        }
+        self.scan = (!self.blocks.is_empty()).then_some(self.front_seq);
+    }
+
+    /// Rows kept warm, `None` when compression is off (see [`History::set_compression`]).
+    #[inline]
+    pub fn compression(&self) -> Option<usize> {
+        self.compression
+    }
+
+    /// Whether [`History::next_job`] may have a job. False means every block is in the state
+    /// the setting asks for. O(1), so a host can check after every batch of output.
+    #[inline]
+    pub fn has_jobs(&self) -> bool {
+        self.scan.is_some()
+    }
+
+    /// The next block that needs to change state, with a copy of its bytes, or `None` when every
+    /// block is in the state the setting asks for. Taking a job changes nothing: until it is
+    /// installed, the next call offers the same block again.
+    pub fn next_job(&mut self) -> Option<Job> {
+        let start = self.position_of(self.scan?);
+        let Some(at) = (start..self.blocks.len()).find(|&at| self.disagrees(at)) else {
+            self.scan = None;
+            return None;
+        };
+
+        let seq = self.front_seq.wrapping_add(at as u32);
+        self.scan = Some(seq);
+        let block = &self.blocks[at];
+        let capacity = match block {
+            Block { cold: true, oversized: true, bytes, .. } => cold::uncompressed_len(bytes),
+            _ => self.block_bytes,
+        };
+        Some(Job {
+            seq,
+            generation: block.generation,
+            compression: self.compression,
+            to_cold: !block.cold,
+            bytes: block.bytes.clone(),
+            capacity,
+        })
+    }
+
+    /// Swap the result of a job in, if its block still exists with the same identity, the
+    /// setting is the one the job was taken under and the block still wants that state. Returns
+    /// whether it did; otherwise the result is dropped (the block was evicted, cleared, changed or
+    /// the setting changed meanwhile). Never compresses, decompresses or copies a block.
+    pub fn install(&mut self, done: Done) -> bool {
+        let at = done.seq.wrapping_sub(self.front_seq) as usize;
+        let current = self.blocks.get(at).is_some_and(|block| {
+            block.live > 0 && block.generation == done.generation && block.cold != done.to_cold
+        });
+        if !current || done.compression != self.compression || self.wants_cold(at) != done.to_cold {
+            return false;
+        }
+
+        let generation = self.next_generation();
+        let block = &mut self.blocks[at];
+        let old = mem::replace(&mut block.bytes, done.bytes);
+        block.cold = done.to_cold;
+        block.generation = generation;
+        if done.to_cold {
+            // The warm buffer goes to the pool like an evicted block's.
+            if !block.oversized {
+                self.recycle(old);
+            }
+        } else {
+            self.cache.get_mut().remove(done.seq);
+        }
+        true
+    }
+
+    /// Run and install every job now (tests, and hosts that want no background work).
+    pub fn run_jobs(&mut self) {
+        while let Some(job) = self.next_job() {
+            let installed = self.install(job.run());
+            debug_assert!(installed, "an inline job was refused");
+        }
+    }
+
+    /// Whether each block, oldest first, is cold (test hook, not a stable API).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn cold_blocks(&self) -> Vec<bool> {
+        self.blocks.iter().map(|block| block.cold).collect()
+    }
+
+    /// Decompressed blocks in the read cache (test hook, not a stable API).
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn cached_blocks(&self) -> usize {
+        self.cache.borrow().entries.len()
+    }
+
+    /// Whether the block at `at` in `blocks` should be cold: compression is on, it holds rows,
+    /// none of them is among the `keep_warm` newest, and it is not the newest block.
+    #[inline]
+    fn wants_cold(&self, at: usize) -> bool {
+        let block = &self.blocks[at];
+        self.compression.is_some()
+            && block.live > 0
+            && block.warm_live == 0
+            && at + 1 < self.blocks.len()
+    }
+
+    /// Whether the block at `at` holds rows and is not in the state it should be in.
+    #[inline]
+    fn disagrees(&self, at: usize) -> bool {
+        self.blocks[at].live > 0 && self.blocks[at].cold != self.wants_cold(at)
+    }
+
+    /// Position in `blocks` of the block `seq`, 0 for one already gone from the front.
+    #[inline]
+    fn position_of(&self, seq: u32) -> usize {
+        let at = seq.wrapping_sub(self.front_seq);
+        if (at as i32) < 0 { 0 } else { at as usize }
+    }
+
+    /// Note that the block `seq` may now disagree with its eligibility.
+    fn mark(&mut self, seq: u32) {
+        match self.scan {
+            Some(scan) if self.position_of(scan) <= self.position_of(seq) => {},
+            _ => self.scan = Some(seq),
+        }
+    }
+
+    /// A fresh block generation.
+    #[inline]
+    fn next_generation(&mut self) -> u64 {
+        self.generation += 1;
+        self.generation
+    }
+
+    /// One more row of the block `seq` is among the warm rows.
+    fn warm_enter(&mut self, seq: u32) {
+        let block = &mut self.blocks[seq.wrapping_sub(self.front_seq) as usize];
+        block.warm_live += 1;
+        if block.warm_live == 1 && block.cold {
+            self.mark(seq);
+        }
+    }
+
+    /// One row of the block `seq` left the warm rows.
+    fn warm_leave(&mut self, seq: u32) {
+        let at = seq.wrapping_sub(self.front_seq) as usize;
+        let block = &mut self.blocks[at];
+        block.warm_live -= 1;
+        if block.warm_live == 0 && !block.cold && at + 1 < self.blocks.len() {
+            self.mark(seq);
+        }
+    }
+
+    /// Account for the row just pushed as the newest: it is warm, and the row now `keep` rows
+    /// from the newest left the warm rows.
+    fn pushed(&mut self, keep: usize) {
+        let len = self.index.len();
+        if keep == 0 {
+            return;
+        }
+        self.warm_enter(self.index[len - 1].block);
+        if len > keep {
+            self.warm_leave(self.index[len - 1 - keep].block);
+        }
+    }
+
+    /// Account for the newest row `entry`, just removed from the index (still in its block):
+    /// it leaves the warm rows, and the row `keep - 1` rows from the newest comes back in.
+    fn popped(&mut self, keep: usize, entry: Entry) {
+        let len = self.index.len();
+        if keep == 0 {
+            return;
+        }
+        self.warm_leave(entry.block);
+        if len >= keep {
+            self.warm_enter(self.index[len - keep].block);
         }
     }
 
@@ -261,6 +645,9 @@ impl<T: HistoryCell> History<T> {
         };
         self.reserve_index();
         self.index.push_back(entry);
+        if let Some(keep) = self.compression {
+            self.pushed(keep);
+        }
     }
 
     /// Encode `row` straight into the newest block when that block surely has room for it
@@ -311,6 +698,9 @@ impl<T: HistoryCell> History<T> {
         };
 
         self.decode(entry, self.extras_end(), into);
+        if let Some(keep) = self.compression {
+            self.popped(keep, entry);
+        }
         self.release(entry);
         self.extras.truncate(entry.first_extra.wrapping_sub(self.extras_base) as usize);
         true
@@ -330,9 +720,22 @@ impl<T: HistoryCell> History<T> {
 
     /// Remove the `count` oldest rows (all of them if there are fewer) without decoding them.
     pub(crate) fn remove_oldest(&mut self, count: usize) {
-        for _ in 0..count.min(self.index.len()) {
-            if let Some(entry) = self.index.pop_front() {
-                self.release(entry);
+        let count = count.min(self.index.len());
+        if let Some(keep) = self.compression {
+            for _ in 0..count {
+                if let Some(entry) = self.index.pop_front() {
+                    // It was warm when every row was.
+                    if self.index.len() < keep {
+                        self.warm_leave(entry.block);
+                    }
+                    self.release(entry);
+                }
+            }
+        } else {
+            for _ in 0..count {
+                if let Some(entry) = self.index.pop_front() {
+                    self.release(entry);
+                }
             }
         }
 
@@ -372,7 +775,7 @@ impl<T: HistoryCell> History<T> {
                 let entry = self.index[pos];
                 let bytes = self.record(entry);
                 self.with_extras(entry, self.extras_after(pos), |extras| {
-                    T::decode_cell(bytes, extras, column.0)
+                    T::decode_cell(&bytes, extras, column.0)
                 })
             },
             None => T::default(),
@@ -397,6 +800,10 @@ impl<T: HistoryCell> History<T> {
         let mut row = mem::take(&mut self.updated);
         self.decode(entry, old_end, &mut row);
         f(&mut row);
+        let warm = self.compression.is_some_and(|keep| self.index.len() - pos <= keep);
+        if warm {
+            self.warm_leave(entry.block);
+        }
         self.release(entry);
 
         let start = entry.first_extra.wrapping_sub(self.extras_base) as usize;
@@ -431,19 +838,23 @@ impl<T: HistoryCell> History<T> {
             }
         }
 
-        self.index[pos] = self.store(entry.first_extra);
+        let new = self.store(entry.first_extra);
+        self.index[pos] = new;
+        if warm {
+            self.warm_enter(new.block);
+        }
         self.updated = row;
     }
 
     /// [`HistoryCell::reflow_info`] of the oldest row, `None` when the history is empty or the
     /// format has no reflow fast path.
     pub(crate) fn oldest_reflow_info(&self) -> Option<ReflowInfo> {
-        self.index.front().and_then(|&entry| T::reflow_info(self.record(entry)))
+        self.index.front().and_then(|&entry| T::reflow_info(&self.record(entry)))
     }
 
     /// The header of the newest row, `None` when the history is empty.
     pub(crate) fn newest_header(&self) -> Option<RowHeader> {
-        self.index.back().map(|&entry| read_header(self.record(entry)))
+        self.index.back().map(|&entry| read_header(&self.record(entry)))
     }
 
     /// Move the oldest row to `to` as its newest row without decoding it: its record is copied
@@ -457,7 +868,10 @@ impl<T: HistoryCell> History<T> {
         };
 
         to.encoded.clear();
-        compact::copy_with_width(self.record(entry), width, &mut to.encoded);
+        compact::copy_with_width(&self.record(entry), width, &mut to.encoded);
+        if self.compression.is_some_and(|keep| self.index.len() < keep) {
+            self.warm_leave(entry.block);
+        }
         self.release(entry);
 
         // The oldest row's extras are at the front of the queue (`remove_oldest` drains the ones
@@ -484,6 +898,9 @@ impl<T: HistoryCell> History<T> {
         let entry = self.store(first_extra);
         self.reserve_index();
         self.index.push_back(entry);
+        if let Some(keep) = self.compression {
+            self.pushed(keep);
+        }
     }
 
     /// Remove the newest row without decoding it (a reflow dropping rows it truncates). Returns
@@ -493,6 +910,9 @@ impl<T: HistoryCell> History<T> {
             return false;
         };
 
+        if let Some(keep) = self.compression {
+            self.popped(keep, entry);
+        }
         self.release(entry);
         self.extras.truncate(entry.first_extra.wrapping_sub(self.extras_base) as usize);
         true
@@ -522,13 +942,13 @@ impl<T: HistoryCell> History<T> {
     /// Whether row `i` (0 is the newest) continues on the next line (the record header's
     /// `WRAPS` bit); "no row" past the end does not.
     pub fn wraps(&self, i: usize) -> bool {
-        self.position(i).is_some_and(|pos| read_header(self.record(self.index[pos])).wraps)
+        self.position(i).is_some_and(|pos| read_header(&self.record(self.index[pos])).wraps)
     }
 
     /// Whether every cell of row `i` (0 is the newest) is empty (the record header's `CLEAR`
     /// bit); "no row" past the end is.
     pub fn is_clear(&self, i: usize) -> bool {
-        self.position(i).is_none_or(|pos| read_header(self.record(self.index[pos])).clear)
+        self.position(i).is_none_or(|pos| read_header(&self.record(self.index[pos])).clear)
     }
 
     /// Blocks that still hold a buffer (tests: the old store's blocks are freed while a reflow
@@ -538,16 +958,21 @@ impl<T: HistoryCell> History<T> {
         self.blocks.iter().filter(|block| block.bytes.capacity() > 0).count()
     }
 
-    /// Remove every row; the limit stays. Frees the index, the extras and every block but at
-    /// most `MAX_SPARES` spares.
+    /// Remove every row; the limit and the compression setting stay. Frees the index, the
+    /// extras, the read cache and every block but at most `MAX_SPARES` spares (never a cold one).
     pub fn clear(&mut self) {
         self.index = VecDeque::new();
         self.extras = VecDeque::new();
         self.extras_base = 0;
         for block in mem::take(&mut self.blocks) {
-            self.recycle(block.bytes);
+            if !block.cold {
+                self.recycle(block.bytes);
+            }
         }
         self.front_seq = 0;
+        self.next_generation();
+        self.scan = None;
+        self.cache.get_mut().entries = Vec::new();
     }
 
     /// Position of row `i` (0 is the newest) in `index`, `None` past the end ("no row"; a
@@ -571,11 +996,50 @@ impl<T: HistoryCell> History<T> {
         self.index.get(pos + 1).map_or_else(|| self.extras_end(), |next| next.first_extra)
     }
 
-    /// The record `entry` points to.
+    /// The record `entry` points to, read through the cache when its block is cold.
     #[inline]
-    fn record(&self, entry: Entry) -> &[u8] {
+    fn record(&self, entry: Entry) -> Record<'_> {
         let block = &self.blocks[entry.block.wrapping_sub(self.front_seq) as usize];
-        &block.bytes[entry.offset as usize..][..entry.len as usize]
+        let range = entry.offset as usize..entry.offset as usize + entry.len as usize;
+        if block.cold {
+            Record::Cold(self.decompressed(entry.block, block), range)
+        } else {
+            Record::Warm(&block.bytes[range])
+        }
+    }
+
+    /// The decompressed bytes of the cold block `seq`, from the cache, or decompressed into it
+    /// (evicting the least recently used block, whose buffer is reused when no read holds it).
+    #[cold]
+    #[inline(never)]
+    fn decompressed(&self, seq: u32, block: &Block) -> Arc<Vec<u8>> {
+        let mut cache = self.cache.borrow_mut();
+        let entries = &mut cache.entries;
+        let hit = entries
+            .iter()
+            .position(|cached| cached.seq == seq && cached.generation == block.generation);
+        if let Some(at) = hit {
+            let cached = entries.remove(at);
+            let bytes = Arc::clone(&cached.bytes);
+            entries.push(cached);
+            return bytes;
+        }
+
+        if entries.capacity() == 0 {
+            entries.reserve_exact(CACHE_BLOCKS);
+        }
+        let mut bytes =
+            if entries.len() >= CACHE_BLOCKS { entries.remove(0).bytes } else { Arc::default() };
+        match Arc::get_mut(&mut bytes) {
+            Some(buffer) => cold::decompress(&block.bytes, buffer),
+            None => {
+                let mut buffer = Vec::new();
+                cold::decompress(&block.bytes, &mut buffer);
+                bytes = Arc::new(buffer);
+            },
+        }
+        entries.push(Cached { seq, generation: block.generation, bytes: Arc::clone(&bytes) });
+        bytes
     }
 
     /// Call `f` with the extras of the row `entry` points to, which end at position `end`, as
@@ -602,7 +1066,7 @@ impl<T: HistoryCell> History<T> {
     /// Decode the row `entry` points to, whose extras end at position `extras_end`, into `into`.
     fn decode(&self, entry: Entry, extras_end: u32, into: &mut Row<T>) {
         let bytes = self.record(entry);
-        let used = self.with_extras(entry, extras_end, |extras| T::decode(bytes, extras, into));
+        let used = self.with_extras(entry, extras_end, |extras| T::decode(&bytes, extras, into));
         // A wrong offset or length must not decode silently.
         debug_assert_eq!(used, entry.len as usize, "history record length disagrees with index");
     }
@@ -614,16 +1078,18 @@ impl<T: HistoryCell> History<T> {
         let len = self.encoded.len();
         let oversized = len > self.block_bytes / 4;
         let fits = |block: &Block| !block.oversized && block.bytes.len() + len <= self.block_bytes;
-        if oversized {
-            let bytes = Vec::with_capacity(len);
-            self.blocks.push_back(Block { bytes, live: 0, oversized: true });
-        } else if !self.blocks.back().is_some_and(fits) {
-            let bytes = self.spares.pop().unwrap_or_else(|| Vec::with_capacity(self.block_bytes));
-            self.blocks.push_back(Block { bytes, live: 0, oversized: false });
+        if oversized || !self.blocks.back().is_some_and(fits) {
+            let bytes = if oversized {
+                Vec::with_capacity(len)
+            } else {
+                self.spares.pop().unwrap_or_else(|| Vec::with_capacity(self.block_bytes))
+            };
+            self.push_block(bytes, oversized);
         }
 
         let block_seq = self.front_seq.wrapping_add(self.blocks.len() as u32 - 1);
         let block = self.blocks.back_mut().expect("a block was just ensured");
+        debug_assert!(!block.cold, "the newest block is cold");
         let offset = block.bytes.len();
         block.bytes.extend_from_slice(&self.encoded);
         block.live += 1;
@@ -632,29 +1098,77 @@ impl<T: HistoryCell> History<T> {
         Entry { block: block_seq, offset: offset as u32, len: len as u32, first_extra }
     }
 
+    /// Append a new, empty block with buffer `bytes` as the newest block. The block that was
+    /// newest may now be eligible to go cold.
+    fn push_block(&mut self, bytes: Vec<u8>, oversized: bool) {
+        if self.compression.is_some() && self.blocks.back().is_some_and(|back| back.warm_live == 0)
+        {
+            self.mark(self.front_seq.wrapping_add(self.blocks.len() as u32 - 1));
+        }
+        let generation = self.next_generation();
+        let block = Block { bytes, live: 0, warm_live: 0, generation, oversized, cold: false };
+        self.blocks.push_back(block);
+    }
+
     /// Account for `entry` no longer pointing into its block: give its bytes back when they are
-    /// the block's last ones, recycle the block's buffer when no entry points into it any more,
-    /// and remove the emptied blocks at either end of the deque.
+    /// the last ones of a warm block, recycle the block's buffer (free it, when cold) when no
+    /// entry points into it any more, and remove the emptied blocks at either end of the deque.
+    /// A block that becomes the newest again gets a new generation, and is warmed now if cold.
     fn release(&mut self, entry: Entry) {
+        let generation = self.generation + 1;
         let block = &mut self.blocks[entry.block.wrapping_sub(self.front_seq) as usize];
         block.live -= 1;
-        if entry.offset as usize + entry.len as usize == block.bytes.len() {
+        if !block.cold && entry.offset as usize + entry.len as usize == block.bytes.len() {
             block.bytes.truncate(entry.offset as usize);
+            // A job may hold a copy of the longer bytes.
+            block.generation = generation;
+            self.generation = generation;
         }
         if block.live == 0 {
             // A block in the middle of the deque stays as an empty placeholder (its sequence
             // number must stay taken) until it reaches an end, but its buffer is reused now.
             let bytes = mem::take(&mut block.bytes);
-            self.recycle(bytes);
+            if mem::take(&mut block.cold) {
+                self.cache.get_mut().remove(entry.block);
+            } else {
+                self.recycle(bytes);
+            }
         }
 
         while self.blocks.front().is_some_and(|block| block.live == 0) {
             self.blocks.pop_front();
             self.front_seq = self.front_seq.wrapping_add(1);
         }
-        while self.blocks.back().is_some_and(|block| block.live == 0) {
-            self.blocks.pop_back();
+        if self.blocks.back().is_some_and(|block| block.live == 0) {
+            while self.blocks.back().is_some_and(|block| block.live == 0) {
+                self.blocks.pop_back();
+            }
+            self.newest_again();
         }
+    }
+
+    /// The newest block was removed: the block now newest will take records again, so its
+    /// copies in jobs go stale, and it must be warm (rare: popping rows past the warm window).
+    fn newest_again(&mut self) {
+        let generation = self.next_generation();
+        let block_bytes = self.block_bytes;
+        let seq = self.front_seq.wrapping_add(self.blocks.len() as u32).wrapping_sub(1);
+        let Some(block) = self.blocks.back_mut() else {
+            return;
+        };
+        block.generation = generation;
+        if !block.cold {
+            return;
+        }
+
+        let mut warm = match block.oversized {
+            true => Vec::with_capacity(cold::uncompressed_len(&block.bytes)),
+            false => self.spares.pop().unwrap_or_else(|| Vec::with_capacity(block_bytes)),
+        };
+        cold::decompress(&block.bytes, &mut warm);
+        block.bytes = warm;
+        block.cold = false;
+        self.cache.get_mut().remove(seq);
     }
 
     /// Keep a block buffer no entry points into as a spare if it has a normal block's capacity
@@ -674,19 +1188,21 @@ impl<T: HistoryCell> History<T> {
 
 #[cfg(feature = "test-hooks")]
 impl<T: HistoryCell> History<T> {
-    /// The bytes of every block, oldest first, partly filled ones included (test hook, not a
-    /// stable API: it exists so tests can measure compressors on real block contents).
+    /// The bytes of every block, oldest first, partly filled ones included, as stored (cold
+    /// blocks compressed) (test hook, not a stable API: it exists so tests can measure
+    /// compressors on real block contents).
     pub fn block_bytes_for_test(&self) -> Vec<&[u8]> {
         self.blocks.iter().map(|block| block.bytes.as_slice()).collect()
     }
 }
 
 impl History<Cell> {
-    /// Row `i` (0 is the newest) as plain text read straight from its record, when it
-    /// qualifies (see `compact::plain_text`); `None` when it does not or is not there.
-    pub(crate) fn plain_text(&self, i: usize) -> Option<PlainText<'_>> {
+    /// `f` of row `i` (0 is the newest) as plain text read straight from its record, when it
+    /// qualifies (see `compact::plain_text`); `None` when it does not or is not there. A callback,
+    /// because a cold row's record lives in the read cache only while it is read.
+    pub(crate) fn plain_text<R>(&self, i: usize, f: impl FnOnce(PlainText<'_>) -> R) -> Option<R> {
         let pos = self.position(i)?;
-        compact::plain_text(self.record(self.index[pos]))
+        compact::plain_text(&self.record(self.index[pos])).map(f)
     }
 }
 
@@ -700,12 +1216,14 @@ impl<T: HistoryCell> Clone for History<T> {
             .map(|block| {
                 let capacity = match block {
                     Block { live: 0, .. } => 0,
-                    Block { oversized: true, bytes, .. } => bytes.len(),
-                    Block { oversized: false, .. } => self.block_bytes,
+                    Block { cold: true, bytes, .. } | Block { oversized: true, bytes, .. } => {
+                        bytes.len()
+                    },
+                    Block { .. } => self.block_bytes,
                 };
                 let mut bytes = Vec::with_capacity(capacity);
                 bytes.extend_from_slice(&block.bytes);
-                Block { bytes, live: block.live, oversized: block.oversized }
+                Block { bytes, ..*block }
             })
             .collect();
 
@@ -720,6 +1238,10 @@ impl<T: HistoryCell> Clone for History<T> {
             limit: self.limit,
             encoded: Vec::new(),
             updated: Row::default(),
+            compression: self.compression,
+            generation: self.generation,
+            scan: self.scan,
+            cache: RefCell::default(),
         }
     }
 }
@@ -735,6 +1257,8 @@ impl<T: HistoryCell> fmt::Debug for History<T> {
             .field("spares", &self.spares.len())
             .field("extras", &self.extras.len())
             .field("block_bytes", &self.block_bytes)
+            .field("compression", &self.compression)
+            .field("cold", &self.blocks.iter().filter(|block| block.cold).count())
             .finish()
     }
 }
@@ -972,17 +1496,32 @@ mod tests {
         }
 
         let mut live = vec![0; history.blocks.len()];
-        for entry in &history.index {
+        let mut warm_live = vec![0; history.blocks.len()];
+        for (pos, entry) in history.index.iter().enumerate() {
             let at = entry.block.wrapping_sub(history.front_seq) as usize;
             let block = &history.blocks[at];
             let end = entry.offset as usize + entry.len as usize;
-            assert!(end <= block.bytes.len(), "a record reaches past its block");
+            let len = match block.cold {
+                true => cold::uncompressed_len(&block.bytes),
+                false => block.bytes.len(),
+            };
+            assert!(end <= len, "a record reaches past its block");
             live[at] += 1;
+            if history.compression.is_some_and(|keep| history.index.len() - pos <= keep) {
+                warm_live[at] += 1;
+            }
         }
-        for (block, live) in history.blocks.iter().zip(live) {
+        for (at, (block, live)) in history.blocks.iter().zip(live).enumerate() {
             assert_eq!(block.live as usize, live, "live count");
+            if history.compression.is_some() {
+                assert_eq!(block.warm_live, warm_live[at], "warm count of block {at}");
+            }
             if live == 0 {
                 assert_eq!(block.bytes.capacity(), 0, "an empty block kept its buffer");
+                assert!(!block.cold, "an empty block is cold");
+            } else if block.cold {
+                assert!(at + 1 < history.blocks.len(), "the newest block is cold");
+                assert_eq!(block.bytes.len(), block.bytes.capacity(), "cold bytes not shrunk");
             } else if block.oversized {
                 assert_eq!(block.bytes.len(), block.bytes.capacity());
                 assert!(block.bytes.len() > history.block_bytes / 4);
@@ -1276,14 +1815,55 @@ mod tests {
         matches_dense_model_with(4096, 160);
     }
 
+    /// The same with compression switched on, off and changed at random, and jobs taken, run,
+    /// installed, dropped or installed late at random points: rows still read as the model's,
+    /// and once every job is run each block's state agrees with its eligibility.
+    #[test]
+    fn matches_dense_model_compressed() {
+        matches_dense_model_compressed_with(TINY, 12);
+        matches_dense_model_compressed_with(4096, 160);
+    }
+
     fn matches_dense_model_with(block_bytes: usize, max_width: usize) {
+        dense_model(block_bytes, max_width, false);
+    }
+
+    fn matches_dense_model_compressed_with(block_bytes: usize, max_width: usize) {
+        dense_model(block_bytes, max_width, true);
+    }
+
+    fn dense_model(block_bytes: usize, max_width: usize, compress: bool) {
         let mut rng = ChaCha8Rng::seed_from_u64(0x5704e);
         let links = cell_links();
         let mut history = History::<Cell>::with_block_size(60, block_bytes);
         let mut model: VecDeque<Row<Cell>> = VecDeque::new();
         let mut into = Row::default();
+        let mut held: Option<Done> = None;
         for step in 0..20_000 {
             let width = rng.gen_range(1..=max_width);
+            if compress {
+                match rng.gen_range(0..100) {
+                    0..=1 => {
+                        let keep = [None, Some(0), Some(1), Some(5), Some(37)];
+                        history.set_compression(keep[rng.gen_range(0..keep.len())]);
+                    },
+                    // Take a job and keep its result for later (installed after whatever the
+                    // next steps do, or dropped).
+                    2..=9 => held = history.next_job().map(Job::run),
+                    10..=17 => {
+                        if let Some(done) = held.take() {
+                            history.install(done);
+                        }
+                    },
+                    18..=29 => {
+                        if let Some(job) = history.next_job() {
+                            assert!(history.install(job.run()), "step {step}: a fresh job");
+                        }
+                    },
+                    30 => run_and_check(&mut history),
+                    _ => {},
+                }
+            }
             match rng.gen_range(0..100) {
                 0..=69 => {
                     let row = cell_row(&mut rng, &links, width);
@@ -1432,5 +2012,342 @@ mod tests {
         }
         assert_eq!(read(&copy, 0), wide(2, 199));
         assert_eq!(read(&history, 0), wide(2, 49));
+    }
+
+    // Cold block tests (design spec 5.1, 5.5): tiny blocks, so a few hundred rows make dozens of
+    // blocks, and small warm windows.
+
+    /// A `usize` row of 1 to 20 cells with varied values (some of them zero, so some rows are
+    /// clear; rows over 64 bytes are oversized).
+    fn varied_row(rng: &mut ChaCha8Rng) -> Row<usize> {
+        let mut row = Row::new(rng.gen_range(1..=20));
+        if rng.gen_bool(0.9) {
+            row[..].iter_mut().for_each(|cell| *cell = rng.gen_range(0..3000));
+        }
+        row
+    }
+
+    /// A history of `rows` varied rows on tiny blocks, with room for 5,000.
+    fn varied(rows: usize) -> History<usize> {
+        let mut rng = ChaCha8Rng::seed_from_u64(0xc01d);
+        let mut history = History::with_block_size(5000, TINY);
+        for _ in 0..rows {
+            history.push_newest(&varied_row(&mut rng));
+        }
+        history
+    }
+
+    /// Every read of `history` equals the same read of `warm`.
+    fn assert_same_rows<T: HistoryCell + fmt::Debug>(history: &History<T>, warm: &History<T>) {
+        assert_eq!(history.len(), warm.len());
+        let (mut a, mut b) = (Row::default(), Row::default());
+        for i in 0..warm.len() {
+            history.read(i, &mut a);
+            warm.read(i, &mut b);
+            assert_eq!(a, b, "row {i}");
+            for col in 0..b.len() {
+                assert_eq!(history.cell(i, Column(col)), b[Column(col)], "row {i} cell {col}");
+            }
+            assert_eq!(history.wraps(i), warm.wraps(i), "row {i} wraps");
+            assert_eq!(history.is_clear(i), warm.is_clear(i), "row {i} clear");
+        }
+    }
+
+    /// Which blocks should be cold with `keep` warm rows: those holding rows, other than the
+    /// newest block, none of whose rows is among the `keep` newest.
+    fn eligible<T: HistoryCell>(history: &History<T>, keep: usize) -> Vec<bool> {
+        let mut eligible: Vec<bool> = history.blocks.iter().map(|block| block.live > 0).collect();
+        if let Some(newest) = eligible.last_mut() {
+            *newest = false;
+        }
+        for entry in history.index.iter().rev().take(keep) {
+            eligible[entry.block.wrapping_sub(history.front_seq) as usize] = false;
+        }
+        eligible
+    }
+
+    /// Run every job and check each block's state against eligibility.
+    fn run_and_check<T: HistoryCell>(history: &mut History<T>) {
+        history.run_jobs();
+        assert!(!history.has_jobs());
+        let expected = match history.compression() {
+            Some(keep) => eligible(history, keep),
+            None => vec![false; history.blocks.len()],
+        };
+        assert_eq!(history.cold_blocks(), expected);
+        check_store(history);
+    }
+
+    #[test]
+    fn cold_rows_read_identically() {
+        let mut history = varied(2000);
+        let warm = history.clone();
+        history.set_compression(Some(10));
+        assert_eq!(history.compression(), Some(10));
+        assert!(history.has_jobs());
+        assert!(history.cold_blocks().iter().all(|&cold| !cold), "nothing compressed inline");
+        run_and_check(&mut history);
+        assert!(history.cold_blocks().iter().filter(|&&cold| cold).count() > 20);
+        assert_same_rows(&history, &warm);
+
+        // Cells with extras (hyperlinks): the extras queue is untouched by compression.
+        let mut rng = ChaCha8Rng::seed_from_u64(0xc01e);
+        let links = cell_links();
+        let mut history = History::<Cell>::with_block_size(1000, 4096);
+        for _ in 0..1000 {
+            let width = rng.gen_range(1..=80);
+            history.push_newest(&cell_row(&mut rng, &links, width));
+        }
+        let warm = history.clone();
+        history.set_compression(Some(37));
+        run_and_check(&mut history);
+        assert!(history.cold_blocks().iter().any(|&cold| cold));
+        assert_same_rows(&history, &warm);
+        for i in 0..warm.len() {
+            let expected = warm.plain_text(i, |p| (p.text.to_vec(), p.tail, p.width, p.wraps));
+            let got = history.plain_text(i, |p| (p.text.to_vec(), p.tail, p.width, p.wraps));
+            assert_eq!(got, expected, "row {i} plain text");
+        }
+    }
+
+    #[test]
+    fn newest_block_never_cold() {
+        for keep in [0, 1, 10, 37] {
+            let mut history = varied(600);
+            history.set_compression(Some(keep));
+            run_and_check(&mut history);
+            assert_eq!(history.cold_blocks().last(), Some(&false), "keep {keep}");
+
+            // Pushing keeps compressing as rows leave the warm window.
+            let mut rng = ChaCha8Rng::seed_from_u64(keep as u64);
+            for _ in 0..300 {
+                history.push_newest(&varied_row(&mut rng));
+            }
+            assert!(history.has_jobs());
+            run_and_check(&mut history);
+            assert_eq!(history.cold_blocks().last(), Some(&false), "keep {keep}");
+        }
+    }
+
+    /// A history with compression at 10 warm rows and its first job taken, plus a warm copy.
+    fn with_job() -> (History<usize>, History<usize>, Job) {
+        let mut history = varied(600);
+        let warm = history.clone();
+        history.set_compression(Some(10));
+        let job = history.next_job().expect("a block to compress");
+        (history, warm, job)
+    }
+
+    #[test]
+    fn stale_job_refused_after_eviction() {
+        let (mut history, mut warm, job) = with_job();
+        let oldest = history.front_seq;
+        history.set_limit(600);
+        warm.set_limit(600);
+        let mut rng = ChaCha8Rng::seed_from_u64(1);
+        while history.front_seq == oldest {
+            let row = varied_row(&mut rng);
+            history.push_newest(&row);
+            warm.push_newest(&row);
+        }
+        assert!(!history.install(job.run()));
+        assert_same_rows(&history, &warm);
+        run_and_check(&mut history);
+        assert_same_rows(&history, &warm);
+    }
+
+    #[test]
+    fn stale_job_refused_after_clear() {
+        let (mut history, warm, job) = with_job();
+        history.clear();
+        assert_eq!(history.cached_blocks(), 0);
+        // The same rows again: the first block has the same sequence number, not the same
+        // identity.
+        let mut rng = ChaCha8Rng::seed_from_u64(0xc01d);
+        for _ in 0..600 {
+            history.push_newest(&varied_row(&mut rng));
+        }
+        assert!(!history.install(job.run()));
+        assert_same_rows(&history, &warm);
+        run_and_check(&mut history);
+        assert_same_rows(&history, &warm);
+    }
+
+    #[test]
+    fn stale_job_refused_after_set_limit() {
+        let (mut history, mut warm, job) = with_job();
+        history.set_limit(100);
+        warm.set_limit(100);
+        assert!(!history.install(job.run()));
+        assert_same_rows(&history, &warm);
+        run_and_check(&mut history);
+        assert_same_rows(&history, &warm);
+    }
+
+    #[test]
+    fn stale_job_refused_after_setting_change() {
+        let (mut history, warm, job) = with_job();
+        history.set_compression(None);
+        assert!(!history.install(job.run()));
+        assert_same_rows(&history, &warm);
+
+        // A cold block's warming job, refused once compression is back on.
+        history.set_compression(Some(10));
+        run_and_check(&mut history);
+        history.set_compression(None);
+        let job = history.next_job().expect("a block to warm");
+        history.set_compression(Some(10));
+        assert!(!history.install(job.run()));
+        assert_same_rows(&history, &warm);
+        run_and_check(&mut history);
+    }
+
+    #[test]
+    fn switching_off_warms_every_block() {
+        let mut history = varied(2000);
+        let warm = history.clone();
+        history.set_compression(Some(0));
+        run_and_check(&mut history);
+        history.set_compression(None);
+        assert!(history.has_jobs());
+        assert_eq!(history.cached_blocks(), 0);
+        run_and_check(&mut history);
+        assert!(history.cold_blocks().iter().all(|&cold| !cold));
+        assert_same_rows(&history, &warm);
+    }
+
+    #[test]
+    fn raising_keep_warm_warms_blocks() {
+        let mut history = varied(2000);
+        let warm = history.clone();
+        history.set_compression(Some(10));
+        run_and_check(&mut history);
+        let cold = history.cold_blocks().iter().filter(|&&cold| cold).count();
+        history.set_compression(Some(1000));
+        run_and_check(&mut history);
+        assert!(history.cold_blocks().iter().filter(|&&cold| cold).count() < cold);
+        assert_same_rows(&history, &warm);
+    }
+
+    #[test]
+    fn lowering_keep_warm_cools_blocks() {
+        let mut history = varied(2000);
+        let warm = history.clone();
+        history.set_compression(Some(1000));
+        run_and_check(&mut history);
+        let cold = history.cold_blocks().iter().filter(|&&cold| cold).count();
+        history.set_compression(Some(10));
+        run_and_check(&mut history);
+        assert!(history.cold_blocks().iter().filter(|&&cold| cold).count() > cold);
+        assert_same_rows(&history, &warm);
+    }
+
+    #[test]
+    fn update_on_cold_row() {
+        let mut history = varied(600);
+        history.set_compression(Some(10));
+        run_and_check(&mut history);
+        let mut warm = history.clone();
+        warm.set_compression(None);
+        warm.run_jobs();
+
+        let i = 500;
+        let pos = history.len() - 1 - i;
+        let block = history.index[pos].block.wrapping_sub(history.front_seq) as usize;
+        assert!(history.cold_blocks()[block], "row {i} is in a cold block");
+        history.update(i, |row| row[Column(0)] = 7777);
+        warm.update(i, |row| row[Column(0)] = 7777);
+        check_store(&history);
+        assert_eq!(read(&history, i)[Column(0)], 7777);
+        assert_same_rows(&history, &warm);
+        run_and_check(&mut history);
+        assert_same_rows(&history, &warm);
+    }
+
+    #[test]
+    fn pop_newest_into_cold_block() {
+        let mut history = varied(600);
+        let mut warm = history.clone();
+        history.set_compression(Some(0));
+        run_and_check(&mut history);
+        let (mut a, mut b) = (Row::default(), Row::default());
+        while warm.pop_newest(&mut b) {
+            assert!(history.pop_newest(&mut a));
+            assert_eq!(a, b, "{} rows left", warm.len());
+            check_store(&history);
+            assert_eq!(history.cold_blocks().last().copied(), history.blocks.back().map(|_| false));
+        }
+        assert!(!history.pop_newest(&mut a));
+        assert!(history.blocks.is_empty());
+    }
+
+    #[test]
+    fn cache_holds_at_most_four_blocks() {
+        let mut history = varied(2000);
+        history.set_compression(Some(0));
+        run_and_check(&mut history);
+        assert_eq!(history.cached_blocks(), 0);
+
+        // The oldest row of each of the first 7 cold blocks.
+        let cold: Vec<usize> = (0..history.blocks.len())
+            .filter(|&block| history.cold_blocks()[block])
+            .take(7)
+            .map(|block| {
+                let seq = history.front_seq.wrapping_add(block as u32);
+                let pos = history.index.iter().position(|entry| entry.block == seq).unwrap();
+                history.len() - 1 - pos
+            })
+            .collect();
+        let cached = |history: &History<usize>| -> Vec<u32> {
+            history.cache.borrow().entries.iter().map(|cached| cached.seq).collect()
+        };
+        let seq = |history: &History<usize>, i: usize| history.index[history.len() - 1 - i].block;
+
+        for (n, &i) in cold[..6].iter().enumerate() {
+            read(&history, i);
+            assert_eq!(history.cached_blocks(), (n + 1).min(CACHE_BLOCKS));
+        }
+        // Least recently used first: reading block 3 again moves it last, so block 7 evicts
+        // block 4.
+        let order: Vec<u32> = cold[2..6].iter().map(|&i| seq(&history, i)).collect();
+        assert_eq!(cached(&history), order);
+        read(&history, cold[2]);
+        read(&history, cold[6]);
+        let order: Vec<u32> =
+            [cold[4], cold[5], cold[2], cold[6]].iter().map(|&i| seq(&history, i)).collect();
+        assert_eq!(cached(&history), order);
+
+        // Lowering the limit and switching off clear the cache.
+        history.set_limit(1500);
+        assert_eq!(history.cached_blocks(), 0);
+        assert_eq!(history.cold_blocks().first(), Some(&true));
+        read(&history, history.len() - 1);
+        assert_eq!(history.cached_blocks(), 1);
+        history.set_compression(None);
+        assert_eq!(history.cached_blocks(), 0);
+    }
+
+    #[test]
+    fn off_does_nothing() {
+        let mut history = History::with_block_size(1000, TINY);
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        for _ in 0..10_000 {
+            history.push_newest(&varied_row(&mut rng));
+        }
+        assert_eq!(history.compression(), None);
+        assert!(!history.has_jobs());
+        assert!(history.next_job().is_none());
+        history.set_compression(None);
+        assert!(!history.has_jobs());
+        assert!(history.cold_blocks().iter().all(|&cold| !cold));
+    }
+
+    /// `History` stays `Send` (fbterm's worker moves `Job`s and `Done`s across threads too).
+    #[test]
+    fn history_and_jobs_are_send() {
+        fn send<S: Send>() {}
+        send::<History<Cell>>();
+        send::<Job>();
+        send::<Done>();
     }
 }
