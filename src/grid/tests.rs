@@ -1152,6 +1152,26 @@ mod compression {
         assert!(!term.has_history_jobs());
     }
 
+    /// A host drops the read cache after a sweep of the history (search, export): the
+    /// decompressed blocks go, and the terminal reads the same afterwards.
+    #[test]
+    fn drop_history_cache_after_a_sweep() {
+        let (mut compressed, mut warm) = (term(Some(50), 126, 40), term(None, 126, 40));
+        let bytes = wrapping_lines(3000);
+        feed(&mut compressed, &bytes);
+        feed(&mut warm, &bytes);
+        compressed.drop_history_cache();
+        compressed.run_history_jobs();
+        assert!(cold(&compressed) > 20);
+
+        assert_same(&compressed, &warm, "after the sweep");
+        assert!(compressed.grid().history().cached_blocks() > 0);
+        compressed.drop_history_cache();
+        assert_eq!(compressed.grid().history().cached_blocks(), 0);
+        assert_same(&compressed, &warm, "after dropping the cache");
+        warm.drop_history_cache();
+    }
+
     /// fbterm's worker moves jobs and results across threads; `Term` stays `Send`.
     #[test]
     fn term_and_history_jobs_are_send() {

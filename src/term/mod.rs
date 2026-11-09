@@ -886,6 +886,15 @@ impl<T> Term<T> {
         grid.history_epoch() == done.epoch && grid.history_mut().install(done.done)
     }
 
+    /// Free the decompressed history blocks kept for reads (feathercritty: history compression;
+    /// at most 4 blocks of 64 KiB per grid). A host calls it after a sweep of the history, such
+    /// as a search or an export, so they do not stay resident. Reads afterwards decompress again.
+    /// Does nothing when no block is cached, which is always the case with compression off.
+    pub fn drop_history_cache(&mut self) {
+        self.grid.history_mut().drop_read_cache();
+        self.inactive_grid.history_mut().drop_read_cache();
+    }
+
     /// Run and install every history job now (feathercritty: tests, and hosts that want no
     /// background work).
     pub fn run_history_jobs(&mut self) {

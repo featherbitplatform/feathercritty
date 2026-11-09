@@ -137,8 +137,9 @@
 //!   first, in a `RefCell` (reads take `&self`; `History` stays `Send`, not `Sync`). A cached block
 //!   is an `Arc<Vec<u8>>`, so a read holds its record without holding the `RefCell` borrow, and an
 //!   evicted buffer is reused when no read still holds it. The cache is cleared by `clear`, a lower
-//!   `set_limit` and switching compression off; an install that warms a cached block, and freeing a
-//!   cold block, drop its entry.
+//!   `set_limit`, switching compression off and [`History::drop_read_cache`] (a host calls
+//!   `Term::drop_history_cache` after a sweep, such as a search or an export); an install that
+//!   warms a cached block, and freeing a cold block, drop its entry.
 //! - **Off means off.** With `None` (the default) and no cold block left, no job exists, `has_jobs`
 //!   is false and the paths above cost one `Option` or `cold` check each. Two details keep the warm
 //!   paths as fast as before the cold state (measured against the fork's `main`,
@@ -521,6 +522,17 @@ impl<T: HistoryCell> History<T> {
             .map(|at| self.front_seq.wrapping_add(at as u32));
     }
 
+    /// Free the decompressed blocks the read cache holds (at most [`CACHE_BLOCKS`]), for a host
+    /// that has finished a sweep of the history (a search, an export) and does not want them to
+    /// stay resident until the next `clear`, lower limit or switch off. Reads afterwards
+    /// decompress again. Does nothing when the cache is empty (always with compression off).
+    pub fn drop_read_cache(&mut self) {
+        let cache = self.cache.get_mut();
+        if cache.entries.capacity() > 0 {
+            cache.entries = Vec::new();
+        }
+    }
+
     /// Rows kept warm, `None` when compression is off (see [`History::set_compression`]).
     #[inline]
     pub fn compression(&self) -> Option<usize> {
@@ -673,12 +685,6 @@ impl<T: HistoryCell> History<T> {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn cached_blocks(&self) -> usize {
         self.cache.borrow().entries.len()
-    }
-
-    /// Drop every decompressed block from the read cache (tests).
-    #[cfg(test)]
-    pub(crate) fn clear_cache(&mut self) {
-        self.cache.get_mut().entries = Vec::new();
     }
 
     /// Whether the block at `at` in `blocks` should be cold: compression is on, it holds rows,
@@ -2461,7 +2467,7 @@ mod tests {
         history.set_compression(Some(10));
         history.run_jobs();
         assert!(history.cold_blocks().iter().any(|&cold| cold));
-        history.clear_cache();
+        history.drop_read_cache();
         assert_eq!(history.cached_blocks(), 0);
 
         let answers: Vec<(bool, bool)> =
@@ -3015,6 +3021,32 @@ mod tests {
         check_store(&history);
         assert!(history.has_jobs());
         run_and_check(&mut history);
+    }
+
+    /// `drop_read_cache` frees the decompressed blocks a sweep left in the cache; reads after it
+    /// decompress again and return the same rows. With nothing cached, or compression off, it
+    /// does nothing.
+    #[test]
+    fn drop_read_cache_frees_cached_blocks() {
+        let mut history = varied(2000);
+        let warm = history.clone();
+        history.drop_read_cache();
+        history.set_compression(Some(10));
+        run_and_check(&mut history);
+        history.drop_read_cache();
+        assert_eq!(history.cached_blocks(), 0);
+
+        assert_same_rows(&history, &warm);
+        assert_eq!(history.cached_blocks(), CACHE_BLOCKS);
+        history.drop_read_cache();
+        assert_eq!(history.cached_blocks(), 0);
+        assert_eq!(history.cache.borrow().entries.capacity(), 0, "the cache kept its buffer");
+        assert_same_rows(&history, &warm);
+        check_store(&history);
+
+        history.set_compression(None);
+        history.drop_read_cache();
+        assert_eq!(history.cached_blocks(), 0);
     }
 
     /// `History` stays `Send` (fbterm's worker moves `Job`s and `Done`s across threads too).
