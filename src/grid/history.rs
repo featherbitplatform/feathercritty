@@ -103,9 +103,15 @@
 //!   swaps the result in (a `Vec` swap: it never compresses, decompresses or copies). Setting
 //!   changes only mark blocks. `scan` is the oldest block that may disagree (every older one
 //!   agrees), so [`History::has_jobs`] is one comparison and the search resumes where it stopped.
-//!   Whatever can make a block disagree lowers `scan` to it: a block's warm count reaching zero, a
-//!   cold block's leaving zero, a new block making the previous newest one eligible, and a setting
-//!   change (from the front). A job left uninstalled is offered again.
+//!   Whatever can make a block disagree lowers `scan` to it, once the change is complete and only
+//!   if the block then disagrees: a block's warm count reaching zero (checked after the row is
+//!   released, which may free the block), a cold block's leaving zero, a new block making the
+//!   previous newest one eligible, the history leaving full, and a setting change (which finds the
+//!   oldest disagreeing block). So `has_jobs` is true only when a job exists, with one exception: a
+//!   marked block that stops disagreeing before its job is installed (installed, evicted, or the
+//!   oldest block of a full history again) leaves `scan` on it until the next `next_jobs` finds
+//!   nothing, which costs a host one empty wake when its worker did not drain the jobs. A job left
+//!   uninstalled is offered again.
 //! - **Batches.** [`History::next_jobs`] takes up to `max` such blocks at once, oldest first
 //!   (`next_job` is a batch of one); they are independent and install in any order. A worker that
 //!   installs one batch and takes the next in a single lock hold needs one hold per batch: with one
@@ -510,7 +516,9 @@ impl<T: HistoryCell> History<T> {
             },
             None => self.cache.get_mut().entries.clear(),
         }
-        self.scan = (!self.blocks.is_empty()).then_some(self.front_seq);
+        self.scan = (0..self.blocks.len())
+            .find(|&at| self.disagrees(at))
+            .map(|at| self.front_seq.wrapping_add(at as u32));
     }
 
     /// Rows kept warm, `None` when compression is off (see [`History::set_compression`]).
@@ -519,8 +527,11 @@ impl<T: HistoryCell> History<T> {
         self.compression
     }
 
-    /// Whether [`History::next_job`] may have a job. False means every block is in the state
-    /// the setting asks for. O(1), so a host can check after every batch of output.
+    /// Whether [`History::next_job`] has a job. False means every block is in the state the
+    /// setting asks for; true means one is not, except right after a job is installed or a
+    /// block stops disagreeing before its job is taken, until the next `next_jobs` finds nothing
+    /// (see "Jobs, never inline" in the module docs). O(1), so a host can check after every batch
+    /// of output.
     #[inline]
     pub fn has_jobs(&self) -> bool {
         self.scan.is_some()
@@ -689,8 +700,8 @@ impl<T: HistoryCell> History<T> {
     /// full (see `wants_cold`), may now want to go cold.
     #[inline]
     fn left_full(&mut self, was_full: bool) {
-        if was_full && self.index.len() < self.limit && !self.blocks.is_empty() {
-            self.mark(self.front_seq);
+        if was_full && self.index.len() < self.limit {
+            self.mark_if_disagrees(self.front_seq);
         }
     }
 
@@ -715,6 +726,16 @@ impl<T: HistoryCell> History<T> {
         }
     }
 
+    /// [`History::mark`] the block `seq` if it still exists and disagrees with its eligibility, so
+    /// that `has_jobs` is true only when a job exists. Called once the change that may have made
+    /// it disagree is complete (a row released, the history full again).
+    fn mark_if_disagrees(&mut self, seq: u32) {
+        let at = seq.wrapping_sub(self.front_seq) as usize;
+        if at < self.blocks.len() && self.disagrees(at) {
+            self.mark(seq);
+        }
+    }
+
     /// A fresh block generation.
     #[inline]
     fn next_generation(&mut self) -> u64 {
@@ -731,31 +752,44 @@ impl<T: HistoryCell> History<T> {
         }
     }
 
-    /// One row of the block `seq` left the warm rows.
+    /// One row of the block `seq` left the warm rows. Only counts: the caller calls
+    /// [`History::warm_left`] once its change is complete (a released row may free the block,
+    /// an eviction in progress leaves the history briefly not full).
     fn warm_leave(&mut self, seq: u32) {
+        self.blocks[seq.wrapping_sub(self.front_seq) as usize].warm_live -= 1;
+    }
+
+    /// The block `seq` lost a warm row (`warm_leave`) and the change is complete: if it has no
+    /// warm row left and now wants to go cold, mark it.
+    fn warm_left(&mut self, seq: u32) {
         let at = seq.wrapping_sub(self.front_seq) as usize;
-        let block = &mut self.blocks[at];
-        block.warm_live -= 1;
-        if block.warm_live == 0 && !block.cold && at + 1 < self.blocks.len() {
-            self.mark(seq);
+        if self.blocks.get(at).is_some_and(|block| block.warm_live == 0) {
+            self.mark_if_disagrees(seq);
         }
     }
 
-    /// Account for the row just pushed as the newest: it is warm, and the row now `keep` rows
-    /// from the newest left the warm rows.
+    /// Account for the row just pushed as the newest: it is warm, the row now `keep` rows from
+    /// the newest left the warm rows, and a block the row started made the previous newest block
+    /// eligible (a new block's first record is at offset 0; no other record is).
     fn pushed(&mut self, keep: usize) {
         let len = self.index.len();
-        if keep == 0 {
-            return;
+        let newest = self.index[len - 1];
+        if keep > 0 {
+            self.warm_enter(newest.block);
+            if len > keep {
+                let left = self.index[len - 1 - keep].block;
+                self.warm_leave(left);
+                self.warm_left(left);
+            }
         }
-        self.warm_enter(self.index[len - 1].block);
-        if len > keep {
-            self.warm_leave(self.index[len - 1 - keep].block);
+        if newest.offset == 0 {
+            self.mark_if_disagrees(newest.block.wrapping_sub(1));
         }
     }
 
     /// Account for the newest row `entry`, just removed from the index (still in its block):
-    /// it leaves the warm rows, and the row `keep - 1` rows from the newest comes back in.
+    /// it leaves the warm rows, and the row `keep - 1` rows from the newest comes back in. The
+    /// caller calls `warm_left` for `entry`'s block once the row is released.
     fn popped(&mut self, keep: usize, entry: Entry) {
         let len = self.index.len();
         if keep == 0 {
@@ -844,13 +878,22 @@ impl<T: HistoryCell> History<T> {
         };
 
         self.decode(entry, self.extras_end(), into);
+        self.remove_popped(entry, was_full);
+        true
+    }
+
+    /// The rest of `pop_newest` and `remove_newest` for the newest row `entry`, just removed
+    /// from the index (`was_full`: compression is on and the history was full before).
+    fn remove_popped(&mut self, entry: Entry, was_full: bool) {
         if let Some(keep) = self.compression {
             self.popped(keep, entry);
         }
-        self.left_full(was_full);
         self.release(entry);
+        if self.compression.is_some() {
+            self.warm_left(entry.block);
+        }
+        self.left_full(was_full);
         self.extras.truncate(entry.first_extra.wrapping_sub(self.extras_base) as usize);
-        true
     }
 
     /// Remove the oldest row into `into`. Returns `false`, leaving `into` untouched, when the
@@ -873,7 +916,8 @@ impl<T: HistoryCell> History<T> {
         if let Some(keep) = self.compression {
             for _ in 0..count {
                 if let Some(entry) = self.index.pop_front() {
-                    // It was warm when every row was.
+                    // It was warm when every row was. Then its block, if it keeps rows, keeps
+                    // warm ones too, so it never becomes eligible here (no `warm_left`).
                     if self.index.len() < keep {
                         self.warm_leave(entry.block);
                     }
@@ -955,6 +999,13 @@ impl<T: HistoryCell> History<T> {
             self.warm_leave(entry.block);
         }
         self.release(entry);
+        if warm {
+            self.warm_left(entry.block);
+        }
+        // The newest block now, to notice a new one (`None` with compression off).
+        let newest = self
+            .compression
+            .map(|_| self.front_seq.wrapping_add(self.blocks.len() as u32).wrapping_sub(1));
 
         let start = entry.first_extra.wrapping_sub(self.extras_base) as usize;
         let old_count = old_end.wrapping_sub(entry.first_extra) as usize;
@@ -994,6 +1045,10 @@ impl<T: HistoryCell> History<T> {
         if warm {
             self.warm_enter(new.block);
         }
+        if let Some(newest) = newest.filter(|&newest| newest != new.block) {
+            // The record started a block: the previous newest one may now be eligible.
+            self.mark_if_disagrees(newest);
+        }
         self.updated = row;
     }
 
@@ -1020,6 +1075,7 @@ impl<T: HistoryCell> History<T> {
 
         to.encoded.clear();
         self.with_record(entry, |bytes| compact::copy_with_width(bytes, width, &mut to.encoded));
+        // Warm only when every row is (see `remove_oldest`: no `warm_left`).
         if self.compression.is_some_and(|keep| self.index.len() < keep) {
             self.warm_leave(entry.block);
         }
@@ -1063,12 +1119,7 @@ impl<T: HistoryCell> History<T> {
             return false;
         };
 
-        if let Some(keep) = self.compression {
-            self.popped(keep, entry);
-        }
-        self.left_full(was_full);
-        self.release(entry);
-        self.extras.truncate(entry.first_extra.wrapping_sub(self.extras_base) as usize);
+        self.remove_popped(entry, was_full);
         true
     }
 
@@ -1295,12 +1346,9 @@ impl<T: HistoryCell> History<T> {
     }
 
     /// Append a new, empty block with buffer `bytes` as the newest block. The block that was
-    /// newest may now be eligible to go cold.
+    /// newest may now be eligible to go cold: the caller marks it once its record is stored
+    /// (`pushed`, `update`).
     fn push_block(&mut self, bytes: Vec<u8>, oversized: bool) {
-        if self.compression.is_some() && self.blocks.back().is_some_and(|back| back.warm_live == 0)
-        {
-            self.mark(self.front_seq.wrapping_add(self.blocks.len() as u32 - 1));
-        }
         let generation = self.next_generation();
         let block = Block { bytes, live: 0, warm_live: 0, generation, oversized, cold: false };
         self.blocks.push_back(block);
@@ -1763,6 +1811,12 @@ mod tests {
         }
         if let (Some(front), Some(back)) = (history.blocks.front(), history.blocks.back()) {
             assert!(front.live > 0 && back.live > 0, "an empty block at an end of the deque");
+        }
+
+        // No job is lost: every block that disagrees with its eligibility is at or after `scan`.
+        if let Some(at) = (0..history.blocks.len()).find(|&at| history.disagrees(at)) {
+            let scan = history.scan.map(|scan| history.position_of(scan));
+            assert!(scan.is_some_and(|scan| scan <= at), "block {at} disagrees, scan {scan:?}");
         }
 
         // Extras: first positions never decrease, and each row's extras are inside the queue.
@@ -2816,39 +2870,82 @@ mod tests {
         assert!(history.cold_blocks().iter().all(|&cold| !cold));
     }
 
+    /// What [`jobs_over_a_feed`] saw.
+    struct Feed {
+        history: History<usize>,
+        /// Jobs taken and installed.
+        jobs: usize,
+        /// Pushes after which `has_jobs` was true (the host would wake its worker).
+        wakes: usize,
+        /// Of those, wakes that found no job.
+        empty_wakes: usize,
+    }
+
     /// Feed `rows` varied rows into a history of `limit` rows keeping `keep` warm, on full-size
-    /// blocks, taking every job after each row (a worker that never falls behind); returns the
-    /// jobs taken.
-    fn jobs_over_a_feed(limit: usize, keep: usize, rows: usize) -> (History<usize>, usize) {
+    /// blocks, and after each row do what a host does: check `has_jobs` and, when it is true,
+    /// take and install jobs until none is left (a worker that never falls behind). After every
+    /// push `has_jobs` must say exactly whether a block disagrees with its eligibility.
+    fn jobs_over_a_feed(limit: usize, keep: usize, rows: usize) -> Feed {
         let mut rng = ChaCha8Rng::seed_from_u64(0xe71c);
-        let mut history = History::with_block_size(limit, DEFAULT_BLOCK_BYTES);
+        let history = History::with_block_size(limit, DEFAULT_BLOCK_BYTES);
+        let mut feed = Feed { history, jobs: 0, wakes: 0, empty_wakes: 0 };
+        let history = &mut feed.history;
         history.set_compression(Some(keep));
-        let mut jobs = 0;
-        for _ in 0..rows {
+        for row in 0..rows {
             history.push_newest(&varied_row(&mut rng));
-            for job in history.next_jobs(8) {
-                jobs += 1;
-                history.install(job.run());
+            let pending = (0..history.blocks.len()).any(|at| history.disagrees(at));
+            assert_eq!(history.has_jobs(), pending, "after row {row}");
+            if !history.has_jobs() {
+                continue;
             }
+            feed.wakes += 1;
+            let mut found = false;
+            loop {
+                let jobs = history.next_jobs(8);
+                if jobs.is_empty() {
+                    break;
+                }
+                found = true;
+                for job in jobs {
+                    feed.jobs += 1;
+                    assert!(history.install(job.run()));
+                }
+            }
+            feed.empty_wakes += usize::from(!found);
         }
-        (history, jobs)
+        feed
     }
 
     /// With the warm rows near the limit (the default scrollback of 10,000 keeps 9,999 warm), a
     /// block only becomes eligible once its last rows are the next to be evicted: compressing
-    /// it frees nothing, so no job is offered for it. A long scrollback still compresses.
+    /// it frees nothing, so no job is offered for it, and `has_jobs` never wakes the host. A
+    /// long scrollback still compresses, and every wake finds a job.
     #[test]
     fn blocks_about_to_be_evicted_are_not_compressed() {
-        let (history, jobs) = jobs_over_a_feed(10_000, 9_999, 200_000);
-        assert_eq!(jobs, 0, "jobs for blocks about to be evicted");
-        assert!(!history.has_jobs());
-        assert!(history.cold_blocks().iter().all(|&cold| !cold));
+        let feed = jobs_over_a_feed(10_000, 9_999, 200_000);
+        assert_eq!(feed.jobs, 0, "jobs for blocks about to be evicted");
+        assert_eq!(feed.wakes, 0, "wakes with no eligible block");
+        assert!(feed.history.cold_blocks().iter().all(|&cold| !cold));
 
-        let (mut history, jobs) = jobs_over_a_feed(100_000, 10_000, 150_000);
+        let Feed { mut history, jobs, wakes, empty_wakes } =
+            jobs_over_a_feed(100_000, 10_000, 150_000);
         assert!(jobs > 50, "{jobs} jobs");
+        assert!(wakes > 0);
+        assert_eq!(empty_wakes, 0, "{empty_wakes} of {wakes} wakes found no job");
         let cold = history.cold_blocks().iter().filter(|&&cold| cold).count();
         assert!(cold * 10 > history.cold_blocks().len() * 8, "{cold} cold blocks");
         run_and_check(&mut history);
+    }
+
+    /// With every row warm (`keep_warm` at or above the history's length) no block is ever
+    /// eligible: evicting a block's last row must not wake the host either.
+    #[test]
+    fn no_wakes_while_every_row_is_warm() {
+        for (limit, keep) in [(5_000, 5_000), (5_000, 8_000), (20_000, usize::MAX)] {
+            let feed = jobs_over_a_feed(limit, keep, 60_000);
+            assert_eq!((feed.jobs, feed.wakes), (0, 0), "limit {limit}, keep {keep}");
+            assert!(feed.history.cold_blocks().iter().all(|&cold| !cold));
+        }
     }
 
     /// The oldest block held back warm while the history is full goes cold once a change leaves
@@ -2889,6 +2986,35 @@ mod tests {
             run_and_check(&mut history);
         }
         assert!(history.cold_blocks()[0]);
+    }
+
+    /// Popping the newest row can leave an older block with no warm row while it still holds
+    /// rows: the newest row sat in it, and the second newest had been moved to a newer block by
+    /// `update`. That block must be offered.
+    #[test]
+    fn pop_newest_offers_the_block_it_leaves_cold() {
+        let mut history = History::with_block_size(1000, TINY);
+        for value in 0..20 {
+            history.push_newest(&row(value + 1));
+        }
+        history.set_compression(Some(1));
+        run_and_check(&mut history);
+        // Row 1 rewritten larger than the room left: it moves to a new block, row 0 stays.
+        let (blocks, newest) = (history.blocks.len(), history.index[history.len() - 1].block);
+        history.update(1, |row| {
+            *row = Row::new(TINY / 4);
+            row[..].iter_mut().enumerate().for_each(|(i, cell)| *cell = 1000 + 7 * i);
+        });
+        assert_eq!(history.blocks.len(), blocks + 1);
+        assert_eq!(history.index[history.len() - 1].block, newest);
+        assert!(history.index.iter().filter(|entry| entry.block == newest).count() > 1);
+        run_and_check(&mut history);
+
+        let mut into = Row::default();
+        assert!(history.pop_newest(&mut into));
+        check_store(&history);
+        assert!(history.has_jobs());
+        run_and_check(&mut history);
     }
 
     /// `History` stays `Send` (fbterm's worker moves `Job`s and `Done`s across threads too).
