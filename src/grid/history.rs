@@ -649,11 +649,12 @@ impl<T: HistoryCell> History<T> {
 
     /// `run_jobs`, running each job with `run`. Nothing changes between taking a job and
     /// installing it here, so an install is never refused; if one ever were, the same job would
-    /// be offered again forever, so it stops there instead (the tests' `run_and_check` asserts
-    /// that no job is left).
+    /// be offered again forever, so it stops there instead in release builds (the tests'
+    /// `run_and_check` asserts that no job is left), and debug builds stop at the assertion.
     fn run_jobs_with(&mut self, mut run: impl FnMut(Job) -> Done) {
         while let Some(job) = self.next_job() {
             if !self.install(run(job)) {
+                debug_assert!(false, "run_jobs: an install was refused");
                 break;
             }
         }
@@ -2844,8 +2845,10 @@ mod tests {
         assert!(history.next_jobs(0).is_empty());
     }
 
-    /// `run_jobs` stops at a refused install instead of offering the same job forever.
+    /// `run_jobs` stops at a refused install instead of offering the same job forever (release
+    /// builds); a refusal there is a bug, so debug builds stop at a `debug_assert!`.
     #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "run_jobs: an install was refused"))]
     fn run_jobs_stops_when_install_refuses() {
         let mut history = varied(600);
         history.set_compression(Some(10));
