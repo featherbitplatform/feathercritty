@@ -64,7 +64,7 @@ use common::{
     interleaved_ms, percentile, runs, selected, table_header, table_row, table_row_abs,
     timed_gate_requested, worker, workload_lines,
 };
-use feathercritty::grid::{Dimensions, RowReader};
+use feathercritty::grid::{Dimensions, RowReader, cold_frame_for_test, decompress_cold_for_test};
 use feathercritty::index::{Column, Line, Point, Side};
 use feathercritty::selection::{Selection, SelectionType};
 use feathercritty::term::cell::Cell;
@@ -324,15 +324,11 @@ fn cold_blocks(sim: &fc::Sim) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// Decompress every block of `cold` (the layout of `src/grid/cold.rs`: a tag, a `u32` length,
-/// the zstd frame) the way `cold.rs` does: a new context and a zeroed buffer per block.
+/// Decompress every block of `cold` with `cold.rs` itself: a new context and a zeroed buffer per
+/// block.
 fn decompress_all(cold: &[Vec<u8>], out: &mut Vec<u8>) {
     for block in cold {
-        let len = u32::from_le_bytes(block[1..5].try_into().unwrap()) as usize;
-        out.clear();
-        out.resize(len, 0);
-        let written = zstd::bulk::decompress_to_buffer(&block[5..], &mut out[..]).unwrap();
-        assert_eq!(written, len);
+        decompress_cold_for_test(block, out);
     }
 }
 
@@ -343,10 +339,10 @@ fn decompress_all_reused(
     out: &mut Vec<u8>,
 ) {
     for block in cold {
-        let len = u32::from_le_bytes(block[1..5].try_into().unwrap()) as usize;
+        let (len, frame) = cold_frame_for_test(block);
         out.clear();
         out.reserve(len);
-        let written = context.decompress_to_buffer(&block[5..], out).unwrap();
+        let written = context.decompress_to_buffer(frame, out).unwrap();
         assert_eq!(written, len);
     }
 }

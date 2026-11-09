@@ -41,6 +41,19 @@ pub(crate) fn uncompressed_len(cold: &[u8]) -> usize {
     u32::from_le_bytes([cold[1], cold[2], cold[3], cold[4]]) as usize
 }
 
+/// [`decompress`] (test hook, not a stable API: `benches/reads.rs` times it on real cold blocks).
+#[cfg(feature = "test-hooks")]
+pub fn decompress_cold_for_test(cold: &[u8], out: &mut Vec<u8>) {
+    decompress(cold, out);
+}
+
+/// The uncompressed length and the zstd frame of the cold block `cold` (test hook, not a stable
+/// API: `benches/reads.rs` decodes the frame with other zstd settings).
+#[cfg(feature = "test-hooks")]
+pub fn cold_frame_for_test(cold: &[u8]) -> (usize, &[u8]) {
+    (uncompressed_len(cold), &cold[HEADER..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

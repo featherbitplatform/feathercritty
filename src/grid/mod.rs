@@ -20,6 +20,8 @@ mod tests;
 
 // feathercritty: the history and its read API (see `history.rs`), and the trait for cells it
 // stores, next to their row codec (see `compact.rs`).
+#[cfg(feature = "test-hooks")]
+pub use self::cold::{cold_frame_for_test, decompress_cold_for_test};
 pub(crate) use self::compact::PlainText;
 pub use self::compact::{HistoryCell, ReflowInfo};
 pub use self::history::{Done, History, Job, RowReader};
