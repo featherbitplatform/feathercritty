@@ -257,16 +257,17 @@ the byte copy) had 100,000-line rewraps of 44 to 69 ms.
 ## Compressor choice (history compression, phase 0)
 
 Which compressor and level the cold-block compression of the design (spec 5.3, 6.3) uses.
-Command: `cargo test --release --test compress_choice -- --ignored --nocapture` (about 4 s).
-Each corpus (`tests/corpora/`) goes through `Processor::advance` into a 126-column terminal with a
+Command: `cargo test --release --test compress_choice -- --ignored --nocapture` (about 4 s). Each
+corpus (`tests/corpora/`) goes through `Processor::advance` into a 126-column terminal with a
 1,000,000-line history; every 64 KiB history block (partly filled ones included) is compressed and
 decompressed on its own, best of 3 passes, and checked to round trip. The three generated corpora
 have 300,000 rows (seeds 1, 2 and 3); the two recorded streams (a `cargo build` log of this
-workspace, 417 lines, and `git log --graph` of this repository, 562 lines, redacted to `/work`) fit
-in one partly filled block each, so their ratios are for a block of 28 and 55 KB (smaller than
-the 64 KiB a full block has, so a little worse than a full block would give). "Projected vs off"
-is (compressed block bytes + 16 bytes of row index per row) over (block bytes + the same index);
-the rule below allows 40%.
+workspace, 417 lines, redacted to `/work`, and `git log --graph --oneline --no-decorate` of this
+repository up to `026ea07`, without authors and without the 27 subjects that name other terminal
+applications, 535 lines) fit in one partly filled block each, so their ratios are for a block of 28
+and 52 KB (smaller than the 64 KiB a full block has, so a little worse than a full block would
+give). "Projected vs off" is (compressed block bytes + 16 bytes of row index per row) over (block
+bytes + the same index); the rule below allows 40%.
 
 Machine as above (Apple M5 Max), zstd 0.14.3 (C library 1.5.7), lz4_flex 0.14.0 (`safe-encode`,
 `safe-decode`, with `std` for the size-prefixed block functions; the 4-byte prefix is counted).
@@ -303,30 +304,37 @@ Machine as above (Apple M5 Max), zstd 0.14.3 (C library 1.5.7), lz4_flex 0.14.0 
 | zstd level 1 | no | 0.182 | 1203 | 2881 | 33.0% |
 | zstd level 3 | no | 0.178 | 1128 | 2893 | 32.6% |
 
-### recorded git graph: 33811 input bytes, 526 history rows, 1 blocks, 54811 block bytes (104.2 bytes per row)
+### recorded git graph: 32165 input bytes, 499 history rows, 1 blocks, 51988 block bytes (104.2 bytes per row)
 
 | candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
 |---|---|---|---|---|---|
-| lz4_flex block | yes | 0.389 | 1720 | 6294 | 47.1% |
-| zstd level 1 | no | 0.266 | 1177 | 2685 | 36.3% |
-| zstd level 3 | no | 0.257 | 837 | 2621 | 35.6% |
+| lz4_flex block | yes | 0.391 | 1537 | 5620 | 47.2% |
+| zstd level 1 | no | 0.267 | 1047 | 2466 | 36.5% |
+| zstd level 3 | no | 0.259 | 860 | 2442 | 35.8% |
+
+The git graph corpus was replaced after the choice (the first one quoted commit subjects naming
+other terminal applications) and measured in a later session, lz4_flex and ruzstd added back for
+the run only: medians of 3 runs. That session ran 10% to 30% slower on the unchanged corpora,
+whose ratios and projected sizes it reproduced exactly, so compare its speeds only with each other.
 
 `ruzstd` 0.8.2, the pure-Rust zstd, was measured in a first run and then dropped from the test:
 its encoder only implements the fastest level, `cargo deny` reports RUSTSEC-2026-0344 on it
 (fixed in 0.9.1, which needs a newer Rust than this crate's 1.85), and it misses the 40% rule on
 the git graph anyway. Its rows (ratio, compress MB/s, decompress MB/s, projected vs off): build log
 0.149 / 336 / 1012 / 31.1%, service log 0.206 / 271 / 782 / 26.9%, shell session 0.200 / 269 /
-768 / 32.4%, recorded cargo build 0.222 / 287 / 735 / 36.3%, recorded git graph 0.341 / 221 / 541 /
-42.9%.
+768 / 32.4%, recorded cargo build 0.222 / 287 / 735 / 36.3%, recorded git graph 0.344 / 206 / 506 /
+43.2%.
 
 ### Decision (spec 5.3 rule)
 
 1. At most 40% of off on every realistic corpus: **lz4_flex fails** (recorded cargo build 40.8%,
-   recorded git graph 47.1%); ruzstd fails (git graph 42.9%). **zstd level 1 and level 3 pass**
-   (worst case 36.3% and 35.6%, both on the git graph).
-2. Fastest decompression among those: level 3 is ahead by 0.4% to 4.6% on four corpora and behind by 2.4% on one (git graph), run to run spreads were about 2.5%, so it is a tie. Level 1
-   compresses 7% to 41% faster, and compression runs on the ingest path (spec 6.3), so the tie goes
-   to level 1; level 3 buys at most 0.7 points of projected size.
+   recorded git graph 47.2%); ruzstd fails (git graph 43.2%). **zstd level 1 and level 3 pass**
+   (worst case 36.5% and 35.8%, both on the git graph).
+2. Fastest decompression among those: level 3 is ahead by 0.4% to 4.6% on four corpora and behind by
+   1% on one (git graph; 2.4% on the first git graph corpus), run to run spreads were about 2.5%, so
+   it is a tie. Level 1 compresses 7% to 22% faster (41% on the first git graph corpus), and
+   compression runs on the ingest path (spec 6.3), so the tie goes to level 1; level 3 buys at most
+   0.7 points of projected size.
 3. Pure Rust within 20%: no pure-Rust candidate passes step 1, so it does not apply.
 
 **Chosen: `zstd`, level 1** (the `zstd` crate, which builds the C library; MIT or Apache-2.0).
@@ -335,7 +343,7 @@ licenses and sources ok; this repository has no `deny.toml` of its own, and with
 empty default every license is rejected, with or without the new crates).
 
 Projected compressed history against off (level 1, block bytes plus index): build log 28.2%, service
-log 21.5%, shell session 28.3%, recorded cargo build 33.0%, recorded git graph 36.3%. For a
+log 21.5%, shell session 28.3%, recorded cargo build 33.0%, recorded git graph 36.5%. For a
 1,000,000-row history at the measured bytes per row (68 to 183 for the generated corpora) that is
 68 to 183 MB of blocks plus 16 MB of index off, against 8 to 27 MB of blocks plus the same index
 compressed. The index (16 bytes per row) is uncompressed and caps the saving: at 68 bytes per row
@@ -459,7 +467,7 @@ Live bytes of a terminal (126x37) at 1,000,000 history lines with `Some(10_000)`
 ran, against the same content with compression off (`large_history_cost_table`, last table; each
 cell a fresh child process, jobs run after every 64 KiB of input). The recorded streams have a few
 hundred lines, so they are repeated to fill the history; a 64 KiB block holds about one copy, so
-the repetition helps little (phase 0 measured the single streams at 33.0% and 36.3% projected).
+the repetition helps little (phase 0 measured the single streams at 33.0% and 36.5% projected).
 
 | Corpus | Off MB | Compressed MB | Compressed / off | Gate |
 |---|---:|---:|---:|---|
@@ -467,10 +475,14 @@ the repetition helps little (phase 0 measured the single streams at 33.0% and 36
 | service log | 202.1 | 47.0 | 23.3% | pass |
 | shell session | 105.8 | 32.6 | 30.8% | pass |
 | recorded cargo build (repeated) | 91.8 | 25.8 | 28.1% | pass |
-| recorded git graph (repeated) | 122.7 | 44.3 | 36.1% | pass |
+| recorded git graph (repeated) | 122.7 | 43.2 | 35.2% | pass |
 | random log lines (`large_history.rs`) | 179.6 | 82.1 | 45.7% | pass (never above off) |
 
-Recorded, not gated: at 100,000 lines the same corpora take 37.5% to 51.1% of off (random 56.4%):
+The git graph corpus was replaced later (see "Compressor choice"); its rows here and below, and the
+100,000-line range, come from `large_history_cost_corpus_cell` run again for that corpus (and for
+the others at 100,000 lines); the rest are from the original session.
+
+Recorded, not gated: at 100,000 lines the same corpora take 37.5% to 50.8% of off (random 56.4%):
 the uncompressed 16-byte index entry per row and the fixed per-terminal overhead weigh more there.
 The read cache holds at most 4 decompressed blocks (256 KiB) and is empty after the jobs ran.
 
@@ -482,7 +494,7 @@ uncompressed size" when switching on), exact bytes at 1,000,000 lines:
 | build log | 103,141,157 | 103,017,695 (pass) | +131,222 B |
 | service log | 222,712,867 | 200,986,295 (pass) | +131,306 B |
 | recorded cargo build (repeated) | 108,072,949 | 108,078,845 (**+5,896 B**) | +131,292 B |
-| shell session, git graph, random | | pass (at most equal in MB) | +131,298 to +156,702 B |
+| shell session, git graph, random | | pass (at most equal in MB) | +131,238 to +156,702 B |
 
 A job copies its block under the lock (design 5.2), and the warm buffer an install replaces is
 kept as a spare (at most 2), so switching on goes about two blocks (128 KiB, 0.08%) above the

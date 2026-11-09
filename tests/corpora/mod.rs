@@ -321,9 +321,10 @@ pub fn shell_session(seed: u64, rows: usize) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// A recorded stream, redacted of absolute paths (`/work`): `"cargo-build"` (output of
-/// `cargo build --color=always`) or `"git-graph"` (`git log --graph --color=always`). Lines end
-/// in `\r\n`.
+/// A recorded stream: `"cargo-build"` (output of `cargo build --color=always`, redacted of
+/// absolute paths as `/work`) or `"git-graph"` (`git log --graph --color=always --oneline
+/// --no-decorate 026ea07` in this repository, without the subjects that name other terminal
+/// applications). Lines end in `\r\n`.
 pub fn recorded(name: &str) -> Vec<u8> {
     let raw: &[u8] = match name {
         "cargo-build" => include_bytes!("data/cargo-build.log"),
