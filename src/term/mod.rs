@@ -366,7 +366,9 @@ pub struct Config {
 
     /// Compress history blocks older than this many rows (`None`: never compress). Blocks change
     /// state only through history jobs (see [`Term::next_history_job`]); any value is accepted,
-    /// 0 included.
+    /// 0 included. [`Term::new`] and [`Term::set_options`] apply it to both grids; a grid put in
+    /// place otherwise (deserialized, or assigned through [`Term::grid_mut`]) has compression off
+    /// until the next `set_options`.
     ///
     /// feathercritty: not upstream.
     pub history_compression: Option<usize>,
@@ -394,7 +396,9 @@ enum HistoryGrid {
     /// screen is shown.
     Normal,
 
-    /// The alternate screen's grid. Its history limit is 0, so it never has jobs.
+    /// The alternate screen's grid. Its history limit is 0, so it has no jobs, unless a host
+    /// gives it a history through [`Term::grid_mut`] while it is shown
+    /// (`alternate_grid_jobs_follow_their_grid` in `src/grid/tests.rs`).
     Alternate,
 }
 
@@ -592,7 +596,8 @@ impl<T> Term<T> {
         }
 
         // feathercritty: history compression, on both grids (the alternate one has a history
-        // limit of 0, so it never has jobs). Only marks blocks for jobs.
+        // limit of 0, so it has no jobs unless a host gave it a history). Only marks blocks for
+        // jobs.
         let compression = self.config.history_compression;
         self.grid.set_history_compression(compression);
         self.inactive_grid.set_history_compression(compression);

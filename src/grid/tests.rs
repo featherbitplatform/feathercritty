@@ -1136,6 +1136,36 @@ mod compression {
         assert!(cold(&term) > 20);
     }
 
+    /// The alternate grid has a history limit of 0, so it has no jobs, unless a host gives it a
+    /// history through `grid_mut` while it is shown. Its jobs then belong to it wherever it sits:
+    /// leaving the alternate screen between taking and installing them does not misroute them.
+    #[test]
+    fn alternate_grid_jobs_follow_their_grid() {
+        let mut term = term(Some(50), 126, 40);
+        feed(&mut term, b"\x1b[?1049h");
+        term.grid_mut().update_history(5000);
+        feed(&mut term, &wrapping_lines(3000));
+        assert!(term.grid().history_size() > 1000);
+        let alt_cold = |term: &Term<VoidListener>| {
+            term.inactive_grid().history().cold_blocks().iter().filter(|&&cold| cold).count()
+        };
+
+        let jobs = term.next_history_jobs(4);
+        assert_eq!(jobs.len(), 4);
+        let normal = term.inactive_grid().history().len();
+        feed(&mut term, b"\x1b[?1049l");
+        assert_eq!(term.grid().history().len(), normal, "the normal grid is shown again");
+        assert!(term.inactive_grid().history().len() > 1000, "the alternate grid kept its rows");
+        for job in jobs {
+            assert!(term.install_history_job(job.run()));
+        }
+        assert_eq!(alt_cold(&term), 4);
+        assert_eq!(cold(&term), 0);
+        term.run_history_jobs();
+        assert!(alt_cold(&term) > 10, "{} cold blocks", alt_cold(&term));
+        assert!(!term.has_history_jobs());
+    }
+
     #[test]
     fn set_options_reaches_the_normal_grid_under_alt_screen() {
         let mut term = term(None, 126, 40);
