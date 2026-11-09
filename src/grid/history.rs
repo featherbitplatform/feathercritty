@@ -2799,7 +2799,9 @@ mod tests {
     }
 
     /// A cold read nested in another cold read's closure reads the right bytes, whether the
-    /// outer read hit the cache's newest block (a shared borrow) or not.
+    /// outer read decompressed its block (no borrow held while its closure runs) or read it in
+    /// place from the cache's newest entry under a shared borrow, so that the inner read of
+    /// another block cannot borrow the cache mutably and decompresses outside it.
     #[test]
     fn nested_cold_reads() {
         let mut history = varied(2000);
@@ -2809,12 +2811,26 @@ mod tests {
         let (a, b) = (history.index[0], history.index[1500]);
         assert_ne!(a.block, b.block);
         assert!(history.cold_blocks()[0]);
+        let at = |e: Entry| e.block.wrapping_sub(history.front_seq) as usize;
+        assert!(history.cold_blocks()[at(b)]);
         let bytes = |h: &History<usize>, e: Entry| h.with_record(e, <[u8]>::to_vec);
         let (wa, wb) = (bytes(&warm, a), bytes(&warm, b));
-        for _ in 0..2 {
-            let (ra, rb) = history.with_record(a, |ra| (ra.to_vec(), bytes(&history, b)));
-            assert_eq!((ra, rb), (wa.clone(), wb.clone()));
-        }
+        let last = |h: &History<usize>| h.cache.borrow().entries.last().map(|cached| cached.seq);
+
+        // The outer read decompresses `a`; the inner one caches `b` as the newest entry.
+        history.drop_read_cache();
+        let (ra, rb) = history.with_record(a, |ra| (ra.to_vec(), bytes(&history, b)));
+        assert_eq!((ra, rb), (wa.clone(), wb.clone()));
+        assert_eq!(last(&history), Some(b.block));
+
+        // `a` read once more is the newest entry, so the outer read is in place and the inner
+        // read of `b` takes the fallback: the cache is left as it was.
+        assert_eq!(bytes(&history, a), wa);
+        assert_eq!(last(&history), Some(a.block));
+        let cached = history.cached_blocks();
+        let (ra, rb) = history.with_record(a, |ra| (ra.to_vec(), bytes(&history, b)));
+        assert_eq!((ra, rb), (wa, wb));
+        assert_eq!((last(&history), history.cached_blocks()), (Some(a.block), cached));
         check_store(&history);
     }
 

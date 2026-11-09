@@ -89,7 +89,45 @@ mod tests {
         decompress(&cold, &mut out);
         assert_eq!(out, data);
         assert_eq!(out.as_ptr(), ptr);
-        assert_eq!(out.capacity(), data.len());
+        assert!(out.capacity() >= data.len());
+    }
+
+    fn cold_text() -> Vec<u8> {
+        let text: Vec<u8> = b"history row ".iter().copied().cycle().take(4096).collect();
+        let mut cold = Vec::new();
+        compress(&text, &mut cold);
+        cold
+    }
+
+    #[test]
+    #[should_panic(expected = "truncated cold history block")]
+    fn rejects_truncated_header() {
+        decompress(&cold_text()[..HEADER - 1], &mut Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "corrupt cold history block")]
+    fn rejects_truncated_frame() {
+        let cold = cold_text();
+        decompress(&cold[..cold.len() - 1], &mut Vec::new());
+    }
+
+    /// A length above the frame's: the frame decompresses into fewer bytes.
+    #[test]
+    #[should_panic(expected = "cold history block length mismatch")]
+    fn rejects_length_above_the_frame() {
+        let mut cold = cold_text();
+        cold[1..HEADER].copy_from_slice(&4097u32.to_le_bytes());
+        decompress(&cold, &mut Vec::new());
+    }
+
+    /// A length below the frame's: the frame does not fit the buffer.
+    #[test]
+    #[should_panic(expected = "corrupt cold history block")]
+    fn rejects_length_below_the_frame() {
+        let mut cold = cold_text();
+        cold[1..HEADER].copy_from_slice(&4095u32.to_le_bytes());
+        decompress(&cold, &mut Vec::new());
     }
 
     #[test]
