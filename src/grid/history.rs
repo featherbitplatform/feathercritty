@@ -108,10 +108,10 @@
 //!   released, which may free the block), a cold block's leaving zero, a new block making the
 //!   previous newest one eligible, the history leaving full, and a setting change (which finds the
 //!   oldest disagreeing block). So `has_jobs` is true only when a job exists, with one exception: a
-//!   marked block that stops disagreeing before its job is installed (installed, evicted, or the
-//!   oldest block of a full history again) leaves `scan` on it until the next `next_jobs` finds
-//!   nothing, which costs a host one empty wake when its worker did not drain the jobs. A job left
-//!   uninstalled is offered again.
+//!   marked block that stops disagreeing before its job is installed (for example installed,
+//!   evicted, the oldest block of a full history again, or the newest block again after rows are
+//!   popped) leaves `scan` on it until the next `next_jobs` finds nothing, which costs a host one
+//!   empty wake when its worker did not drain the jobs. A job left uninstalled is offered again.
 //! - **Batches.** [`History::next_jobs`] takes up to `max` such blocks at once, oldest first
 //!   (`next_job` is a batch of one); they are independent and install in any order. A worker that
 //!   installs one batch and takes the next in a single lock hold needs one hold per batch: with one
@@ -522,7 +522,7 @@ impl<T: HistoryCell> History<T> {
             .map(|at| self.front_seq.wrapping_add(at as u32));
     }
 
-    /// Free the decompressed blocks the read cache holds (at most [`CACHE_BLOCKS`]), for a host
+    /// Free the decompressed blocks the read cache holds (at most four), for a host
     /// that has finished a sweep of the history (a search, an export) and does not want them to
     /// stay resident until the next `clear`, lower limit or switch off. Reads afterwards
     /// decompress again. Does nothing when the cache is empty (always with compression off).

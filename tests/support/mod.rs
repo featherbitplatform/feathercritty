@@ -547,12 +547,11 @@ pub fn cold_history() -> Option<usize> {
     *COLD.get_or_init(|| {
         let value = std::env::var("DIFF_COLD").ok()?;
         let value = value.trim();
-        let rows = match value {
-            "" => return None,
-            _ => {
-                value.parse().unwrap_or_else(|_| panic!("DIFF_COLD must be a row count: {value:?}"))
-            },
-        };
+        if value.is_empty() {
+            return None;
+        }
+        let rows: usize =
+            value.parse().unwrap_or_else(|_| panic!("DIFF_COLD must be a row count: {value:?}"));
         (rows > 0).then_some(rows)
     })
 }
