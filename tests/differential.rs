@@ -7,13 +7,19 @@
 //! are driven, and how to move the oracle to a newer upstream release are documented in
 //! `tests/support/mod.rs`.
 //!
-//! Knobs: `DIFF_SEEDS` (seeds per pass, default 300), `DIFF_STEPS` (steps per random seed,
-//! default 400), `DIFF_SEED` (replay one seed), `DIFF_SEED_START` (first seed of every random
-//! pass, default 0; `ref_recordings` ignores it, its seeds name recordings), `DIFF_TINY`
-//! (feathercritty's history uses 256-byte blocks instead of 64 KiB ones, so block boundaries, spare
-//! blocks and oversized rows are crossed constantly, and its column reflow keeps a window of one
-//! dense row instead of `2 * lines + 2`). A failure prints the seed, the `DIFF_STEPS` (and
-//! `DIFF_TINY`) value the pass used and a minimized step list. Each pass prints coverage statistics
+//! Knobs: `DIFF_SEEDS` (seeds per pass, default 300), `DIFF_STEPS` (steps per random seed, default
+//! 400), `DIFF_SEED` (replay one seed), `DIFF_SEED_START` (first seed of every random pass, default
+//! 0; `ref_recordings` ignores it, its seeds name recordings), `DIFF_TINY` (feathercritty's history
+//! uses 256-byte blocks instead of 64 KiB ones, so block boundaries, spare blocks and oversized
+//! rows are crossed constantly, and its column reflow keeps a window of one dense row instead of
+//! `2 * lines + 2`), `DIFF_COLD=<n>` (feathercritty runs with `history_compression: Some(n)`, `0`
+//! meaning off as with `DIFF_TINY=0`, and after every step runs every history job, runs some and
+//! drops some results, or takes one and installs it only after the next step has been applied, so
+//! resizes, limit changes, `CSI 3 J`, RIS and evictions land in between and installs are refused;
+//! the choice comes from its own RNG seeded from the case (`fc::Jobs`), so the steps and the
+//! oracle's side are the same with and without it; `full_history` must install and refuse at
+//! least one job). A failure prints the seed, the `DIFF_STEPS` (and `DIFF_TINY`,
+//! `DIFF_COLD`) value the pass used and a minimized step list. Each pass prints coverage statistics
 //! (see them with `--nocapture`).
 //!
 //! Intended behavioral differences (README change list), modeled as described in
@@ -85,6 +91,7 @@ fn full_history() {
         seeds.len() < 5 || stats.reached_limit * 2 >= stats.cases,
         "too few cases reached their history limit: {stats}"
     );
+    support::assert_cold_coverage("full_history", seeds.len(), &stats);
 }
 
 fn realistic(test: &str, kind: Realistic) {

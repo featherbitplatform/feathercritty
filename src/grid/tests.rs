@@ -989,3 +989,246 @@ fn reflow_sink_matches_vec_for_any_window() {
         assert_eq!(history.limit(), limit);
     }
 }
+
+// feathercritty: history compression through `Term` (history compression design spec 5.2, 5.6).
+
+mod compression {
+    use rand::{Rng, SeedableRng};
+
+    use super::*;
+    use crate::event::VoidListener;
+    use crate::term::test::TermSize;
+    use crate::term::{Config, Term};
+    use crate::vte::ansi::Processor;
+
+    /// A term of `columns` x `lines` with a history of 5,000 rows on 2 KiB blocks (so a few
+    /// thousand rows make many blocks) and `compression`.
+    fn term(compression: Option<usize>, columns: usize, lines: usize) -> Term<VoidListener> {
+        let config = Config {
+            scrolling_history: 5000,
+            history_compression: compression,
+            ..Config::default()
+        };
+        let mut term = Term::new(config.clone(), &TermSize::new(columns, lines), VoidListener);
+        *term.grid_mut() = Grid::new_with_block_size(lines, columns, 5000, 2048);
+        // Applies the setting to the replaced grid.
+        term.set_options(config);
+        term
+    }
+
+    /// Colored lines of 1 to 300 characters, so many wrap at 100 and 126 columns.
+    fn wrapping_lines(rows: usize) -> Vec<u8> {
+        let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(0x5ca1e);
+        let mut out = Vec::new();
+        for n in 0..rows {
+            out.extend_from_slice(format!("\x1b[{}m{n:05} ", rng.gen_range(30..38)).as_bytes());
+            for _ in 0..rng.gen_range(1..300) {
+                if rng.gen_bool(0.05) {
+                    out.extend_from_slice(format!("\x1b[{}m", rng.gen_range(40..48)).as_bytes());
+                }
+                out.push(rng.gen_range(b'a'..=b'z'));
+            }
+            out.extend_from_slice(b"\x1b[0m\r\n");
+        }
+        out
+    }
+
+    fn feed(term: &mut Term<VoidListener>, bytes: &[u8]) {
+        let mut parser: Processor = Processor::new();
+        parser.advance(term, bytes);
+    }
+
+    fn cold(term: &Term<VoidListener>) -> usize {
+        term.grid().history().cold_blocks().iter().filter(|&&cold| cold).count()
+    }
+
+    fn assert_same(a: &Term<VoidListener>, b: &Term<VoidListener>, what: &str) {
+        assert_eq!(a.grid(), b.grid(), "grids differ {what}");
+        assert_eq!(a.grid().cursor.point, b.grid().cursor.point, "cursor differs {what}");
+        assert_eq!(a.grid().display_offset(), b.grid().display_offset());
+    }
+
+    #[test]
+    fn reflow_over_cold_history_matches_warm() {
+        let (mut compressed, mut warm) = (term(Some(50), 126, 40), term(None, 126, 40));
+        let bytes = wrapping_lines(3000);
+        feed(&mut compressed, &bytes);
+        feed(&mut warm, &bytes);
+        assert!(compressed.has_history_jobs());
+        compressed.run_history_jobs();
+        assert!(!compressed.has_history_jobs());
+        assert!(cold(&compressed) > 20, "{} cold blocks", cold(&compressed));
+        assert_same(&compressed, &warm, "before resizing");
+
+        for (columns, lines, reflow) in [(100, 40, true), (126, 40, true), (126, 25, false)] {
+            let what = format!("after resizing to {columns}x{lines}");
+            compressed.resize(TermSize::new(columns, lines));
+            warm.resize(TermSize::new(columns, lines));
+            if reflow {
+                // A column reflow builds the new history warm and leaves its blocks for jobs.
+                assert_eq!(cold(&compressed), 0, "compressed inline {what}");
+                assert!(compressed.has_history_jobs(), "no jobs {what}");
+            }
+            assert_same(&compressed, &warm, &what);
+            compressed.run_history_jobs();
+            assert!(cold(&compressed) > 20, "{} cold blocks {what}", cold(&compressed));
+            assert_same(&compressed, &warm, &format!("{what}, jobs run"));
+        }
+    }
+
+    #[test]
+    fn job_from_before_reflow_is_refused() {
+        // Below the limit, so the pushes of the lines-only resize below evict nothing.
+        let mut term = term(Some(50), 126, 40);
+        feed(&mut term, &wrapping_lines(1000));
+        assert!(term.grid().history_size() < 4000);
+        let job = term.next_history_job().expect("a block to compress");
+        term.resize(TermSize::new(100, 40));
+        assert!(!term.install_history_job(job.run()));
+
+        // A lines-only resize keeps the history: a job taken before it is still current.
+        let job = term.next_history_job().expect("a block to compress");
+        term.resize(TermSize::new(100, 30));
+        assert!(term.install_history_job(job.run()));
+    }
+
+    /// A worker can take a batch of jobs in one lock hold and install them in one more; the
+    /// terminal ends up as with `run_history_jobs`.
+    #[test]
+    fn history_jobs_in_batches() {
+        let mut reference = term(Some(50), 126, 40);
+        let mut term = term(Some(50), 126, 40);
+        feed(&mut term, &wrapping_lines(3000));
+        feed(&mut reference, &wrapping_lines(3000));
+        assert!(term.next_history_jobs(0).is_empty());
+        let mut batches = 0;
+        loop {
+            let jobs = term.next_history_jobs(8);
+            if jobs.is_empty() {
+                break;
+            }
+            assert!(jobs.len() <= 8);
+            let done: Vec<_> = jobs.into_iter().map(crate::term::HistoryJob::run).collect();
+            for done in done {
+                assert!(term.install_history_job(done));
+            }
+            batches += 1;
+        }
+        reference.run_history_jobs();
+        assert!(batches > 2);
+        assert!(!term.has_history_jobs());
+        assert_eq!(cold(&term), cold(&reference));
+        assert!(cold(&term) > 20);
+    }
+
+    /// A job belongs to the normal grid wherever it sits: switching to the alternate screen
+    /// between taking and installing it does not misroute it.
+    #[test]
+    fn job_survives_alt_screen_switch() {
+        let mut term = term(Some(50), 126, 40);
+        feed(&mut term, &wrapping_lines(3000));
+        let job = term.next_history_job().expect("a block to compress");
+        feed(&mut term, b"\x1b[?1049h");
+        assert!(term.install_history_job(job.run()));
+        term.run_history_jobs();
+        feed(&mut term, b"\x1b[?1049l");
+        assert!(!term.has_history_jobs());
+        assert!(cold(&term) > 20);
+    }
+
+    /// The alternate grid has a history limit of 0, so it has no jobs, unless a host gives it a
+    /// history through `grid_mut` while it is shown. Its jobs then belong to it wherever it sits:
+    /// leaving the alternate screen between taking and installing them does not misroute them.
+    #[test]
+    fn alternate_grid_jobs_follow_their_grid() {
+        let mut term = term(Some(50), 126, 40);
+        feed(&mut term, b"\x1b[?1049h");
+        term.grid_mut().update_history(5000);
+        feed(&mut term, &wrapping_lines(3000));
+        assert!(term.grid().history_size() > 1000);
+        let alt_cold = |term: &Term<VoidListener>| {
+            term.inactive_grid().history().cold_blocks().iter().filter(|&&cold| cold).count()
+        };
+
+        let jobs = term.next_history_jobs(4);
+        assert_eq!(jobs.len(), 4);
+        let normal = term.inactive_grid().history().len();
+        feed(&mut term, b"\x1b[?1049l");
+        assert_eq!(term.grid().history().len(), normal, "the normal grid is shown again");
+        assert!(term.inactive_grid().history().len() > 1000, "the alternate grid kept its rows");
+        for job in jobs {
+            assert!(term.install_history_job(job.run()));
+        }
+        assert_eq!(alt_cold(&term), 4);
+        assert_eq!(cold(&term), 0);
+        term.run_history_jobs();
+        assert!(alt_cold(&term) > 10, "{} cold blocks", alt_cold(&term));
+        assert!(!term.has_history_jobs());
+    }
+
+    #[test]
+    fn set_options_reaches_the_normal_grid_under_alt_screen() {
+        let mut term = term(None, 126, 40);
+        feed(&mut term, &wrapping_lines(3000));
+        feed(&mut term, b"\x1b[?1049h");
+        let config =
+            Config { scrolling_history: 5000, history_compression: Some(50), ..Config::default() };
+        term.set_options(config);
+        feed(&mut term, b"\x1b[?1049l");
+        assert!(term.has_history_jobs());
+        assert_eq!(cold(&term), 0);
+        term.run_history_jobs();
+        assert!(cold(&term) > 20, "{} cold blocks", cold(&term));
+        assert!(!term.has_history_jobs());
+    }
+
+    /// A host drops the read cache after a sweep of the history (search, export): the
+    /// decompressed blocks go, and the terminal reads the same afterwards.
+    #[test]
+    fn drop_history_cache_after_a_sweep() {
+        let (mut compressed, mut warm) = (term(Some(50), 126, 40), term(None, 126, 40));
+        let bytes = wrapping_lines(3000);
+        feed(&mut compressed, &bytes);
+        feed(&mut warm, &bytes);
+        compressed.drop_history_cache();
+        compressed.run_history_jobs();
+        assert!(cold(&compressed) > 20);
+
+        assert_same(&compressed, &warm, "after the sweep");
+        assert!(compressed.grid().history().cached_blocks() > 0);
+        compressed.drop_history_cache();
+        assert_eq!(compressed.grid().history().cached_blocks(), 0);
+        assert_same(&compressed, &warm, "after dropping the cache");
+        warm.drop_history_cache();
+    }
+
+    /// fbterm's worker moves jobs and results across threads; `Term` stays `Send`.
+    #[test]
+    fn term_and_history_jobs_are_send() {
+        fn send<S: Send>() {}
+        send::<Term<VoidListener>>();
+        send::<crate::term::HistoryJob>();
+        send::<crate::term::HistoryDone>();
+    }
+
+    #[test]
+    fn default_config_never_has_jobs() {
+        assert_eq!(Config::default().history_compression, None);
+        let mut term = term(None, 126, 40);
+        let no_jobs = |term: &mut Term<VoidListener>| {
+            assert!(!term.has_history_jobs());
+            assert!(term.next_history_job().is_none());
+            assert_eq!(cold(term), 0);
+        };
+        feed(&mut term, &wrapping_lines(3000));
+        no_jobs(&mut term);
+        term.resize(TermSize::new(100, 25));
+        no_jobs(&mut term);
+        feed(&mut term, b"\x1b[?1049h");
+        feed(&mut term, &wrapping_lines(100));
+        no_jobs(&mut term);
+        feed(&mut term, b"\x1b[?1049l");
+        term.run_history_jobs();
+        no_jobs(&mut term);
+    }
+}

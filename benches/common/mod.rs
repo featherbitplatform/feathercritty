@@ -544,3 +544,156 @@ pub fn table_row_abs(label: &str, ac: Stats, fc: Stats, max_ms: f64) -> bool {
     );
     ok
 }
+
+// -- history compression (feathercritty, README change 9) -------------------------------------
+
+/// Rows kept warm in the compression benchmarks: the value of the memory gate (history
+/// compression design spec 6.3).
+pub const KEEP_WARM: usize = 10_000;
+
+/// History size of the compression benchmarks (spec 6.4: "at a 1,000,000-line history").
+pub const BIG_HISTORY: usize = 1_000_000;
+
+/// A feathercritty terminal with `history` rows of history and `history_compression` set to
+/// `keep_warm`.
+pub fn fc_sim(columns: usize, lines: usize, history: usize, keep_warm: Option<usize>) -> fc::Sim {
+    let mut sim = fc::Sim::new(columns, lines, history);
+    sim.term.set_options(feathercritty::term::Config {
+        scrolling_history: history,
+        history_compression: keep_warm,
+        ..feathercritty::term::Config::default()
+    });
+    sim
+}
+
+/// Input that fills a `BIG_HISTORY`-row history at `columns` columns with log lines.
+pub fn big_prefill(columns: usize) -> Vec<u8> {
+    workload_lines(Workload::LogLines95, BIG_HISTORY + 40, 1, columns, 37)
+}
+
+/// Percentile `p` (0..=100) of `values` (sorted in place); 0 for none.
+pub fn percentile(values: &mut [f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
+    let rank = ((p / 100.0) * (values.len() - 1) as f64).round() as usize;
+    values[rank]
+}
+
+/// A history worker on its own thread, as fbterm runs one (history compression design spec
+/// 5.4): woken after a feed that left jobs, it takes a batch of up to [`worker::BATCH`] jobs
+/// under the terminal's lock (`Term::next_history_jobs`), runs them unlocked, then installs
+/// them and takes the next batch in one more lock hold, until no job is left. It records how
+/// long each of its lock holds lasted.
+pub mod worker {
+    use std::sync::Arc;
+    use std::sync::mpsc::{self, Receiver, Sender};
+    use std::thread::{self, JoinHandle};
+    use std::time::Instant;
+
+    use parking_lot::Mutex;
+
+    use super::fc::Sim;
+
+    /// Jobs per lock hold. Copying a 64 KiB block takes a few microseconds, so a batch stays
+    /// far below the 0.1 ms hold budget, and one hold per batch lets the worker keep up with a
+    /// parser that holds the lock almost all the time (one job per hold does not).
+    pub const BATCH: usize = 8;
+
+    /// What a worker did, in milliseconds.
+    #[derive(Default)]
+    pub struct Report {
+        /// Each lock hold: installing the last batch (if any) and taking the next, the copies
+        /// of the blocks included; the last hold of a round finds no job.
+        pub holds: Vec<f64>,
+        /// Time spent running jobs, outside the lock.
+        pub run_ms: f64,
+        pub jobs: usize,
+        pub refused: usize,
+    }
+
+    pub struct Worker {
+        wake: Sender<bool>,
+        handle: JoinHandle<Report>,
+    }
+
+    fn ms(since: Instant) -> f64 {
+        since.elapsed().as_secs_f64() * 1000.0
+    }
+
+    /// Run every job there is, recording into `report`.
+    pub fn drain(sim: &Mutex<Sim>, report: &mut Report) {
+        let mut done = Vec::new();
+        loop {
+            let jobs = {
+                let mut term = sim.lock();
+                let held = Instant::now();
+                for done in done.drain(..) {
+                    report.refused += usize::from(!term.term.install_history_job(done));
+                }
+                let jobs = term.term.next_history_jobs(BATCH);
+                report.holds.push(ms(held));
+                jobs
+            };
+            if jobs.is_empty() {
+                return;
+            }
+            let started = Instant::now();
+            report.jobs += jobs.len();
+            done.extend(jobs.into_iter().map(|job| job.run()));
+            report.run_ms += ms(started);
+        }
+    }
+
+    fn work(sim: Arc<Mutex<Sim>>, wake: Receiver<bool>) -> Report {
+        let mut report = Report::default();
+        while let Ok(mut go) = wake.recv() {
+            // Coalesce the wakes queued meanwhile; `false` asks to stop after this round.
+            while let Ok(more) = wake.try_recv() {
+                go &= more;
+            }
+            drain(&sim, &mut report);
+            if !go {
+                break;
+            }
+        }
+        report
+    }
+
+    impl Worker {
+        pub fn start(sim: Arc<Mutex<Sim>>) -> Self {
+            let (wake, rx) = mpsc::channel();
+            let handle = thread::Builder::new()
+                .name("history-worker".into())
+                .spawn(move || work(sim, rx))
+                .expect("spawn the history worker");
+            Worker { wake, handle }
+        }
+
+        /// A feed left jobs (fbterm's session enqueues its terminal).
+        pub fn wake(&self) {
+            let _ = self.wake.send(true);
+        }
+
+        /// Finish the jobs there are, stop, and report.
+        pub fn stop(self) -> Report {
+            let _ = self.wake.send(false);
+            self.handle.join().expect("history worker panicked")
+        }
+    }
+
+    /// Feed `bytes` in `chunk`-sized pieces the way fbterm's session does: lock, parse a piece,
+    /// check for jobs, unlock, wake the worker when there are jobs.
+    pub fn feed(sim: &Mutex<Sim>, worker: &Worker, bytes: &[u8], chunk: usize) {
+        for piece in bytes.chunks(chunk) {
+            let mut term = sim.lock();
+            term.feed(piece, piece.len());
+            let jobs = term.term.has_history_jobs();
+            drop(term);
+            if jobs {
+                worker.wake();
+            }
+        }
+    }
+}

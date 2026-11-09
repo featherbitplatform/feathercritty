@@ -41,6 +41,29 @@ pub fn new_term(
     k::term::Term::new(config, size, k::event::VoidListener)
 }
 
+/// The configuration of a new terminal and of `Step::SetHistory` (`DIFF_COLD` concerns
+/// feathercritty only).
+pub fn config(scrolling_history: usize, kitty_keyboard: bool) -> k::term::Config {
+    k::term::Config { scrolling_history, kitty_keyboard, ..k::term::Config::default() }
+}
+
+/// 0.26.0 has no history jobs: `fc::Jobs`'s counterpart does nothing. Not a unit struct, so
+/// `term_impl.rs` builds both with `Jobs::default()`.
+#[derive(Debug, Default)]
+pub struct Jobs(());
+
+impl Jobs {
+    pub fn new(_start: &super::Start) -> Self {
+        Self::default()
+    }
+
+    pub fn after_step(&mut self, _term: &mut k::term::Term<k::event::VoidListener>) {}
+
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (0, 0, 0)
+    }
+}
+
 /// See `cell_at`.
 pub fn row_at(
     grid: &k::grid::Grid<k::term::cell::Cell>,

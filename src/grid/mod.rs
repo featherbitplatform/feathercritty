@@ -9,6 +9,7 @@ use crate::index::{Column, Line, Point};
 use crate::term::cell::{Cell, Flags, ResetDiscriminant};
 use crate::vte::ansi::{CharsetIndex, StandardCharset};
 
+mod cold;
 mod compact;
 mod history;
 pub mod resize;
@@ -19,9 +20,11 @@ mod tests;
 
 // feathercritty: the history and its read API (see `history.rs`), and the trait for cells it
 // stores, next to their row codec (see `compact.rs`).
+#[cfg(feature = "test-hooks")]
+pub use self::cold::{cold_frame_for_test, decompress_cold_for_test};
 pub(crate) use self::compact::PlainText;
 pub use self::compact::{HistoryCell, ReflowInfo};
-pub use self::history::{History, RowReader};
+pub use self::history::{Done, History, Job, RowReader};
 pub use self::row::Row;
 use self::storage::Storage;
 
@@ -157,6 +160,11 @@ pub struct Grid<T: HistoryCell> {
     /// positions stable while output scrolls).
     scrolled_lines: i64,
 
+    /// Bumped whenever the history is replaced by a rebuilt one (a column reflow,
+    /// `initialize_all`), so history jobs taken before are refused (feathercritty, see
+    /// `Term::install_history_job`).
+    history_epoch: u64,
+
     /// Rows the column reflow keeps dense, when a test sets it (feathercritty: a test hook, see
     /// `set_reflow_window`; `None` is the default window of `resize.rs`).
     #[cfg(any(test, feature = "test-hooks"))]
@@ -242,6 +250,7 @@ impl<T: HistoryCell> Grid<T> {
             lines,
             columns,
             scrolled_lines: 0,
+            history_epoch: 0,
             #[cfg(any(test, feature = "test-hooks"))]
             reflow_window: None,
             #[cfg(any(test, feature = "test-hooks"))]
@@ -274,6 +283,13 @@ impl<T: HistoryCell> Grid<T> {
     /// the screen grows or shrinks. Can be negative (a grow pulled lines back from history).
     pub fn scrolled_lines(&self) -> i64 {
         self.scrolled_lines
+    }
+
+    /// Keep the `keep_warm` newest history rows uncompressed and compress older blocks through
+    /// history jobs; `None` never compresses (feathercritty, see "Cold blocks" in `history.rs`
+    /// and `Term::next_history_job`). Only marks blocks: nothing is compressed here.
+    pub fn set_history_compression(&mut self, keep_warm: Option<usize>) {
+        self.history.set_compression(keep_warm);
     }
 
     /// Update the size of the scrollback history.
@@ -583,8 +599,7 @@ impl<T: HistoryCell> Grid<T> {
         // history until it reached `max_scroll_limit`; the history is rebuilt with them first.
         let missing = self.history.limit() - self.history_size();
         if missing != 0 {
-            let mut history =
-                History::with_block_size(self.history.limit(), self.history.block_bytes());
+            let mut history = self.history.sibling(self.history.limit());
             let blank = Row::new(self.columns);
             for _ in 0..missing {
                 history.push_newest(&blank);
@@ -594,6 +609,7 @@ impl<T: HistoryCell> Grid<T> {
                 history.push_newest(&row);
             }
             self.history = history;
+            self.history_epoch += 1;
         }
     }
 
@@ -670,6 +686,33 @@ impl<T: HistoryCell> Grid<T> {
     #[inline]
     pub(crate) fn history(&self) -> &History<T> {
         &self.history
+    }
+
+    /// The rows above the screen, for history jobs (feathercritty: `Term`'s job API).
+    #[inline]
+    pub(crate) fn history_mut(&mut self) -> &mut History<T> {
+        &mut self.history
+    }
+
+    /// Bumped whenever the history is replaced by a rebuilt one (feathercritty: jobs taken from
+    /// the old history carry the old value).
+    #[inline]
+    pub(crate) fn history_epoch(&self) -> u64 {
+        self.history_epoch
+    }
+
+    /// The history's blocks as bytes, oldest first (test hook, see
+    /// `History::block_bytes_for_test`).
+    #[cfg(feature = "test-hooks")]
+    pub fn history_blocks_for_test(&self) -> Vec<&[u8]> {
+        self.history.block_bytes_for_test()
+    }
+
+    /// Whether each history block, oldest first, is compressed (test hook, see
+    /// `History::cold_blocks`).
+    #[cfg(feature = "test-hooks")]
+    pub fn cold_blocks_for_test(&self) -> Vec<bool> {
+        self.history.cold_blocks()
     }
 
     /// Change history row `line` (`line < 0`) (feathercritty: the one history write, see
@@ -751,16 +794,20 @@ impl<T: HistoryCell> Grid<T> {
 }
 
 impl Grid<Cell> {
-    /// History line `line` as plain text read straight from its record, without decoding its
-    /// cells (feathercritty: the text fast path; see `compact::plain_text` for which rows
+    /// `f` of history line `line` as plain text read straight from its record, without decoding
+    /// its cells (feathercritty: the text fast path; see `compact::plain_text` for which rows
     /// qualify). `None` for a screen line, a line outside the grid, or a row that does not
     /// qualify; read those through [`RowReader`].
     #[inline]
-    pub(crate) fn history_plain_text(&self, line: Line) -> Option<PlainText<'_>> {
+    pub(crate) fn history_plain_text<R>(
+        &self,
+        line: Line,
+        f: impl FnOnce(PlainText<'_>) -> R,
+    ) -> Option<R> {
         if line.0 >= 0 || line < self.topmost_line() {
             return None;
         }
-        self.history.plain_text((-line.0 - 1) as usize)
+        self.history.plain_text((-line.0 - 1) as usize, f)
     }
 }
 
@@ -897,6 +944,7 @@ mod serde_proxy {
                 lines,
                 display_offset,
                 scrolled_lines: 0,
+                history_epoch: 0,
                 #[cfg(any(test, feature = "test-hooks"))]
                 reflow_window: None,
                 #[cfg(any(test, feature = "test-hooks"))]

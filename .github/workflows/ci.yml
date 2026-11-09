@@ -47,6 +47,18 @@ jobs:
         run: cargo test --locked --release --test differential
         env:
           DIFF_TINY: 1
+      # The differential test in release with history compression on feathercritty's side and
+      # history jobs run, dropped or held across the next step (DIFF_COLD, see
+      # tests/differential.rs): tiny blocks with one warm row, then 64 KiB blocks with 37.
+      - name: differential test, cold history and tiny blocks (release)
+        run: cargo test --locked --release --test differential
+        env:
+          DIFF_COLD: 1
+          DIFF_TINY: 1
+      - name: differential test, cold history (release)
+        run: cargo test --locked --release --test differential
+        env:
+          DIFF_COLD: 37
       # Large histories (tests/large_history.rs, all #[ignore]). The 100,000-line comparison
       # against 0.26.0 holds two full snapshots (peak RSS measured at 3.9 GB), which fits the
       # Linux and macOS runners; Windows runs neither. large_history_cost_table is manual.
@@ -55,3 +67,5 @@ jobs:
         run: >-
           cargo test --locked --release --test large_history -- --ignored --exact
           large_history_matches_oracle_at_100k large_history_invariants_at_1m
+          large_history_matches_oracle_at_100k_compressed
+          large_history_invariants_at_1m_compressed

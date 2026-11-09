@@ -30,6 +30,14 @@
 //! Peak memory is the old compact store plus the new one plus the window; nothing dense of
 //! history size is allocated, and nothing of the pass stays resident after it.
 //!
+//! - **Cold blocks** (history compression design spec 5.6): the new history is built warm, with
+//!   compression off (`History::sibling_warm`), so the pass does no per-row warm-row accounting;
+//!   `replace_rows` then applies the old setting, which counts the warm rows once and marks the
+//!   blocks for jobs, which run after the resize like any others. Nothing is compressed inline. The
+//!   old history's cold blocks are read through its read cache as `RowSource` pops them (byte copy
+//!   included) and freed as their last row leaves. The new history has a new identity and the
+//!   grid's `history_epoch` is bumped, so jobs taken before the pass are refused.
+//!
 //! When merging upstream: if upstream's reflow starts using another `Vec` operation on these
 //! containers (indexing a row other than the newest, `insert`, `retain`, ...), add it to the
 //! sink with the same meaning, decoding rows back when they already left the window, and extend
@@ -408,10 +416,10 @@ impl<T: HistoryCell> ReflowSink<T> {
 
 impl<T: HistoryCell> Grid<T> {
     /// Move the history out for a reflow (feathercritty), leaving an empty one with the same
-    /// limit and block size, so `history.limit()` and `Dimensions` keep working during the pass.
-    /// Allocates nothing.
+    /// limit, block size and compression (`History::sibling`), so `history.limit()` and
+    /// `Dimensions` keep working during the pass. Allocates nothing.
     fn take_history(&mut self) -> History<T> {
-        let empty = History::with_block_size(self.history.limit(), self.history.block_bytes());
+        let empty = self.history.sibling(self.history.limit());
         mem::replace(&mut self.history, empty)
     }
 
@@ -424,11 +432,7 @@ impl<T: HistoryCell> Grid<T> {
 
         let limit = self.history.limit() + self.lines;
         #[allow(unused_mut)]
-        let mut sink = ReflowSink::new(
-            window,
-            grow_to,
-            History::with_block_size(limit, self.history.block_bytes()),
-        );
+        let mut sink = ReflowSink::new(window, grow_to, self.history.sibling_warm(limit));
         #[cfg(any(test, feature = "test-hooks"))]
         {
             sink.byte_copy = self.reflow_byte_copy;
@@ -440,8 +444,11 @@ impl<T: HistoryCell> Grid<T> {
     /// `self.raw.replace_inner`).
     fn replace_rows(&mut self, rows: ReflowSink<T>) {
         let (screen, history) = rows.finish(self.lines, self.history.limit());
+        let compression = self.history.compression();
         self.screen.raw = screen;
         self.history = history;
+        self.history.set_compression(compression);
+        self.history_epoch += 1;
         debug_assert_eq!(self.screen.raw.len(), self.lines);
     }
 }

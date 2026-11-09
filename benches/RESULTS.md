@@ -254,6 +254,349 @@ took 31.4 ms (126->100) and 37.0 ms (100->126) in the fork against 26.0 and 18.1
 the trim to 10,000 lines 0.5 ms against 30.4 ms. The first measurement of this table (before
 the byte copy) had 100,000-line rewraps of 44 to 69 ms.
 
+## Compressor choice (history compression, phase 0)
+
+Which compressor and level the cold-block compression of the design (spec 5.3, 6.3) uses.
+Command: `cargo test --release --test compress_choice -- --ignored --nocapture` (about 4 s). Each
+corpus (`tests/corpora/`) goes through `Processor::advance` into a 126-column terminal with a
+1,000,000-line history; every 64 KiB history block (partly filled ones included) is compressed and
+decompressed on its own, best of 3 passes, and checked to round trip. The three generated corpora
+have 300,000 rows (seeds 1, 2 and 3); the two recorded streams (a `cargo build` log of this
+workspace, 417 lines, redacted to `/work`, and `git log --graph --oneline --no-decorate` of this
+repository up to `026ea07`, without authors and without the 27 subjects that name other terminal
+applications, 535 lines) fit in one partly filled block each, so their ratios are for a block of 28
+and 52 KB (smaller than the 64 KiB a full block has, so a little worse than a full block would
+give). "Projected vs off" is (compressed block bytes + 16 bytes of row index per row) over (block
+bytes + the same index); the rule below allows 40%.
+
+Machine as above (Apple M5 Max), zstd 0.14.3 (C library 1.5.7), lz4_flex 0.14.0 (`safe-encode`,
+`safe-decode`, with `std` for the size-prefixed block functions; the 4-byte prefix is counted).
+
+### build log: 14182801 input bytes, 299965 history rows, 313 blocks, 20494665 block bytes (68.3 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.178 | 1944 | 6001 | 33.4% |
+| zstd level 1 | no | 0.114 | 1473 | 3675 | 28.2% |
+| zstd level 3 | no | 0.111 | 1373 | 3700 | 28.0% |
+
+### service log: 36075261 input bytes, 299964 history rows, 840 blocks, 54968639 block bytes (183.3 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.248 | 1450 | 4552 | 30.8% |
+| zstd level 1 | no | 0.146 | 1295 | 2942 | 21.5% |
+| zstd level 3 | no | 0.143 | 1156 | 2998 | 21.2% |
+
+### shell session: 18059993 input bytes, 299984 history rows, 400 blocks, 26172485 block bytes (87.2 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.253 | 1384 | 4757 | 36.9% |
+| zstd level 1 | no | 0.152 | 1210 | 2709 | 28.3% |
+| zstd level 3 | no | 0.152 | 1046 | 2834 | 28.3% |
+
+### recorded cargo build: 19481 input bytes, 385 history rows, 1 blocks, 27967 block bytes (72.6 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.278 | 2245 | 8949 | 40.8% |
+| zstd level 1 | no | 0.182 | 1203 | 2881 | 33.0% |
+| zstd level 3 | no | 0.178 | 1128 | 2893 | 32.6% |
+
+### recorded git graph: 32165 input bytes, 499 history rows, 1 blocks, 51988 block bytes (104.2 bytes per row)
+
+| candidate | pure Rust | ratio | compress MB/s | decompress MB/s | projected vs off |
+|---|---|---|---|---|---|
+| lz4_flex block | yes | 0.391 | 1537 | 5620 | 47.2% |
+| zstd level 1 | no | 0.267 | 1047 | 2466 | 36.5% |
+| zstd level 3 | no | 0.259 | 860 | 2442 | 35.8% |
+
+The git graph corpus was replaced after the choice (the first one quoted commit subjects naming
+other terminal applications) and measured in a later session, lz4_flex and ruzstd added back for
+the run only: medians of 3 runs. That session ran 10% to 30% slower on the unchanged corpora,
+whose ratios and projected sizes it reproduced exactly, so compare its speeds only with each other.
+
+`ruzstd` 0.8.2, the pure-Rust zstd, was measured in a first run and then dropped from the test:
+its encoder only implements the fastest level, `cargo deny` reports RUSTSEC-2026-0344 on it
+(fixed in 0.9.1, which needs a newer Rust than this crate's 1.85), and it misses the 40% rule on
+the git graph anyway. Its rows (ratio, compress MB/s, decompress MB/s, projected vs off): build log
+0.149 / 336 / 1012 / 31.1%, service log 0.206 / 271 / 782 / 26.9%, shell session 0.200 / 269 /
+768 / 32.4%, recorded cargo build 0.222 / 287 / 735 / 36.3%, recorded git graph 0.344 / 206 / 506 /
+43.2%.
+
+### Decision (spec 5.3 rule)
+
+1. At most 40% of off on every realistic corpus: **lz4_flex fails** (recorded cargo build 40.8%,
+   recorded git graph 47.2%); ruzstd fails (git graph 43.2%). **zstd level 1 and level 3 pass**
+   (worst case 36.5% and 35.8%, both on the git graph).
+2. Fastest decompression among those: level 3 is ahead by 0.4% to 4.6% on four corpora and behind by
+   1% on one (git graph; 2.4% on the first git graph corpus), run to run spreads were about 2.5%, so
+   it is a tie. Level 1 compresses 7% to 22% faster (41% on the first git graph corpus), and
+   compression runs on the ingest path (spec 6.3), so the tie goes to level 1; level 3 buys at most
+   0.7 points of projected size.
+3. Pure Rust within 20%: no pure-Rust candidate passes step 1, so it does not apply.
+
+**Chosen: `zstd`, level 1** (the `zstd` crate, which builds the C library; MIT or Apache-2.0).
+`cargo deny check` passes with it under the terminal repository's `deny.toml` (advisories, bans,
+licenses and sources ok; this repository has no `deny.toml` of its own, and with cargo-deny's
+empty default every license is rejected, with or without the new crates).
+
+Projected compressed history against off (level 1, block bytes plus index): build log 28.2%, service
+log 21.5%, shell session 28.3%, recorded cargo build 33.0%, recorded git graph 36.5%. For a
+1,000,000-row history at the measured bytes per row (68 to 183 for the generated corpora) that is
+68 to 183 MB of blocks plus 16 MB of index off, against 8 to 27 MB of blocks plus the same index
+compressed. The index (16 bytes per row) is uncompressed and caps the saving: at 68 bytes per row
+it is 19% of off.
+
+## History compression (README change 9)
+
+The gates of the history compression design (its sections 6.2, 6.3 and 6.4, library rows) for
+`0.26.0+fbterm.7`. The fbterm rows of 6.4 (draw-list build, fbterm search and export, scenario I)
+are measured in the terminal repository.
+
+- Date: 2026-11-08. Machine as above (Apple M5 Max), rustc 1.99.1, release profile.
+- Every gate is a median of at least 5 runs (31 interleaved rounds for "off means off"); spreads
+  are (max - min) / median.
+
+Commands:
+
+```
+cargo bench --bench ingest -- --gate     # last section: compression on, worker, lock holds, flood
+cargo bench --bench reads -- --gate      # last section: 1,000,000-line reads, reflow, switching
+cargo test --release --test large_history -- --ignored --nocapture --exact large_history_cost_table
+cargo run --release --example memory -- --gate
+cargo test --release --test alloc
+```
+
+plus the harness of "Off means off" below, which is not part of the repository.
+
+### Off means off (design 6.2)
+
+**Method.** Compression off (`history_compression: None`, the default) against the fork's `main`
+before this work (`026ea07`), in one binary, the way `benches/ingest.rs` compares with 0.26.0: a
+scratch crate depends on this branch and on a worktree of `026ea07` whose package is renamed
+(`feathercritty_main`, dependency key `alacritty_terminal`), includes `benches/common/mod.rs`, and
+runs every ingest workload at both sizes plus the warm reads (regex search, `selection_to_string`
+over 1,000 rows, every history row through `RowReader` ten times, the two reflows). Every row runs
+31 interleaved rounds of main, branch, main again, and passes within `max(1%, A/A spread)` (the
+noise rule of the 1% rows above, applied to every row). It is built with fbterm's release profile
+(`lto = "thin"`, `codegen-units = 1`): with the default profile, codegen-unit partitioning moved
+whole functions between runs of unchanged source (`decode_cell_row` took 15% more samples on the
+branch with its source identical).
+
+**What was found and fixed** (first measurements, before the fixes):
+
+| Row | Before | Cause | Fix |
+|---|---|---|---|
+| every history row through `RowReader` | 1.035 to 1.047 | reads returned an enum carrying an `Arc` for cold records; its drop and `Deref` cost every warm read | records reach their reader through a closure (`with_record`); the warm path is a borrow and one `cold` check |
+| reflow 126->100->126 (byte copy) | 1.12 to 1.13 | every stored record's index entry parsed the record header again for its two header bits | entries take the bits from the encoder's returned header, or from the entry a record is copied from |
+| same, after that | 1.05 | `release` carried the generation and cold-block bookkeeping inline | the rare branches (a truncated last record, an emptied block) moved to `#[cold]` functions |
+
+**Result**, three sessions (ratio branch / main). Session 1: before the `release` split; session
+2: the final code except the cold-read and reflow changes of the compression section below (they
+do not touch these paths); session 3: the final code.
+
+| Row | Session 1 | Session 2 | Session 3 | Verdict |
+|---|---|---|---|---|
+| ingest, all 18 rows but those below | 0.981 to 1.010 | 0.915 to 1.009 | 0.983 to 1.008 | pass |
+| ingest short lines 126x37 | 1.009 | 0.995 | **1.015** | pass, pass, FAIL |
+| ingest dense cells 126x37 | 1.003 | 1.004 | **1.025** | pass, pass, FAIL |
+| ingest dense cells 200x60 | **1.030** | **1.016** | **1.012** | FAIL |
+| ingest typing echo 200x60 | **1.011** | 0.943 | 1.008 | FAIL, pass, pass |
+| regex search, no match | 0.970 | 1.005 | 0.976 | pass |
+| `selection_to_string` 1,000 rows | 1.003 | 1.021 | 1.018 | pass (A/A 1.8% to 2.2%) |
+| every history row through `RowReader` | 0.984 | 0.991 | 0.986 | pass |
+| reflow 126->100->126 (10,000 rows, 0.64 ms) | **1.051** | **1.043** | **1.032** | FAIL |
+| reflow 200->80 | **1.013** | 0.980 | 1.004 | FAIL, pass, pass |
+
+Session 3 in full (main, branch and main again, medians in ms):
+
+```
+row                                  |    main ms |  branch ms |   main2 ms |  ratio |
+ingest short lines 126x37            |    280.070 |    284.340 |    280.532 |  1.015 | A/A  0.16% | spread   2.9% | FAIL (<= 1.010)
+ingest full-width plain 126x37       |    242.190 |    242.385 |    242.094 |  1.001 | A/A  0.04% | spread   2.1% | pass (<= 1.010)
+ingest uniform rows 126x37           |    785.430 |    789.685 |    785.531 |  1.005 | A/A  0.01% | spread   2.1% | pass (<= 1.010)
+ingest dense cells 126x37            |    134.510 |    137.892 |    134.690 |  1.025 | A/A  0.13% | spread   2.5% | FAIL (<= 1.010)
+ingest region scroll 126x37          |    228.018 |    227.472 |    228.158 |  0.998 | A/A  0.06% | spread   1.5% | pass (<= 1.010)
+ingest alt-screen redraw 126x37      |    157.332 |    156.283 |    156.938 |  0.993 | A/A  0.25% | spread   3.9% | pass (<= 1.010)
+ingest typing echo 126x37            |    448.759 |    452.184 |    447.427 |  1.008 | A/A  0.30% | spread   3.6% | pass (<= 1.010)
+ingest log lines 95 126x37           |    220.202 |    219.119 |    220.429 |  0.995 | A/A  0.10% | spread   1.4% | pass (<= 1.010)
+ingest wide chars 126x37             |    245.742 |    246.887 |    245.903 |  1.005 | A/A  0.07% | spread   4.4% | pass (<= 1.010)
+ingest short lines 200x60            |    274.615 |    276.404 |    275.138 |  1.007 | A/A  0.19% | spread  27.5% | pass (<= 1.010)
+ingest full-width plain 200x60       |    244.688 |    240.539 |    244.756 |  0.983 | A/A  0.03% | spread   1.3% | pass (<= 1.010)
+ingest uniform rows 200x60           |   1135.688 |   1139.447 |   1134.721 |  1.003 | A/A  0.09% | spread   1.6% | pass (<= 1.010)
+ingest dense cells 200x60            |    133.978 |    135.596 |    134.001 |  1.012 | A/A  0.02% | spread   6.0% | FAIL (<= 1.010)
+ingest region scroll 200x60          |    265.319 |    264.441 |    265.248 |  0.997 | A/A  0.03% | spread   1.6% | pass (<= 1.010)
+ingest alt-screen redraw 200x60      |    162.531 |    161.667 |    162.311 |  0.995 | A/A  0.14% | spread   3.0% | pass (<= 1.010)
+ingest typing echo 200x60            |    439.193 |    442.919 |    438.812 |  1.008 | A/A  0.09% | spread   2.8% | pass (<= 1.010)
+ingest log lines 95 200x60           |    221.781 |    220.113 |    221.876 |  0.992 | A/A  0.04% | spread   3.4% | pass (<= 1.010)
+ingest wide chars 200x60             |    246.872 |    246.600 |    246.812 |  0.999 | A/A  0.02% | spread   2.2% | pass (<= 1.010)
+read regex search, no match 126x37   |      6.596 |      6.437 |      6.612 |  0.976 | A/A  0.24% | spread   8.8% | pass (<= 1.010)
+read selection_to_string 1000 rows   |      0.069 |      0.071 |      0.068 |  1.018 | A/A  1.92% | spread  48.7% | pass (<= 1.019)
+resize reflow 126->100->126          |      0.640 |      0.660 |      0.650 |  1.032 | A/A  1.65% | spread  13.8% | FAIL (<= 1.016)
+resize reflow 200->80                |      7.116 |      7.143 |      7.105 |  1.004 | A/A  0.15% | spread   5.6% | pass (<= 1.010)
+read every history row x10 (RowReader) |     10.135 |      9.995 |     10.168 |  0.986 | A/A  0.33% | spread   4.5% | pass (<= 1.010)
+4 row(s) missed
+```
+
+**The remaining misses.** Rows move in and out of the 1% band between sessions whose changes do
+not touch their path (short lines and dense cells at 126x37 between sessions 2 and 3; typing echo
+went from 1.011 to 0.943), and session 2 has rows up to 8.5% *faster* than main for no change of
+theirs. A control build of `026ea07` whose only change is one unused `Option<usize>` field in
+`Config` measured 0.98 to 1.02 against `026ea07` in separate processes on dense cells 200x60 and
+the reflow. With compression off the branch adds, on the ingest path, one `Option` check per
+pushed row and one per new block (design 5.2 allows "one branch on an `Option`"), and on reads one
+`cold` check. The reflow of a 10,000-row history keeps a residue of 2% to 4% (0.02 ms): profiling it
+(`samply`) put the difference in `Cell::reflow_info`, whose machine code is byte-identical in both
+builds and equally aligned, and in `RowSource::next_reflow`, which carries the two `Option` checks
+per row of `move_oldest_to` and `push_encoded`. The verdict is left to the owner (see the report of
+this task); the gates are unchanged.
+
+**Memory and allocations.** Live bytes are not identical: a block's bookkeeping grew from 32 to 48
+bytes (warm-row count, generation, cold flag), so a history holds 16 bytes more per slot of its
+block deque, measured exactly with a counting allocator: +128 B (short lines, 10,000 rows), +512 B
+(log lines), +8,192 B (dense cells), +65,536 B (1,000,000 log lines, 203.6 MB in all; 0.03%).
+`examples/memory.rs --gate` passes as before (log lines 2.13 MB, dense cells 17.10 against 17.09 MB
+before), and `tests/alloc.rs` passes: zero allocations per scrolled row at a full history, with
+compression off and on.
+
+### Memory (design 6.3)
+
+Live bytes of a terminal (126x37) at 1,000,000 history lines with `Some(10_000)` after every job
+ran, against the same content with compression off (`large_history_cost_table`, last table; each
+cell a fresh child process, jobs run after every 64 KiB of input). The recorded streams have a few
+hundred lines, so they are repeated to fill the history; a 64 KiB block holds about one copy, so
+the repetition helps little (phase 0 measured the single streams at 33.0% and 36.5% projected).
+
+| Corpus | Off MB | Compressed MB | Compressed / off | Gate |
+|---|---:|---:|---:|---|
+| build log | 86.8 | 27.0 | 31.1% | pass (<= 40%) |
+| service log | 202.1 | 47.0 | 23.3% | pass |
+| shell session | 105.8 | 32.6 | 30.8% | pass |
+| recorded cargo build (repeated) | 91.8 | 25.8 | 28.1% | pass |
+| recorded git graph (repeated) | 122.7 | 43.2 | 35.2% | pass |
+| random log lines (`large_history.rs`) | 179.6 | 82.1 | 45.7% | pass (never above off) |
+
+The git graph corpus was replaced later (see "Compressor choice"); its rows here and below, and the
+100,000-line range, come from `large_history_cost_corpus_cell` run again for that corpus (and for
+the others at 100,000 lines); the rest are from the original session.
+
+Recorded, not gated: at 100,000 lines the same corpora take 37.5% to 50.8% of off (random 56.4%):
+the uncompressed 16-byte index entry per row and the fixed per-terminal overhead weigh more there.
+The read cache holds at most 4 decompressed blocks (256 KiB) and is empty after the jobs ran.
+
+Peaks (design 6.4, "peak live bytes never above off" for the reflow, "memory never above the
+uncompressed size" when switching on), exact bytes at 1,000,000 lines:
+
+| Corpus | Off peak in 10 resizes | Compressed peak | Switching on: peak over uncompressed |
+|---|---:|---:|---:|
+| build log | 103,141,157 | 103,017,695 (pass) | +131,222 B |
+| service log | 222,712,867 | 200,986,295 (pass) | +131,306 B |
+| recorded cargo build (repeated) | 108,072,949 | 108,078,845 (**+5,896 B**) | +131,292 B |
+| shell session, git graph, random | | pass (at most equal in MB) | +131,238 to +156,702 B |
+
+A job copies its block under the lock (design 5.2), and the warm buffer an install replaces is
+kept as a spare (at most 2), so switching on goes about two blocks (128 KiB, 0.08%) above the
+uncompressed size before it comes down (service log: 174.8 MB to 43.1 MB). The compressed reflow's
+peak includes the read cache (up to 256 KiB) and comes within 6 KB above off on the most
+compressible corpus. Both are reported to the owner as measured; the gates are unchanged.
+
+### Speed with compression on (design 6.4, library rows)
+
+`benches/ingest.rs` and `benches/reads.rs`, last sections: 1,000,000 history lines of log lines at
+126x37, `Some(10_000)`. The worker (`benches/common/mod.rs`, `worker`) runs on its own thread and
+shares the terminal through a `parking_lot::Mutex` as fbterm does; the parser locks, parses
+64 KiB, checks `has_history_jobs`, unlocks and wakes the worker.
+
+```
+== history compression (feathercritty only; the 0.26.0 column is compression off) ==
+workload                           |    0.26.0 ms |    fork ms |  ratio |   spread | gate
+----------------------------------------------------------------------------------------------
+log lines 95 126x37, 1M history, on+worker vs off |      223.013 |    229.670 |  1.030 |     1.3% | pass (<= 1.03x)
+  jobs left when the parser finished: 8 of 8 runs
+worker lock holds, 1M-line fill    | p99 0.0070 ms (fills 0.0069-0.0072) | max 0.0107 ms (median of fills) | 1044 holds per fill | pass (p99 <= 0.1 ms)
+flood with the worker              | 60 s, 227 MB/s | most warm blocks: first half 38, second half 38, after stop 29 | worker 243716 jobs, 20.9% of one core | pass (bounded)
+9 ingest row(s) missed their threshold
+```
+
+| Row | Gate | Measured | Verdict |
+|---|---|---|---|
+| parser-side ingest, on with the worker, against off | at most 1.03x | 1.041 (first session), 1.030 (second) | borderline: FAIL, pass |
+| worker lock holds over a 1,000,000-line fill | p99 at most 0.1 ms | p99 0.0070 ms, max 0.0107 ms, about 1,050 holds | pass |
+| 60 s flood of log lines (227 MB/s) | backlog bounded | at most 38 warm blocks in both halves (29 is the warm window), 20.9% of one core | pass |
+| switching on, 1,000,000 lines | holds as above; time recorded | 137 ms, 2,796 jobs, holds p99 0.0167 ms | pass |
+| switching off | holds as above; time recorded | 79 ms, holds p99 0.0055 ms | pass |
+
+**Batches.** With one job per lock hold the worker fell behind a flood: a parser that holds the
+lock almost all the time left it about one hold per 64 KiB parsed, and two holds per job (take,
+install) were too few. The warm blocks grew by about 24 per 2 MB of input with an ordinary unlock
+and by about 5.5 with a fair one. `Term::next_history_jobs(max)` takes a batch in one hold, and the
+worker installs a batch and takes the next in the same hold: the backlog stays at the warm window
+plus up to 9 blocks for 60 s, and the holds stay below 0.011 ms.
+
+**Where the ingest cost goes** (experiments in the tuning pass, 5 runs each): the parser waited 3.0
+ms per 50 MB for the worker's holds (1.4%; each block is copied under the lock, design 5.2); a
+thread compressing on a neighbouring core with no lock at all cost the parser 2.0% to 2.9% (shared
+caches); compression on with nothing ever eligible (`keep_warm` above the history size) cost 2.3%,
+most of it lock traffic: there every evicted block raised a job that turned out empty (since fixed:
+`has_jobs` turns true only when a block is eligible, so such a history never wakes the worker; not
+measured again). Keeping more spare blocks changed nothing (1.033 with 16 spares). A host that runs
+the worker on efficiency cores (fbterm's low-priority worker, design 5.4) would move the cache share
+away from the parser; the library cannot set that.
+
+```
+== history compression, 1,000,000-line history (feathercritty only; the 0.26.0 column is compression off, the fork column compression on) ==
+workload                           |    0.26.0 ms |    fork ms |  ratio |   spread | gate
+----------------------------------------------------------------------------------------------
+1M: regex search, no match         |      650.064 |    729.806 |  1.123 |     1.8% | pass (<= 2.00x)
+1M: selection_to_string 1000 rows  |        1.462 |      3.708 |  2.537 |     4.2% | -
+1M: export-equivalent read         |      175.441 |    250.668 |  1.429 |    25.4% | pass (<= 2.00x)
+1M: reflow 126->100                |      127.490 |    184.064 |  1.444 |     1.9% | FAIL (<= off + decompress 53.135 ms = 180.626 ms, and <= 1000 ms)
+1M: reflow 100->126                |      201.710 |    263.057 |  1.304 |     1.3% | FAIL (<= off + decompress 57.188 ms = 258.898 ms, and <= 1000 ms)
+1M: switch on                      | total 137.4 ms (137.0-139.0) | 2796 jobs | holds p99 0.0167 ms, max 0.0266 ms | pass (p99 <= 0.1 ms)
+1M: switch off                     | total 78.9 ms (78.8-79.2) | 2796 jobs | holds p99 0.0055 ms, max 0.0087 ms | pass (p99 <= 0.1 ms)
+decompress one block               | as cold.rs 28.00 us | reused context and buffer 26.94 us | 0.962 | 2796 blocks | -
+2 read row(s) missed their threshold
+```
+
+| Row | Gate | Measured | Verdict |
+|---|---|---|---|
+| regex search, no match | at most 2x | 1.12x (730 ms against 650 ms) | pass |
+| every history row read as text (export-equivalent) | at most 2x | 1.43x | pass |
+| `selection_to_string`, 1,000 rows 500,000 up, read cache cold | none (recorded) | 2.54x (185 us against 73 us per selection) | - |
+| reflow 126->100 | off + decompress once, at most 1 s | 184.1 ms against 127.5 + 53.1 = 180.6 ms | **FAIL by 1.9%** (spread 1.9%) |
+| reflow 100->126 | same | 263.1 ms against 201.7 + 57.2 = 258.9 ms | **FAIL by 1.6%** (spread 1.3%) |
+| decompress one 64 KiB block | recorded | 28.0 us as `cold.rs` does it; 26.9 us with a reused context and no zeroing (-3.8%) | - |
+
+The selection row has no gate in the design; a selection that starts in cold history with an
+empty cache pays for about four blocks of decompression, more than reading those rows warm. A
+selection made by dragging over the rows has just read them through the cache.
+
+The reflow was first 1.53x and 1.33x (12 ms and 9 ms over the bound): every record read looked
+the block up in the cache, moved it to the back and cloned its `Arc`, twice per row, and the new
+history kept the warm-row accounting for every pushed row. Two changes took most of it: a read of
+the block read last is served in place under a shared borrow of the cache (no reordering, no
+reference count), and the reflow builds its new history with compression off and applies the
+setting once at the end (one count over the warm rows). What is left (3 to 4 ms over 1,000,000
+rows) is within the run's spread, and is reported to the owner as measured.
+
+The per-call zstd context and the zeroed buffer of `cold.rs` cost 3.8% of a block's
+decompression. No gate depends on it (the reflow bound counts decompression as `cold.rs` does it,
+and the other reads pass with margin), so `cold.rs` is unchanged.
+
+### Large histories with compression off
+
+`large_history_cost_table`, first two tables, as in "Large histories" above (fill once, resizes
+median of 5; this test binary uses the default release profile): 1,000,000 log lines take
+179.6 MB live (179.5 before; the 64 KiB of block bookkeeping above). Two runs at 1,000,000 lines,
+against the table above: log lines 126->100 30.5 and 32.1 ms (31.1 before), 100->126 35.2 and
+39.7 ms (35.1); full-width 269.8 and 266.3 ms (280.8), 312.0 and 311.9 ms (328.5); short lines
+41.5 and 43.2 ms (43.1), 46.6 and 47.5 ms (46.7). The second run's log-line 100->126 is 13%
+slower at both sizes, after changes that do not touch the path with compression off; in fbterm's
+release profile (thin LTO, one codegen unit, separate processes) 200 rounds of 126->100->126 on a
+10,000-row history measured 0.8% to 1.9% slower than `026ea07`, as in "Off means off".
+
 ## Baseline on identical code (formerly `benches/BASELINE.md`)
 
 Before the compact store (commit `05dd594`, the fork's library identical to 0.26.0 apart from

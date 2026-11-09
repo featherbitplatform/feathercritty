@@ -101,7 +101,7 @@ use std::cell::Cell;
 use std::fmt;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Mutex, Once, mpsc};
+use std::sync::{Mutex, Once, OnceLock, mpsc};
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -339,6 +339,12 @@ pub struct Stats {
     /// Moved windows that feathercritty also searched as drawn, checked on its own (fork
     /// change 5; 0.26.0 would hang there).
     pub change5_windows: usize,
+    /// History job results installed (`DIFF_COLD`; `fc::Jobs`).
+    pub jobs_installed: usize,
+    /// History job results the terminal refused (taken before a step that changed their block).
+    pub jobs_refused: usize,
+    /// History job results run and dropped without installing them.
+    pub jobs_dropped: usize,
 }
 
 impl Stats {
@@ -353,6 +359,9 @@ impl Stats {
         self.no_termination += other.no_termination;
         self.change5_answers += other.change5_answers;
         self.change5_windows += other.change5_windows;
+        self.jobs_installed += other.jobs_installed;
+        self.jobs_refused += other.jobs_refused;
+        self.jobs_dropped += other.jobs_dropped;
     }
 }
 
@@ -375,7 +384,15 @@ impl fmt::Display for Stats {
             self.no_termination,
             self.change5_answers,
             self.change5_windows,
-        )
+        )?;
+        if self.jobs_installed + self.jobs_refused + self.jobs_dropped > 0 {
+            write!(
+                f,
+                "; history jobs: {} installed, {} refused, {} dropped",
+                self.jobs_installed, self.jobs_refused, self.jobs_dropped
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -471,6 +488,7 @@ pub fn run(start: &Start, steps: &[Step]) -> Result<Stats, Divergence> {
             qb.iter().filter(|(_, q)| *q == project::QAns::NoTermination).count();
     }
     stats.reached_limit = usize::from(reached);
+    (stats.jobs_installed, stats.jobs_refused, stats.jobs_dropped) = a.jobs.counts();
 
     Ok(stats)
 }
@@ -497,8 +515,46 @@ pub fn tiny_blocks() -> bool {
     std::env::var("DIFF_TINY").is_ok_and(|value| value.trim() != "0")
 }
 
+/// Under `DIFF_COLD`, check that a pass of `seeds` seeds with totals `stats` installed history
+/// jobs and had some refused (a job held across a step that changed its block), so a change that
+/// stops the harness from reaching either fails instead of passing vacuously. Only for passes that
+/// reach both on every block size: `full_history` (most passes do not: with 64 KiB blocks
+/// `ref_recordings` never fills one, and `realistic_diagnostics` refuses none even with tiny
+/// blocks). A replay of fewer than 5 seeds is not checked.
+pub fn assert_cold_coverage(test: &str, seeds: usize, stats: &Stats) {
+    if cold_history().is_none() || seeds < 5 {
+        return;
+    }
+    assert!(
+        stats.jobs_installed > 0 && stats.jobs_refused > 0,
+        "`{test}` under DIFF_COLD installed {} and refused {} history jobs: {stats}",
+        stats.jobs_installed,
+        stats.jobs_refused,
+    );
+}
+
 /// History block size under `DIFF_TINY`.
 pub const TINY_BLOCK_BYTES: usize = 256;
+
+/// `DIFF_COLD`: when set to a row count `n` above 0, feathercritty's terminals run with
+/// `Config::history_compression: Some(n)`, and after every step `fc::Jobs` runs, drops or holds
+/// history jobs (`fc::Jobs::after_step`); unset, empty or `0`, compression stays off (`0` means
+/// off, as with `DIFF_TINY`; keeping no row warm is covered by the history's own randomized model
+/// test, `matches_dense_model_compressed`). The oracle side and the generators ignore it, so every
+/// seed's steps are the same either way. Read once per process.
+pub fn cold_history() -> Option<usize> {
+    static COLD: OnceLock<Option<usize>> = OnceLock::new();
+    *COLD.get_or_init(|| {
+        let value = std::env::var("DIFF_COLD").ok()?;
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let rows: usize =
+            value.parse().unwrap_or_else(|_| panic!("DIFF_COLD must be a row count: {value:?}"));
+        (rows > 0).then_some(rows)
+    })
+}
 
 /// `DIFF_SEEDS`, or `default`.
 pub fn seed_count(default: u64) -> u64 {
@@ -565,6 +621,9 @@ where
     let mut steps = steps.map(|n| format!(" DIFF_STEPS={n}")).unwrap_or_default();
     if tiny_blocks() {
         steps += " DIFF_TINY=1";
+    }
+    if let Some(cold) = cold_history() {
+        steps += &format!(" DIFF_COLD={cold}");
     }
     if divergence.hang {
         // Minimizing would rerun the hanging query many times, leaving a spinning thread each

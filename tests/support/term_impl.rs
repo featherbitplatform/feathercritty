@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use super::{ORACLE, cell_at, k, new_term, row_at, set_cell};
+use super::{Jobs, ORACLE, cell_at, config, k, new_term, row_at, set_cell};
 use k::event::VoidListener;
 use k::grid::{Dimensions, Scroll};
 use k::index::{Boundary, Column, Direction, Line, Point, Side as KSide};
@@ -60,6 +60,8 @@ pub struct Side {
     /// The matches 0.26.0's iterator yielded in each probed `search` since the last `queries`
     /// (`search_terminates`), `None` where it was not walked; see `check_search_walked`.
     walks: RefCell<Vec<Option<Walk>>>,
+    /// History jobs between steps (`DIFF_COLD`, feathercritty only; `fc::Jobs`, `ac::Jobs`).
+    pub jobs: Jobs,
 }
 
 fn sel_ty(ty: SelTy) -> SelectionType {
@@ -405,17 +407,13 @@ impl Side {
     }
 
     pub fn new(start: &Start) -> Self {
-        let config = Config {
-            scrolling_history: start.history,
-            kitty_keyboard: start.kitty,
-            ..Config::default()
-        };
         let size = TermSize::new(start.columns, start.lines);
         Self {
-            term: new_term(config, &size),
+            term: new_term(config(start.history, start.kitty), &size),
             parser: Processor::new(),
             kitty: start.kitty,
             walks: RefCell::default(),
+            jobs: Jobs::new(start),
         }
     }
 
@@ -456,16 +454,13 @@ impl Side {
             Step::Bytes(bytes) => self.parser.advance(&mut self.term, bytes),
             Step::Resize { lines, columns } => self.term.resize(TermSize::new(*columns, *lines)),
             Step::ScrollView(delta) => self.term.scroll_display(Scroll::Delta(*delta)),
-            Step::SetHistory(limit) => self.term.set_options(Config {
-                scrolling_history: *limit,
-                kitty_keyboard: self.kitty,
-                ..Config::default()
-            }),
+            Step::SetHistory(limit) => self.term.set_options(config(*limit, self.kitty)),
             Step::Select { ty: None, .. } => self.term.selection = None,
             Step::Select { ty: Some(ty), start, end } => {
                 self.term.selection = Some(self.selection(*ty, *start, *end));
             },
         }
+        self.jobs.after_step(&mut self.term);
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -574,7 +569,13 @@ impl Side {
         let size = TermSize::new(grid.columns(), grid.screen_lines());
         let mut term = Term::new(Config::default(), &size, VoidListener);
         *term.grid_mut() = grid;
-        let side = Side { term, parser: Processor::new(), kitty: false, walks: RefCell::default() };
+        let side = Side {
+            term,
+            parser: Processor::new(),
+            kitty: false,
+            walks: RefCell::default(),
+            jobs: Jobs::default(),
+        };
         let search = search.clone();
         let (tx, rx) = mpsc::channel();
         thread::spawn(move || {
