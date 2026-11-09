@@ -35,7 +35,8 @@ regex-automata = "0.4.3"
 unicode-segmentation = "1.12"
 unicode-width = "0.2.0"
 # Compresses cold history blocks (src/grid/cold.rs); chosen in benches/RESULTS.md, "Compressor choice".
-zstd = "0.14.3"
+# No default features: the bulk API needs none (not `legacy` formats, `arrays` or `zdict_builder`).
+zstd = { version = "0.14.3", default-features = false }
 vte = { version = "0.15.0", default-features = false, features = ["std", "ansi"] }
 serde = { version = "1", features = ["derive", "rc"], optional = true }
 
