@@ -260,8 +260,12 @@ fn reflow_peak_below_dense() {
 
 /// Peak live bytes of the thread across 126->100->126 columns (and the history jobs a host runs
 /// after each resize) on a `rows`-row history of `bytes`, with the given compression. Returns
-/// (live bytes before the resizes, peak during them, live bytes after).
-fn resize_peak(bytes: &[u8], limit: usize, compression: Option<usize>) -> (isize, isize, isize) {
+/// (live bytes before the resizes, peak during them, live bytes after, cold blocks after).
+fn resize_peak(
+    bytes: &[u8],
+    limit: usize,
+    compression: Option<usize>,
+) -> (isize, isize, isize, usize) {
     let (lines, columns) = (37, 126);
     start_counting();
     let config =
@@ -286,8 +290,9 @@ fn resize_peak(bytes: &[u8], limit: usize, compression: Option<usize>) -> (isize
     let (after, peak) = live_and_peak();
     COUNTING.with(|counting| counting.set(false));
     assert_eq!(term.grid().columns(), columns);
+    let cold = term.grid().cold_blocks_for_test().iter().filter(|&&cold| cold).count();
     drop(term);
-    (before, peak, after)
+    (before, peak, after, cold)
 }
 
 /// Spec: peak live bytes during a resize are never above the same history with compression off.
@@ -296,8 +301,8 @@ fn resize_peak(bytes: &[u8], limit: usize, compression: Option<usize>) -> (isize
 fn reflow_peak_with_cold_history_not_above_off() {
     let limit = 100_000;
     let bytes = corpora::service_log(7, limit + 100);
-    let (off_before, off_peak, off_after) = resize_peak(&bytes, limit, None);
-    let (on_before, on_peak, on_after) = resize_peak(&bytes, limit, Some(10_000));
+    let (off_before, off_peak, off_after, off_cold) = resize_peak(&bytes, limit, None);
+    let (on_before, on_peak, on_after, on_cold) = resize_peak(&bytes, limit, Some(10_000));
     println!(
         "off: {off_before} B before, peak {off_peak} B, {off_after} B after\non:  {on_before} B \
          before, peak {on_peak} B, {on_after} B after"
@@ -307,4 +312,7 @@ fn reflow_peak_with_cold_history_not_above_off() {
         on_peak <= off_peak,
         "peak with compression {on_peak} B is above the peak with it off {off_peak} B"
     );
+    // The resized history is compressed again, or the comparison would be of two warm grids.
+    assert_eq!(off_cold, 0);
+    assert!(on_cold > 0, "no cold block after the resizes");
 }

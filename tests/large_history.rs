@@ -25,8 +25,9 @@
 //!   rows evicted at the top never shift the expectation.
 //! - `large_history_matches_oracle_at_100k_compressed` and
 //!   `large_history_invariants_at_1m_compressed` run the two above with `history_compression:
-//!   Some(10_000)`, `run_history_jobs()` after the fill and each step, and check that most blocks
-//!   are compressed.
+//!   Some(10_000)`, `run_history_jobs()` after each step, and check that most blocks are compressed
+//!   after the fill and each phase (the 100,000-line one also after each step of the fill, once the
+//!   history holds four warm windows).
 //! - `large_history_cost_table` measures (it prints, never asserts): live bytes, resident set size,
 //!   resize and trim times for short, log-style and full-width lines at 100,000 and 1,000,000
 //!   history lines, and the tables recorded in `benches/RESULTS.md`. Its last table is the history
@@ -632,14 +633,22 @@ fn oracle_at_100k(compression: Option<usize>) {
         set_history(&mut a, limit, compression);
     }
 
+    let mut checked = 0;
     fill(
         |step| {
             apply(&mut a, step, compression);
             b.apply(step);
+            // Compression keeps up during the fill, not only once the history is full: from four
+            // warm windows on, most blocks are compressed after every step's jobs.
+            if compression.is_some() && a.term.grid().history_size() >= 4 * WARM {
+                checked += 1;
+                assert_cold(&a, &format!("fill, {} rows", a.term.grid().history_size()));
+            }
         },
         blocks,
         true,
     );
+    assert!(compression.is_none() || checked > 10, "{checked} fill steps checked");
     let plan = plan();
     println!(
         "large history vs 0.26.0, {limit}-line limit, {} lines of content",
