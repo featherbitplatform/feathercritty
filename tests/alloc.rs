@@ -201,6 +201,25 @@ fn compression_off_allocates_nothing_per_row() {
     check(8, 256, true);
 }
 
+/// Taking one history job allocates only the copy of its block (`next_history_job` takes no
+/// detour through a batch `Vec`); finding none allocates nothing.
+#[test]
+fn next_history_job_allocates_only_its_copy() {
+    let config =
+        Config { scrolling_history: 20_000, history_compression: Some(100), ..Config::default() };
+    let mut term = Term::new(config, &TermSize::new(126, 37), VoidListener);
+    let mut parser: Processor = Processor::new();
+    parser.advance(&mut term, &corpora::service_log(3, 5_000));
+    assert!(term.has_history_jobs());
+
+    let mut job = None;
+    assert_eq!(allocations_in(|| job = term.next_history_job()), 1);
+    assert!(term.install_history_job(job.take().expect("a job").run()));
+    term.run_history_jobs();
+    assert_eq!(allocations_in(|| job = term.next_history_job()), 0);
+    assert!(job.is_none());
+}
+
 /// A reflow streams the history: during 126->100->126 columns with a full 10,000-row history,
 /// the grid's peak live bytes stay below what the history rows alone take as dense rows, and the
 /// old store is released as the pass goes (design spec 5.6, 6.4).

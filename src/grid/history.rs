@@ -553,7 +553,9 @@ impl<T: HistoryCell> History<T> {
     /// block is in the state the setting asks for. Taking a job changes nothing: until it is
     /// installed, the next call offers the same block again.
     pub fn next_job(&mut self) -> Option<Job> {
-        self.next_jobs(1).pop()
+        let mut job = None;
+        self.take_jobs(1, |next, _| job = Some(next));
+        job
     }
 
     /// Up to `max` blocks that need to change state, oldest first, each with a copy of its bytes
@@ -562,32 +564,46 @@ impl<T: HistoryCell> History<T> {
     /// changes nothing; they can be installed in any order.
     pub fn next_jobs(&mut self, max: usize) -> Vec<Job> {
         let mut jobs = Vec::new();
+        self.take_jobs(max, |job, left| {
+            if jobs.is_empty() {
+                jobs.reserve_exact(max.min(left));
+            }
+            jobs.push(job);
+        });
+        jobs
+    }
+
+    /// Hand `take` up to `max` jobs, oldest first, each with the number of blocks from its own
+    /// to the newest (a bound on the jobs left), and move `scan` to the first one (or clear it
+    /// when there is none). Shared by `next_job`, which allocates nothing beyond the copy, and
+    /// `next_jobs`.
+    fn take_jobs(&mut self, max: usize, mut take: impl FnMut(Job, usize)) {
         let Some(scan) = self.scan else {
-            return jobs;
+            return;
         };
         if max == 0 {
-            return jobs;
+            return;
         }
 
+        let mut taken = 0;
         for at in self.position_of(scan)..self.blocks.len() {
             if !self.disagrees(at) {
                 continue;
             }
             let seq = self.front_seq.wrapping_add(at as u32);
-            if jobs.is_empty() {
+            if taken == 0 {
                 // Every older block agrees.
                 self.scan = Some(seq);
-                jobs.reserve_exact(max.min(self.blocks.len() - at));
             }
-            jobs.push(self.job(at, seq));
-            if jobs.len() == max {
-                return jobs;
+            take(self.job(at, seq), self.blocks.len() - at);
+            taken += 1;
+            if taken == max {
+                return;
             }
         }
-        if jobs.is_empty() {
+        if taken == 0 {
             self.scan = None;
         }
-        jobs
     }
 
     /// The job for the block at `at` (sequence number `seq`), with a copy of its bytes.
