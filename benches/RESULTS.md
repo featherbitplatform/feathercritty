@@ -535,14 +535,15 @@ and by about 5.5 with a fair one. `Term::next_history_jobs(max)` takes a batch i
 worker installs a batch and takes the next in the same hold: the backlog stays at the warm window
 plus up to 9 blocks for 60 s, and the holds stay below 0.011 ms.
 
-**Where the ingest cost goes** (experiments in the tuning pass, 5 runs each): the parser waited
-3.0 ms per 50 MB for the worker's holds (1.4%; each block is copied under the lock, design 5.2); a
-thread compressing on a neighbouring core with no lock at all cost the parser 2.0% to 2.9%
-(shared caches); compression on with nothing ever eligible (`keep_warm` above the history size) cost 2.3%,
-most of it lock traffic: there every evicted block raised a job that turned out empty. Keeping more spare blocks changed
-nothing (1.033 with 16 spares). A host that runs the worker on efficiency cores (fbterm's
-low-priority worker, design 5.4) would move the cache share away from the parser; the library
-cannot set that.
+**Where the ingest cost goes** (experiments in the tuning pass, 5 runs each): the parser waited 3.0
+ms per 50 MB for the worker's holds (1.4%; each block is copied under the lock, design 5.2); a
+thread compressing on a neighbouring core with no lock at all cost the parser 2.0% to 2.9% (shared
+caches); compression on with nothing ever eligible (`keep_warm` above the history size) cost 2.3%,
+most of it lock traffic: there every evicted block raised a job that turned out empty (since fixed:
+`has_jobs` turns true only when a block is eligible, so such a history never wakes the worker; not
+measured again). Keeping more spare blocks changed nothing (1.033 with 16 spares). A host that runs
+the worker on efficiency cores (fbterm's low-priority worker, design 5.4) would move the cache share
+away from the parser; the library cannot set that.
 
 ```
 == history compression, 1,000,000-line history (feathercritty only; the 0.26.0 column is compression off, the fork column compression on) ==
