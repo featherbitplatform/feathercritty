@@ -7,10 +7,12 @@
 //! [`inline::InlineImageParser`].
 //!
 //! The parsers read image headers and decode pixels where the protocol itself defines a pixel
-//! format (sixel); everything else hands payload bytes to the embedder through events. The
-//! limits in [`limits`] are shared by all of them, and every buffer here is bounded so remote
-//! input cannot make the parser panic, hang or grow without bound.
+//! format (sixel); everything else hands payload bytes to the embedder through events. The limits
+//! in [`limits`] and the incremental base64 in [`b64`] are shared by the two protocols that carry
+//! base64 payloads, and every buffer here is bounded so remote input cannot make the parser panic,
+//! hang or grow without bound.
 
+mod b64;
 pub mod inline;
 pub mod kitty;
 pub mod limits;

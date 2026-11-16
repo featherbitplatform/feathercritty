@@ -43,15 +43,15 @@
 //! terminal releases a client that stopped mid-upload — and tests never sleep. Every buffer is
 //! bounded: the staged payload of one APC frame and the accumulated bytes of one transmission by
 //! [`MAX_PAYLOAD_BYTES`], the inflated output by [`MAX_IMAGE_BYTES`] or, for a declared raw
-//! format, by its own declared size; base64 carries at most three characters between chunks. A
-//! dropped transmission releases what it held.
+//! format, by its own declared size; base64 is decoded incrementally by [`Decoder`], which carries
+//! at most three characters between chunks and treats padding that ends one chunk as the end of the
+//! payload. A dropped transmission releases what it held.
 
 use std::time::Instant;
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use flate2::{Decompress, FlushDecompress, Status};
 
+use super::b64::{B64Error, Decoder};
 use super::limits::{MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, MAX_PAYLOAD_BYTES, STALL};
 
 /// The PNG file magic, the sniffed marker for `f=100` data.
@@ -386,14 +386,15 @@ impl Pending {
 pub struct KittyParser {
     frame: Frame,
     pending: Option<Pending>,
-    /// At most three base64 characters left over between chunks (an incomplete quad).
-    stash: Vec<u8>,
+    /// The payload base64, decoded incrementally across chunks (at most three characters carried,
+    /// and padding that ends one chunk ends the payload).
+    b64: Decoder,
     reject: Option<KittyReject>,
 }
 
 impl Default for KittyParser {
     fn default() -> Self {
-        Self { frame: Frame::inactive(), pending: None, stash: Vec::new(), reject: None }
+        Self { frame: Frame::inactive(), pending: None, b64: Decoder::default(), reject: None }
     }
 }
 
@@ -508,7 +509,7 @@ impl KittyParser {
             if now.saturating_duration_since(pending.last_progress) > STALL {
                 let (id, number, quiet) = (pending.id.unwrap_or(0), pending.number, pending.quiet);
                 self.pending = None;
-                self.stash.clear();
+                self.b64.reset();
                 self.reject = self.reject.take().or(Some(KittyReject {
                     id,
                     number,
@@ -529,7 +530,7 @@ impl KittyParser {
     /// of a compressed transmission, under 64 KiB, is not counted). A dropped transmission
     /// holds nothing.
     pub fn held_bytes(&self) -> usize {
-        let mut held = self.stash.len() + self.frame.pair.len() + self.frame.text.len();
+        let mut held = self.b64.carried() + self.frame.pair.len() + self.frame.text.len();
         if let Some(pending) = &self.pending {
             held += pending.out.len();
         }
@@ -679,7 +680,7 @@ impl KittyParser {
                     // Any delete aborts a chunked upload in progress (protocol rule).
                     *touched = true;
                     self.pending = None;
-                    self.stash.clear();
+                    self.b64.reset();
                     let selector = keys.d.unwrap_or(b'a');
                     let target = match selector.to_ascii_lowercase() {
                         b'a' => DeleteTarget::All,
@@ -771,7 +772,7 @@ impl KittyParser {
                 raw_limit,
                 last_progress: now,
             });
-            self.stash.clear();
+            self.b64.reset();
         }
 
         let more = frame.keys.m.unwrap_or(false);
@@ -779,25 +780,38 @@ impl KittyParser {
     }
 
     /// Decode this frame's staged text into the pending transmission and close it when `m` says
-    /// so. Caps are enforced here; a killed transmission is freed before returning.
+    /// so. Caps are enforced here — on the base64 length, before anything is decoded, so a frame
+    /// that cannot fit is refused rather than turned into bytes first — and a killed transmission
+    /// is freed before returning.
     fn feed_payload(&mut self, text: Vec<u8>, more: bool, now: Instant) -> Option<KittyCommand> {
-        let Self { pending, stash, reject, .. } = self;
-        let decoded = match decode_prefix(stash, &text) {
+        let Self { pending, b64, reject, .. } = self;
+        // The room this frame's payload has left: the data cap for raw data, and the same cap on
+        // the compressed bytes fed to the inflate for `o=z`, whose output `pump` caps separately. A
+        // stream that already ended stores nothing its later chunks decode to, so nothing can pass
+        // a cap there; invalid base64 — data after the payload's padding included — is still
+        // refused.
+        let room = match pending.as_ref().expect("feed_payload runs with a transmission") {
+            p if p.stream_end => usize::MAX,
+            p if p.compressed => MAX_PAYLOAD_BYTES.saturating_sub(p.fed as usize),
+            p => MAX_PAYLOAD_BYTES.saturating_sub(p.out.len()),
+        };
+        let decoded = match b64.put(&text, room) {
             Ok(decoded) => decoded,
-            Err(()) => {
-                kill(reject, pending, stash, KittyError::EINVAL);
+            Err(B64Error::TooBig) => {
+                kill(reject, pending, b64, KittyError::ENOMEM);
+                return None;
+            },
+            Err(B64Error::Invalid) => {
+                kill(reject, pending, b64, KittyError::EINVAL);
                 return None;
             },
         };
         let feed_result = {
             let p = pending.as_mut().expect("feed_payload runs with a transmission");
             if !p.compressed {
-                if p.out.len() + decoded.len() > MAX_PAYLOAD_BYTES {
-                    Err(KittyError::ENOMEM)
-                } else {
-                    p.out.extend_from_slice(&decoded);
-                    Ok(())
-                }
+                // `put` measured this frame against the cap before decoding it, so these bytes fit.
+                p.out.extend_from_slice(&decoded);
+                Ok(())
             } else if p.stream_end {
                 Ok(()) // trailing bytes after the zlib stream are ignored, and never stored
             } else {
@@ -818,7 +832,7 @@ impl KittyParser {
             }
         };
         if let Err(error) = feed_result {
-            kill(reject, pending, stash, error);
+            kill(reject, pending, b64, error);
             return None;
         }
         if more {
@@ -826,23 +840,31 @@ impl KittyParser {
             return None;
         }
 
-        // The transmission is complete: drain the base64 tail, close the inflate, validate.
-        let tail = match drain_tail(stash) {
+        // The transmission is complete: drain the last base64 group (at most two bytes), close the
+        // inflate and validate. A stream that already ended ignores what its tail decodes to, and
+        // for a compressed one `pump` bounds what those bytes can become.
+        let tail_room = match pending.as_ref().expect("feed_payload runs with a transmission") {
+            p if p.compressed => usize::MAX,
+            p => MAX_PAYLOAD_BYTES.saturating_sub(p.out.len()),
+        };
+        let tail = match b64.finish(tail_room) {
             Ok(tail) => tail,
-            Err(()) => {
-                kill(reject, pending, stash, KittyError::EINVAL);
+            Err(B64Error::TooBig) => {
+                kill(reject, pending, b64, KittyError::ENOMEM);
+                return None;
+            },
+            Err(B64Error::Invalid) => {
+                kill(reject, pending, b64, KittyError::EINVAL);
                 return None;
             },
         };
         let close_result = {
             let p = pending.as_mut().unwrap();
             if !p.compressed {
-                if p.out.len() + tail.len() > MAX_PAYLOAD_BYTES {
-                    Err(KittyError::ENOMEM) // the transmission passed its data cap
-                } else {
-                    p.out.extend_from_slice(&tail);
-                    Ok(())
-                }
+                // `finish` measured the tail against the cap before decoding it, so these bytes
+                // fit.
+                p.out.extend_from_slice(&tail);
+                Ok(())
             } else if p.stream_end {
                 // A finished zlib stream is complete: base64 that decodes past its end is not
                 // image data and is dropped, not appended.
@@ -863,7 +885,7 @@ impl KittyParser {
             }
         };
         if let Err(error) = close_result {
-            kill(reject, pending, stash, error);
+            kill(reject, pending, b64, error);
             return None;
         }
         let resolved = {
@@ -879,11 +901,11 @@ impl KittyParser {
             Ok(Some(format)) => format,
             Ok(None) => {
                 *pending = None;
-                stash.clear();
+                b64.reset();
                 return None;
             },
             Err(error) => {
-                kill(reject, pending, stash, error);
+                kill(reject, pending, b64, error);
                 return None;
             },
         };
@@ -899,7 +921,7 @@ impl KittyParser {
             }
         };
         *pending = None; // releases what the inflate did not move into the command
-        stash.clear();
+        b64.reset();
         Some(command)
     }
 
@@ -1022,7 +1044,7 @@ fn build_place(keys: &Keys, quiet: u8) -> KittyPlace {
 fn kill(
     reject: &mut Option<KittyReject>,
     pending: &mut Option<Pending>,
-    stash: &mut Vec<u8>,
+    b64: &mut Decoder,
     error: KittyError,
 ) {
     if let Some(pending) = pending.take() {
@@ -1035,37 +1057,7 @@ fn kill(
             });
         }
     }
-    stash.clear();
-}
-
-/// Decode the quad-aligned part of `stash + text`; at most three characters (an incomplete
-/// quad) stay in `stash` for the next chunk. A padding character that does not end a quad makes
-/// the whole transmission EINVAL, matching the protocol's base64 rules.
-fn decode_prefix(stash: &mut Vec<u8>, text: &[u8]) -> Result<Vec<u8>, ()> {
-    let mut all = std::mem::take(stash);
-    all.extend_from_slice(text);
-    let quads = all.len() & !3;
-    *stash = all.split_off(quads);
-    STANDARD.decode(&all).map_err(|_| ())
-}
-
-/// Decode what the stash holds at the end of a transmission. A complete quad is always consumed
-/// by `decode_prefix`, so anything left here is an incomplete group: leading padding is skipped,
-/// stray padding alone or a single leftover symbol cannot form a byte and makes the whole
-/// transmission EINVAL, and a padding symbol anywhere inside the group is rejected by the decode.
-fn drain_tail(stash: &mut Vec<u8>) -> Result<Vec<u8>, ()> {
-    let tail = std::mem::take(stash);
-    if tail.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(at) = tail.iter().position(|&b| b != b'=') else {
-        return Err(()); // padding with nothing to pad
-    };
-    let body = &tail[at..];
-    if body.len() == 1 {
-        return Err(());
-    }
-    STANDARD_NO_PAD.decode(body).map_err(|_| ())
+    b64.reset();
 }
 
 /// Inflate `input` into `out`, stopping at the stream end. Errors on corrupt data (`EINVAL`), once

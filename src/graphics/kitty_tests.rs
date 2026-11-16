@@ -290,6 +290,31 @@ fn base64_split_mid_quad() {
 }
 
 #[test]
+fn padding_in_a_later_chunk_is_refused() {
+    // A padded group ends the payload: base64 in a later chunk is refused exactly as it would be
+    // inside the same one. The first chunk closes its quad with padding and leaves the
+    // transmission open (`m=1`); data in the next one is EINVAL.
+    let now = Instant::now();
+    let mut parser = KittyParser::new();
+    assert_eq!(parse(&mut parser, &apc("f=24,s=1,v=1,m=1", b"QQ=="), now), None);
+    assert!(parser.take_reject().is_none());
+    assert_eq!(parse(&mut parser, &apc("m=0", b"QQ=="), now), None);
+    assert_eq!(parser.take_reject().map(|r| r.error), Some(KittyError::EINVAL));
+
+    // The same bytes arriving at once are refused too — mid-stream padding fails the decode of the
+    // quad-aligned part, whether it lands in this chunk's text or was carried from the last one.
+    let (cmd, rej) = once(&apc("f=24,s=1,v=1", b"QQ==QQ=="));
+    assert_eq!(cmd, None);
+    assert_eq!(rej.map(|r| r.error), Some(KittyError::EINVAL));
+
+    // Padding that legitimately ends the payload still closes a transmission normally: four bytes
+    // base64 to `AQIDBA==`, and the killed parser is clean for it.
+    let cmd = parse(&mut parser, &apc("f=32,s=1,v=1", &b64(&[1, 2, 3, 4])), now);
+    assert!(matches!(cmd, Some(KittyCommand::Transmit { .. })));
+    assert!(parser.take_reject().is_none());
+}
+
+#[test]
 fn zlib_payload_inflates_within_cap() {
     let raw: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
     let compressed = zlib(&raw);

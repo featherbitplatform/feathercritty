@@ -27,23 +27,23 @@
 //! payload streams past without being stored.
 //!
 //! The payload is base64 text (the vendored parser drops the control characters inside an OSC
-//! string, so line breaks never arrive here). It is decoded as it arrives: at most three characters
-//! — an incomplete quad — are carried between puts, and a final group decodes with or without its
-//! padding characters. Padding that does not end the payload is not the base64 the protocol sends,
-//! so such a payload drops the image instead of being guessed at.
+//! string, so line breaks never arrive here), decoded incrementally by the shared
+//! [`crate::graphics::b64`]: at most three characters — an incomplete quad — are carried between
+//! puts, and a final group decodes with or without its padding characters. Padding ends the
+//! payload, whether more data follows it in the same put or in a later one: such a payload is not
+//! the base64 the protocol sends, so it drops the image instead of being guessed at.
 //!
 //! Format and pixel size come from the header (the `imagesize` crate): PNG, JPEG and GIF, an
 //! animated file contributing its first frame; anything else is no image. A file cut short behind a
 //! readable header is still handed on — whether the encoded data was complete is the embedder's
 //! decode to report, not something the header can say. An image is refused when a side passes
 //! [`MAX_IMAGE_SIDE`] or one RGBA8 frame of it would pass [`MAX_IMAGE_BYTES`] (what the embedder
-//! decodes into), and a payload past [`MAX_PAYLOAD_BYTES`] is dropped. Every drop releases what it
-//! held at once, so no input can grow this parser past one payload cap, and nothing here panics or
-//! hangs on remote bytes. A sequence that carries no payload displays nothing.
+//! decodes into), and a payload past [`MAX_PAYLOAD_BYTES`] is dropped: a put whose decoded size
+//! would pass the cap is refused on its base64 length, before it becomes bytes. Every drop releases
+//! what it held at once, so no input can grow this parser past one payload cap, and nothing here
+//! panics or hangs on remote bytes. A sequence that carries no payload displays nothing.
 
-use base64::Engine as _;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
-
+use super::b64::Decoder;
 use super::limits::{MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, MAX_PAYLOAD_BYTES};
 
 /// A requested display size, in the unit the sender chose.
@@ -110,8 +110,9 @@ pub struct InlineImageParser {
     /// that was refused or dropped along the way, and for a stray callback with nothing in
     /// progress.
     seq: Option<Sequence>,
-    /// At most three base64 characters left over between puts (an incomplete quad).
-    stash: Vec<u8>,
+    /// The base64 carried between puts (at most three characters), and whether padding has ended
+    /// this sequence's payload.
+    b64: Decoder,
 }
 
 impl InlineImageParser {
@@ -126,22 +127,21 @@ impl InlineImageParser {
     /// and arguments that ask for nothing to display leave no sequence at all, so the payload is
     /// consumed without being stored.
     pub fn start(&mut self, args: &[u8]) {
-        self.stash.clear();
+        self.b64.reset();
         self.seq = parse_args(args).map(|args| Sequence { args, out: Vec::new() });
     }
 
     /// Payload text arrived (`inline_image_put`), in arbitrary slices.
     pub fn put(&mut self, bytes: &[u8]) {
         let Some(mut seq) = self.seq.take() else { return }; // consumed, or never started
-        let decoded = match decode_prefix(&mut self.stash, bytes) {
-            Ok(decoded) => decoded,
-            // Not base64: the image is dropped. There is no reply channel to complain through.
-            Err(()) => return self.discard(),
-        };
-        if seq.out.len() + decoded.len() > MAX_PAYLOAD_BYTES {
-            return self.discard(); // past the payload cap, and nothing from it is kept
+        // The cap is measured against the base64 length inside `put`, before anything decodes.
+        let room = MAX_PAYLOAD_BYTES.saturating_sub(seq.out.len());
+        match self.b64.put(bytes, room) {
+            Ok(decoded) => seq.out.extend_from_slice(&decoded), // `put` proved these bytes fit
+            // Not base64, or past the payload cap: the image is dropped. There is no reply channel
+            // to complain through.
+            Err(_) => return self.discard(),
         }
-        seq.out.extend_from_slice(&decoded);
         self.seq = Some(seq);
     }
 
@@ -154,18 +154,15 @@ impl InlineImageParser {
         let Some(seq) = self.seq.take() else {
             // A stray `end` (`inline_image_abort` already ran, or the argument limit was passed
             // before any start): nothing is in progress and nothing is held.
-            self.stash.clear();
+            self.b64.reset();
             return None;
         };
-        let tail = match drain_tail(&mut self.stash) {
-            Ok(tail) => tail,
-            Err(()) => return None, // the last quad never completed: no bytes to add
+        let tail_room = MAX_PAYLOAD_BYTES.saturating_sub(seq.out.len());
+        let Ok(tail) = self.b64.finish(tail_room) else {
+            return None; // the carried characters are not a final group the protocol accepts
         };
-        if seq.out.len() + tail.len() > MAX_PAYLOAD_BYTES {
-            return None; // the last group put it past the cap
-        }
         let mut bytes = seq.out;
-        bytes.extend_from_slice(&tail);
+        bytes.extend_from_slice(&tail); // `finish` proved these bytes fit inside the cap
         if bytes.is_empty() {
             return None; // a sequence carrying no payload displays nothing
         }
@@ -190,13 +187,13 @@ impl InlineImageParser {
     /// `end` answers nothing.
     fn discard(&mut self) {
         self.seq = None;
-        self.stash.clear();
+        self.b64.reset();
     }
 
     /// Bytes held for the sequence in progress (test hook).
     #[cfg(test)]
     fn held(&self) -> usize {
-        self.seq.as_ref().map_or(0, |seq| seq.out.len()) + self.stash.len()
+        self.seq.as_ref().map_or(0, |seq| seq.out.len()) + self.b64.carried()
     }
 }
 
@@ -301,41 +298,11 @@ fn header_size(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-// --- payload plumbing ---------------------------------------------------------------------
-
-/// Decode the quad-aligned part of `stash + bytes`; at most three characters (an incomplete quad)
-/// stay in `stash` for the next slice. Padding that does not end a quad fails the decode, which
-/// drops the whole image: a padded chunk in mid-payload is not base64 the protocol sends.
-fn decode_prefix(stash: &mut Vec<u8>, bytes: &[u8]) -> Result<Vec<u8>, ()> {
-    let mut all = std::mem::take(stash);
-    all.extend_from_slice(bytes);
-    let quads = all.len() & !3;
-    *stash = all.split_off(quads);
-    STANDARD.decode(&all).map_err(|_| ())
-}
-
-/// Decode what the stash holds when the payload ends: an incomplete final group, with or without
-/// its padding. A single leftover symbol cannot form a byte, and padding with nothing to pad is not
-/// data either; either drops the image.
-fn drain_tail(stash: &mut Vec<u8>) -> Result<Vec<u8>, ()> {
-    let tail = std::mem::take(stash);
-    if tail.is_empty() {
-        return Ok(Vec::new());
-    }
-    let Some(at) = tail.iter().position(|&byte| byte != b'=') else {
-        return Err(()); // padding with nothing to pad
-    };
-    let body = &tail[at..];
-    if body.len() == 1 {
-        return Err(()); // one symbol carries no whole byte
-    }
-    STANDARD_NO_PAD.decode(body).map_err(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use base64::Engine as _;
     use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 
     use crate::graphics::limits::{MAX_IMAGE_BYTES, MAX_IMAGE_SIDE, MAX_PAYLOAD_BYTES};
@@ -548,7 +515,7 @@ mod tests {
         parser.start(b"inline=1");
         for byte in STANDARD.encode(&data).into_bytes() {
             parser.put(&[byte]);
-            assert!(parser.stash.len() <= 3, "at most an incomplete quad is carried over");
+            assert!(parser.b64.carried() <= 3, "at most an incomplete quad is carried over");
         }
         assert_eq!(parser.end().expect("character by character").bytes, data);
     }
@@ -674,6 +641,15 @@ mod tests {
         let mut parser = InlineImageParser::new();
         parser.start(b"inline=1");
         parser.put(text.as_bytes());
+        assert!(parser.end().is_none());
+        assert_eq!(parser.held(), 0);
+
+        // Padding ends the payload across puts too: data after a padded group is refused in the
+        // next put exactly as it would be in the same one.
+        let mut parser = InlineImageParser::new();
+        parser.start(b"inline=1");
+        parser.put(b"QQ==");
+        parser.put(b"QQ==");
         assert!(parser.end().is_none());
         assert_eq!(parser.held(), 0);
 
