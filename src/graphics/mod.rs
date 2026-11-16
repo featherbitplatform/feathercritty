@@ -2,14 +2,16 @@
 
 //! Graphics protocol state machines (feathercritty), fed by the streaming string-sequence
 //! callbacks of [`crate::vte`]: `apc_start`/`apc_put`/`apc_end`/`apc_abort` drive
-//! [`kitty::KittyParser`], `sixel_start`/`sixel_put` drive [`sixel::SixelDecoder`], and the OSC
-//! 1337 parser arrives with its task.
+//! [`kitty::KittyParser`], `sixel_start`/`sixel_put` drive [`sixel::SixelDecoder`], and
+//! `inline_image_start`/`inline_image_put`/`inline_image_end`/`inline_image_abort` drive
+//! [`inline::InlineImageParser`].
 //!
 //! The parsers read image headers and decode pixels where the protocol itself defines a pixel
 //! format (sixel); everything else hands payload bytes to the embedder through events. The
 //! limits in [`limits`] are shared by all of them, and every buffer here is bounded so remote
 //! input cannot make the parser panic, hang or grow without bound.
 
+pub mod inline;
 pub mod kitty;
 pub mod limits;
 pub mod sixel;
