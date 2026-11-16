@@ -23,21 +23,28 @@
 //! (this fork never reads local files); indexed color formats `f=8`/`f=16` and the animation
 //! actions `a=f`, `a=a`, `a=c` with `ENOTSUPPORTED`; anything malformed — unknown or
 //! unsupported keys (`S`, `O`, `N`, `e`, `P`, `Q`, `H`, `V`, `F` among them), bad value types,
-//! both `i` and `I` in one frame, an out-of-range integer, a truncated compressed stream — with
-//! `EINVAL`; images over the size limits of [`crate::graphics::limits`] and transmissions past
-//! [`MAX_PAYLOAD_BYTES`] with `ENOMEM`; PNG data whose header is missing or unreadable with
-//! `EBADPNG`. A transmission that carries no payload decodes to nothing and is silently
-//! ignored: there is no image to store or place.
+//! both `i` and `I` in one frame, an out-of-range integer, a truncated compressed stream, raw
+//! data that does not match its declared size (compressed data longer than declared is refused
+//! without inflating the excess) — with `EINVAL`; images over the size limits of
+//! [`crate::graphics::limits`] and transmissions past [`MAX_PAYLOAD_BYTES`] with `ENOMEM`; PNG
+//! data whose header is missing or unreadable with `EBADPNG`. A transmission that carries no
+//! payload decodes to nothing and is silently ignored: there is no image to store or place. The
+//! query action `a=q` is checked exactly as the transmission it asks about, so a client probing
+//! which transfer media work gets `EBADF` for the ones this terminal will not accept instead of
+//! an `OK` that every later image would contradict.
 //!
 //! Rejections do not travel as commands: they sit in a one-slot side channel,
 //! [`take_reject`](KittyParser::take_reject), until the caller answers them with
-//! [`reply`]. Bad control data never disturbs a chunked upload in progress — only a payload
-//! failure, a delete command or a frame that starts another transmission ends one (the protocol
-//! asks a delete to abort an upload). Time is injected through `end(now)`: a transmission that
-//! has made no progress for [`STALL`] is dropped there with `ENOMEM`, so tests never sleep. Every
-//! buffer is bounded: the staged payload of one APC frame and the accumulated bytes of one
-//! transmission by [`MAX_PAYLOAD_BYTES`], the inflated output by [`MAX_IMAGE_BYTES`]; a dropped
-//! transmission releases what it held.
+//! [`reply`], which echoes the id and — for an image addressed by number — the number too. Bad
+//! control data never disturbs a chunked upload in progress — only a payload failure, a delete
+//! command or a frame that starts another transmission ends one (the protocol asks a delete to
+//! abort an upload). Time is injected: `end(now)` and [`tick`](KittyParser::tick) drop a
+//! transmission that has made no progress for [`STALL`] with `ENOMEM` — `tick` so that an idle
+//! terminal releases a client that stopped mid-upload — and tests never sleep. Every buffer is
+//! bounded: the staged payload of one APC frame and the accumulated bytes of one transmission by
+//! [`MAX_PAYLOAD_BYTES`], the inflated output by [`MAX_IMAGE_BYTES`] or, for a declared raw
+//! format, by its own declared size; base64 carries at most three characters between chunks. A
+//! dropped transmission releases what it held.
 
 use std::time::Instant;
 
@@ -104,18 +111,23 @@ impl KittyError {
 pub struct KittyReject {
     /// The `i` of the sequence that failed, 0 when it carried none.
     pub id: u32,
+    /// The `I` image number of the sequence that failed, for [`reply`] to echo.
+    pub number: Option<u32>,
     /// The failure to report.
     pub error: KittyError,
     /// The sequence's quiet level, for `reply`.
     pub quiet: u8,
 }
 
-/// Builds a graphics protocol response frame: `ESC _ G i=<id>[,p=<pid>] ; OK|<ECODE>:<message>
-/// ESC \`. A placement id only travels with an image id (the protocol ignores placement ids on
-/// images without one), and nothing is echoed for an unnamed image. `q=1` suppresses the OK
-/// answer, `q=2` suppresses every answer; failures survive `q=1`.
+/// Builds a graphics protocol response frame: `ESC _ G i=<id>[,I=<number>][,p=<pid>]
+/// ; OK|<ECODE>:<message> ESC \`. When the client addressed an image by number the terminal
+/// answers with the id it assigned *and* echoes the number (`i=99,I=13` for `I=13`). A placement
+/// id only travels with an image id (the protocol ignores placement ids on images without one),
+/// and nothing is echoed for an unnamed, unnumbered image. `q=1` suppresses the OK answer, `q=2`
+/// suppresses every answer; failures survive `q=1`.
 pub fn reply(
     id: u32,
+    number: Option<u32>,
     placement: Option<u32>,
     result: Result<(), KittyError>,
     quiet: u8,
@@ -128,6 +140,13 @@ pub fn reply(
     out.extend_from_slice(b"\x1b_G");
     if id != 0 {
         out.extend_from_slice(format!("i={id}").as_bytes());
+    }
+    if let Some(n) = number {
+        // A number alone (no id yet, e.g. a rejection before an id was assigned) still travels.
+        let sep = if id == 0 { "" } else { "," };
+        out.extend_from_slice(format!("{sep}I={n}").as_bytes());
+    }
+    if id != 0 {
         if let Some(pid) = placement.filter(|p| *p != 0) {
             out.extend_from_slice(format!(",p={pid}").as_bytes());
         }
@@ -347,7 +366,20 @@ struct Pending {
     stream_end: bool,
     /// The placement carried by an `a=T` frame, if any.
     place: Option<KittyPlace>,
+    /// Bytes the declared raw format (`f=24|32`) expects: `s * v * bpp`. For `o=z` data the
+    /// inflate stops here — compressed pixel data longer than its declaration is EINVAL rather
+    /// than a full inflate of whatever the client sent.
+    raw_limit: Option<usize>,
     last_progress: Instant,
+}
+
+impl Pending {
+    /// The byte count a raw format declared, as the inflate's stop line: compressed pixel data
+    /// longer than its declaration is EINVAL. `None` (PNG or an undeclared format) leaves the
+    /// image cap as the only ceiling.
+    fn declared_size(&self) -> Option<u64> {
+        self.raw_limit.map(|n| n as u64)
+    }
 }
 
 /// The kitty graphics protocol state machine; see the [module docs](self).
@@ -375,12 +407,13 @@ impl KittyParser {
     /// without ending) is discarded.
     pub fn start(&mut self) {
         if self.frame.active {
-            self.abort(); // a frame started without ending: drop it and begin again
-        } else {
-            self.frame = Frame::inactive();
-            self.frame.active = true;
-            self.frame.region = Region::WaitingG;
+            // A frame started without ending (the vte parser aborted it): drop it, then set up
+            // the new one. An upload completed by earlier chunks keeps its data.
+            self.abort();
         }
+        self.frame = Frame::inactive();
+        self.frame.active = true;
+        self.frame.region = Region::WaitingG;
     }
 
     /// APC content arrived (`apc_put`), in arbitrary slices.
@@ -436,6 +469,7 @@ impl KittyParser {
         } else if let Some(error) = frame.error {
             self.reject = self.reject.take().or(Some(KittyReject {
                 id: frame.keys.i.unwrap_or(0),
+                number: frame.keys.number,
                 error,
                 quiet: frame.keys.q.unwrap_or(0),
             }));
@@ -447,18 +481,7 @@ impl KittyParser {
             }
         };
         if !touched {
-            if let Some(pending) = &self.pending {
-                if now.saturating_duration_since(pending.last_progress) > STALL {
-                    let (id, quiet) = (pending.id.unwrap_or(0), pending.quiet);
-                    self.pending = None;
-                    self.stash.clear();
-                    self.reject = self.reject.take().or(Some(KittyReject {
-                        id,
-                        error: KittyError::ENOMEM,
-                        quiet,
-                    }));
-                }
-            }
+            self.drop_stalled(now);
         }
         command
     }
@@ -469,6 +492,31 @@ impl KittyParser {
     /// never saw this frame's bytes: they are fed only when a frame ends).
     pub fn abort(&mut self) {
         self.frame = Frame::inactive();
+    }
+
+    /// Nothing arrived on the wire: callers run this on a timer so that a client which stops
+    /// mid-upload while the terminal sits idle is released anyway. It drops a chunked transmission
+    /// that has made no progress for [`STALL`], with the `ENOMEM` rejection waiting in
+    /// [`take_reject`](Self::take_reject); the frame being parsed, if any, is left alone.
+    pub fn tick(&mut self, now: Instant) {
+        self.drop_stalled(now);
+    }
+
+    /// The stall check shared by `end` and `tick`.
+    fn drop_stalled(&mut self, now: Instant) {
+        if let Some(pending) = &self.pending {
+            if now.saturating_duration_since(pending.last_progress) > STALL {
+                let (id, number, quiet) = (pending.id.unwrap_or(0), pending.number, pending.quiet);
+                self.pending = None;
+                self.stash.clear();
+                self.reject = self.reject.take().or(Some(KittyReject {
+                    id,
+                    number,
+                    error: KittyError::ENOMEM,
+                    quiet,
+                }));
+            }
+        }
     }
 
     /// Takes the rejection waiting to be answered, if any. Rejections are kept one deep: a
@@ -662,14 +710,18 @@ impl KittyParser {
                 },
                 b'q' => {
                     // The query action needs an id to answer for; it stores nothing and leaves
-                    // any chunked upload alone.
-                    return match keys.i {
-                        Some(id) => Some(KittyCommand::Query { id, quiet: keys.q.unwrap_or(0) }),
-                        None => {
-                            self.reject_once(keys, KittyError::EINVAL);
-                            None
-                        },
+                    // any chunked upload alone. It must still refuse what a transmission would:
+                    // clients use the query to choose a transfer medium, so answering OK for
+                    // `t=f` would have them pick a medium every later image fails on.
+                    let Some(id) = keys.i else {
+                        self.reject_once(keys, KittyError::EINVAL);
+                        return None;
                     };
+                    if let Err(error) = plan_transmit(&keys) {
+                        self.reject_once(keys, error);
+                        return None;
+                    }
+                    return Some(KittyCommand::Query { id, quiet: keys.q.unwrap_or(0) });
                 },
                 b'p' => {
                     return Some(KittyCommand::Place(build_place(&keys, keys.q.unwrap_or(0))));
@@ -693,6 +745,15 @@ impl KittyParser {
                 return None;
             }
             let compressed = keys.o == Some(b'z');
+            // `plan_transmit` validated the declared raw size, so it is safe to use as the
+            // inflate ceiling for `o=z` data.
+            let raw_limit = match (keys.f, keys.s, keys.v) {
+                (Some(f @ (24 | 32)), Some(w), Some(h)) => {
+                    let bpp: u64 = if f == 24 { 3 } else { 4 };
+                    Some((u64::from(w) * u64::from(h) * bpp) as usize)
+                },
+                _ => None,
+            };
             *touched = true;
             self.pending = Some(Pending {
                 id: keys.i,
@@ -707,6 +768,7 @@ impl KittyParser {
                 fed: 0,
                 stream_end: false,
                 place: (keys.a == Some(b'T')).then(|| build_place(&keys, keys.q.unwrap_or(0))),
+                raw_limit,
                 last_progress: now,
             });
             self.stash.clear();
@@ -742,10 +804,12 @@ impl KittyParser {
                 match p.fed.checked_add(decoded.len() as u64) {
                     Some(total) if total <= MAX_PAYLOAD_BYTES as u64 => {
                         p.fed = total;
+                        let declared = p.declared_size();
                         pump(
                             p.inflator.as_mut().expect("compressed sets one"),
                             &decoded,
                             &mut p.out,
+                            declared,
                         )
                         .map(|done| p.stream_end |= done)
                     },
@@ -772,20 +836,27 @@ impl KittyParser {
         };
         let close_result = {
             let p = pending.as_mut().unwrap();
-            if !p.compressed || p.stream_end {
+            if !p.compressed {
                 if p.out.len() + tail.len() > MAX_PAYLOAD_BYTES {
-                    Err(KittyError::ENOMEM)
+                    Err(KittyError::ENOMEM) // the transmission passed its data cap
                 } else {
-                    p.out.extend_from_slice(&tail); // for a finished stream these trail and are ignored too
+                    p.out.extend_from_slice(&tail);
                     Ok(())
                 }
+            } else if p.stream_end {
+                // A finished zlib stream is complete: base64 that decodes past its end is not
+                // image data and is dropped, not appended.
+                Ok(())
             } else if p.fed == 0 && tail.is_empty() {
                 Ok(()) // nothing was ever fed to the decompressor: an empty transmission
             } else {
+                let declared = p.declared_size();
                 let inflator = p.inflator.as_mut().expect("compressed sets one");
-                match pump(inflator, &tail, &mut p.out) {
+                match pump(inflator, &tail, &mut p.out, declared) {
                     Ok(true) => Ok(true),
-                    Ok(false) => pump_with(inflator, &[], &mut p.out, FlushDecompress::Finish),
+                    Ok(false) => {
+                        pump_with(inflator, &[], &mut p.out, FlushDecompress::Finish, declared)
+                    },
                     Err(error) => Err(error),
                 }
                 .and_then(|done| if done { Ok(()) } else { Err(KittyError::EINVAL) }) // truncated stream
@@ -835,6 +906,7 @@ impl KittyParser {
     fn reject_once(&mut self, keys: Keys, error: KittyError) {
         self.reject = self.reject.take().or(Some(KittyReject {
             id: keys.i.unwrap_or(0),
+            number: keys.number,
             error,
             quiet: keys.q.unwrap_or(0),
         }));
@@ -955,8 +1027,12 @@ fn kill(
 ) {
     if let Some(pending) = pending.take() {
         if reject.is_none() {
-            *reject =
-                Some(KittyReject { id: pending.id.unwrap_or(0), error, quiet: pending.quiet });
+            *reject = Some(KittyReject {
+                id: pending.id.unwrap_or(0),
+                number: pending.number,
+                error,
+                quiet: pending.quiet,
+            });
         }
     }
     stash.clear();
@@ -992,10 +1068,18 @@ fn drain_tail(stash: &mut Vec<u8>) -> Result<Vec<u8>, ()> {
     STANDARD_NO_PAD.decode(body).map_err(|_| ())
 }
 
-/// Inflate `input` into `out`, stopping at the stream end. Errors on corrupt data (`EINVAL`) or
-/// once `out` would pass `MAX_IMAGE_BYTES` (`ENOMEM`). Returns whether the stream ended.
-fn pump(inflator: &mut Decompress, input: &[u8], out: &mut Vec<u8>) -> Result<bool, KittyError> {
-    pump_with(inflator, input, out, FlushDecompress::None)
+/// Inflate `input` into `out`, stopping at the stream end. Errors on corrupt data (`EINVAL`), once
+/// the output would pass `MAX_IMAGE_BYTES` (`ENOMEM` — checked first, so a bomb is reported as too
+/// much image data), or once it passes the `declared` byte count of a raw format (`EINVAL`: more
+/// pixel data than the sender described, and the excess is never inflated). Returns whether the
+/// stream ended.
+fn pump(
+    inflator: &mut Decompress,
+    input: &[u8],
+    out: &mut Vec<u8>,
+    declared: Option<u64>,
+) -> Result<bool, KittyError> {
+    pump_with(inflator, input, out, FlushDecompress::None, declared)
 }
 
 fn pump_with(
@@ -1003,6 +1087,7 @@ fn pump_with(
     input: &[u8],
     out: &mut Vec<u8>,
     flush: FlushDecompress,
+    declared: Option<u64>,
 ) -> Result<bool, KittyError> {
     let mut spare = vec![0u8; INFLATE_SPARE];
     let mut pos = 0usize;
@@ -1016,8 +1101,12 @@ fn pump_with(
         let produced = (inflator.total_out() - out_before) as usize;
         pos += consumed;
         if produced > 0 {
-            if out.len() as u64 + produced as u64 > MAX_IMAGE_BYTES {
+            let total = out.len() as u64 + produced as u64;
+            if total > MAX_IMAGE_BYTES {
                 return Err(KittyError::ENOMEM);
+            }
+            if declared.is_some_and(|declared| total > declared) {
+                return Err(KittyError::EINVAL); // more pixel data than the sender declared
             }
             out.extend_from_slice(&spare[..produced]);
         }
@@ -1053,7 +1142,6 @@ fn uint(value: &[u8]) -> Option<u32> {
     std::str::from_utf8(value).ok()?.parse().ok()
 }
 
-/// A signed 32-bit decimal value.
 /// A signed 32-bit decimal value (plain digits with an optional leading minus).
 fn int(value: &[u8]) -> Option<i32> {
     let digits = value.strip_prefix(b"-").unwrap_or(value);

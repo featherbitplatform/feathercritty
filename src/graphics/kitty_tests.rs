@@ -490,22 +490,41 @@ fn stalled_transmission_is_dropped() {
 
 #[test]
 fn reply_quiet_levels() {
-    assert_eq!(reply(5, Some(2), Ok(()), 0), Some(b"\x1b_Gi=5,p=2;OK\x1b\\".to_vec()));
+    assert_eq!(reply(5, None, Some(2), Ok(()), 0), Some(b"\x1b_Gi=5,p=2;OK\x1b\\".to_vec()));
     // q=1 suppresses OK responses.
-    assert_eq!(reply(5, Some(2), Ok(()), 1), None);
+    assert_eq!(reply(5, None, Some(2), Ok(()), 1), None);
     // ...but not failure responses.
     assert_eq!(
-        reply(5, None, Err(KittyError::ENOENT), 1),
+        reply(5, None, None, Err(KittyError::ENOENT), 1),
         Some(b"\x1b_Gi=5;ENOENT:image not found\x1b\\".to_vec())
     );
     // q=2 suppresses everything.
-    assert_eq!(reply(5, Some(2), Ok(()), 2), None);
-    assert_eq!(reply(5, None, Err(KittyError::ENOMEM), 2), None);
-    // Without an id nothing is echoed; only the message travels.
-    assert_eq!(reply(0, Some(3), Ok(()), 0), Some(b"\x1b_G;OK\x1b\\".to_vec()));
+    assert_eq!(reply(5, None, Some(2), Ok(()), 2), None);
+    assert_eq!(reply(5, None, None, Err(KittyError::ENOMEM), 2), None);
+    // Without an id and without a number nothing is echoed; only the message travels.
+    assert_eq!(reply(0, None, Some(3), Ok(()), 0), Some(b"\x1b_G;OK\x1b\\".to_vec()));
     assert_eq!(
-        reply(9, None, Err(KittyError::EBADPNG), 0),
+        reply(9, None, None, Err(KittyError::EBADPNG), 0),
         Some(b"\x1b_Gi=9;EBADPNG:malformed PNG data\x1b\\".to_vec())
+    );
+
+    // An image addressed by number is answered with the id the terminal assigned and the number
+    // echoed beside it (the protocol's example answers `I=13` with `i=99,I=13`).
+    assert_eq!(reply(99, Some(13), None, Ok(()), 0), Some(b"\x1b_Gi=99,I=13;OK\x1b\\".to_vec()));
+    // A failure that has no id yet still echoes the number it was addressed by.
+    assert_eq!(
+        reply(0, Some(13), None, Err(KittyError::EINVAL), 0),
+        Some(b"\x1b_GI=13;EINVAL:invalid control data\x1b\\".to_vec())
+    );
+
+    // The rejection channel carries the number for exactly this answer.
+    let (cmd, rej) = once(&apc("f=24,I=13,s=1,v=1", &b64(&[1, 2]))); // two of three bytes
+    assert_eq!(cmd, None);
+    let rej = rej.expect("short pixel data is rejected");
+    assert_eq!((rej.id, rej.number), (0, Some(13)));
+    assert_eq!(
+        reply(rej.id, rej.number, None, Err(rej.error), rej.quiet),
+        Some(b"\x1b_GI=13;EINVAL:invalid control data\x1b\\".to_vec())
     );
 }
 
@@ -700,4 +719,148 @@ fn delete_aborts_partial_upload() {
     let cmd = parse(&mut parser, &apc("f=32,s=1,v=1", &b64(b"abcd")), now);
     assert!(matches!(cmd, Some(KittyCommand::Transmit { .. })));
     assert!(parser.take_reject().is_none());
+}
+
+#[test]
+fn query_reports_refused_media() {
+    // A client chooses its transfer medium by querying it. Answering OK for a medium a real
+    // transmission would refuse would send every later image down a path that always fails.
+    for control in ["a=q,i=31,t=f", "a=q,i=31,t=t", "a=q,i=31,t=s"] {
+        let (cmd, rej) = once(&apc(control, b""));
+        assert_eq!(cmd, None, "{control} must not be answered OK");
+        let rej = rej.expect("{control} is refused");
+        assert_eq!((rej.error, rej.id), (KittyError::EBADF, 31));
+    }
+
+    // Everything else a transmission is checked for applies to its query too.
+    let (_, rej) = once(&apc("a=q,i=31,f=7", b""));
+    assert_eq!(rej.expect("f=7 is not a format").error, KittyError::EINVAL);
+    let (_, rej) = once(&apc("a=q,i=31,f=24", b""));
+    assert_eq!(rej.expect("raw data needs s and v").error, KittyError::EINVAL);
+    let (_, rej) = once(&apc("a=q,i=31,t=d,f=24,s=20000,v=1", b""));
+    assert_eq!(rej.expect("the side passes the limit").error, KittyError::ENOMEM);
+
+    // What this terminal can do is answered: direct data, with the id and quiet level echoed.
+    let (cmd, rej) = once(&apc("a=q,i=31,t=d,f=24,s=1,v=1,q=1", &b64(&[1, 2, 3])));
+    assert_eq!(cmd, Some(KittyCommand::Query { id: 31, quiet: 1 }));
+    assert!(rej.is_none());
+    let (cmd, _) = once(&apc("a=q,i=31", b"")); // a bare support probe carries no parameters
+    assert_eq!(cmd, Some(KittyCommand::Query { id: 31, quiet: 0 }));
+}
+
+#[test]
+fn tick_drops_stalled_transmission() {
+    let t0 = Instant::now();
+    let mut parser = KittyParser::new();
+    assert_eq!(parse(&mut parser, &apc("f=32,s=1,v=1,m=1,i=6,q=1", b"AAAA"), t0), None);
+
+    // Nothing arrives on the wire; a tick inside the window changes nothing.
+    parser.tick(t0 + Duration::from_secs(9));
+    assert!(parser.take_reject().is_none());
+    assert!(parser.held_bytes() > 0);
+
+    // Past STALL the upload is released even though no APC sequence came in at all.
+    parser.tick(t0 + Duration::from_secs(11));
+    let rej = parser.take_reject().expect("tick dropped the stalled upload");
+    assert_eq!((rej.error, rej.id, rej.quiet), (KittyError::ENOMEM, 6, 1));
+    assert_eq!(parser.held_bytes(), 0);
+
+    // The next sequence parses normally.
+    let cmd = parse(&mut parser, &apc("a=q,i=3", b""), t0 + Duration::from_secs(12));
+    assert_eq!(cmd, Some(KittyCommand::Query { id: 3, quiet: 0 }));
+
+    // A chunk that arrived moved the clock: ticking soon after it keeps the upload alive.
+    let late = t0 + Duration::from_secs(20);
+    assert_eq!(parse(&mut parser, &apc("f=24,s=1,v=1,m=1", b"AQID"), late), None);
+    parser.tick(late + Duration::from_secs(5));
+    assert!(parser.take_reject().is_none());
+    assert!(parser.held_bytes() > 0);
+
+    // `tick` never disturbs a frame being parsed: only the stalled upload is released.
+    parser.start();
+    parser.put(b"Ga=q,i=4");
+    parser.tick(late + Duration::from_secs(30));
+    assert_eq!(
+        parser.end(late + Duration::from_secs(30)),
+        Some(KittyCommand::Query { id: 4, quiet: 0 })
+    );
+}
+
+#[test]
+fn a_second_start_abandons_the_unfinished_frame() {
+    let now = Instant::now();
+    let mut parser = KittyParser::new();
+    parser.start();
+    parser.put(&apc("f=24,s=1,v=1,m=1", b"AQID")); // staged, but its `end` never came
+    assert!(parser.held_bytes() > 0);
+
+    // Starting again drops that frame silently and sets up the new one.
+    parser.start();
+    assert_eq!(parser.take_reject(), None); // abandoning a frame is not an error
+    assert_eq!(parser.held_bytes(), 0); // its staged payload is gone
+    parser.put(b"Ga=q,i=3");
+    assert_eq!(parser.end(now), Some(KittyCommand::Query { id: 3, quiet: 0 }));
+
+    // Chunks completed by earlier sequences are not "the frame in progress": they survive.
+    let mut parser = KittyParser::new();
+    assert_eq!(parse(&mut parser, &apc("f=24,s=1,v=2,m=1", b"AQID"), now), None);
+    parser.start();
+    parser.put(b"Gm=1;AAAA"); // an unfinished second chunk...
+    parser.start(); // ...abandoned by a new sequence instead of CAN/SUB
+    let cmd = parse(&mut parser, &apc("m=0", b"AQID"), now);
+    let Some(KittyCommand::Transmit { bytes, .. }) = cmd else {
+        panic!("the transmission did not finish: {cmd:?}");
+    };
+    assert_eq!(bytes, vec![1, 2, 3, 1, 2, 3]); // chunk one, the abandoned frame skipped, chunk three
+}
+
+#[test]
+fn bytes_after_a_finished_zlib_stream_are_dropped() {
+    // A transmission whose zlib stream ends early: whatever decodes after the stream end is not
+    // image data, so it is dropped rather than appended to the pixels.
+    let mut payload = zlib(&[1, 2, 3]);
+    payload.extend_from_slice(b"trailing garbage past the end of the stream");
+    let (cmd, rej) = once(&apc("f=24,s=1,v=1,o=z", &b64(&payload)));
+    assert!(rej.is_none(), "trailing bytes must not fail the transmission: {rej:?}");
+    let Some(KittyCommand::Transmit { bytes, format, .. }) = cmd else {
+        panic!("expected a transmit command, got {cmd:?}");
+    };
+    assert_eq!(bytes, vec![1, 2, 3]); // the inflate output only
+    assert_eq!(format, KittyFormat::Rgb { width: 1, height: 1 });
+}
+
+#[test]
+fn compressed_raw_data_longer_than_declared_is_einval() {
+    // The declared size is the inflate ceiling for a raw format: over-long compressed pixel data
+    // is EINVAL, and the excess is never inflated at all.
+    let (cmd, rej) = once(&apc("f=24,s=1,v=1,o=z", &b64(&zlib(&[1, 2, 3, 4, 5, 6]))));
+    assert_eq!(cmd, None);
+    assert_eq!(rej.expect("data longer than declared").error, KittyError::EINVAL);
+
+    // The declared amount inflates and is accepted.
+    let (cmd, rej) = once(&apc("f=24,s=1,v=1,o=z", &b64(&zlib(&[1, 2, 3]))));
+    assert!(rej.is_none());
+    assert!(matches!(cmd, Some(KittyCommand::Transmit { .. })));
+
+    // Short data is still EINVAL: the pixel buffer it declared is incomplete.
+    let (cmd, rej) = once(&apc("f=24,s=1,v=1,o=z", &b64(&zlib(&[1]))));
+    assert_eq!(cmd, None);
+    assert_eq!(rej.expect("short data").error, KittyError::EINVAL);
+}
+
+#[test]
+fn compressed_output_is_capped_at_the_image_limit_not_the_payload_cap() {
+    // 18 MB of RGB24 inflates from a payload far under the 16 MiB that caps transmitted bytes:
+    // the inflate is bounded by the image limit (64 MiB), so this transmission is accepted.
+    let (w, h) = (3000u32, 2000u32); // 18 MB of pixel data
+    let raw = vec![7u8; w as usize * h as usize * 3];
+    assert!(raw.len() > MAX_PAYLOAD_BYTES, "the fixture must exceed the transmitted-data cap");
+    let payload = zlib(&raw);
+    let (cmd, rej) = once(&apc(&format!("f=24,s={w},v={h},o=z"), &b64(&payload)));
+    assert!(rej.is_none(), "{rej:?}");
+    let Some(KittyCommand::Transmit { bytes, format, .. }) = cmd else {
+        panic!("expected a transmit command, got {cmd:?}");
+    };
+    assert_eq!(format, KittyFormat::Rgb { width: w, height: h });
+    assert_eq!(bytes.len(), raw.len());
 }
