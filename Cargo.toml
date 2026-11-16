@@ -78,6 +78,10 @@ rand_chacha = "0.3"
 # Checks that a match the fork returns where 0.26.0 cannot answer is a real match (the library
 # already depends on this crate).
 regex-automata = "0.4.3"
+# The sixel reference fixtures (src/graphics/sixel_tests.rs): their expected pixels are written as
+# PNG by the fixture generator and read back in the test to compare the decoder against. Dev-only;
+# nothing in the library encodes or decodes PNG through it.
+png = "0.17"
 
 # Benchmarks print their own tables (and take `--gate`), so they bring their own `main`.
 [[bench]]
