@@ -26,6 +26,13 @@
 //! * OSC Strings can be terminated by 0x07
 //! * Only supports 7-bit codes
 //!
+//! feathercritty adds string sequences that are streamed to the [`Perform`] implementation instead
+//! of buffered, so a large payload costs no parser memory: APC strings ([`Perform::apc_start`],
+//! [`Perform::apc_put`], [`Perform::apc_end`], [`Perform::apc_abort`]), the payload of an OSC 1337
+//! inline image (`ESC ] 1337 ; File = <args> : <data>`, [`Perform::osc_stream_start`] and friends)
+//! and runs of device control string bytes ([`Perform::put_slice`]). SOS and PM are discarded, as
+//! they were.
+//!
 //! [`Parser`]: struct.Parser.html
 //! [`Perform`]: trait.Perform.html
 //! [Paul Williams' ANSI parser state machine]: https://vt100.net/emu/dec_ansi_parser
@@ -40,6 +47,10 @@ use core::str;
 mod params;
 
 pub mod ansi;
+// feathercritty: tests for the streamed string sequences added by this fork.
+#[cfg(test)]
+mod tests_strings;
+
 pub use params::{Params, ParamsIter};
 
 const MAX_INTERMEDIATES: usize = 2;
@@ -49,6 +60,15 @@ const MAX_OSC_RAW: usize = 1024;
 // feathercritty: maximum raw bytes kept for an OSC string. Longer OSC strings are discarded
 // (not dispatched) unless their first parameter is 1337, whose arguments carry inline image data.
 pub const MAX_OSC_BYTES: usize = 64 * 1024;
+
+// feathercritty: maximum bytes of the arguments of an OSC 1337 inline image (`File=<args>:`). The
+// args are the only part of such an image the parser keeps; the payload is streamed. An image whose
+// args pass this limit without a `:` is aborted (see `OscStream`).
+const MAX_OSC_STREAM_ARGS: usize = 4 * 1024;
+
+// feathercritty: the marker in an OSC 1337 string that starts an inline image, matched byte by
+// byte so a read split inside it still matches.
+const OSC_FILE_MARKER: &[u8] = b"File=";
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
@@ -70,6 +90,9 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     // feathercritty: set once an OSC exceeds `MAX_OSC_BYTES` and is not exempt from the cap.
     // While it is set no more bytes are stored and the finished OSC is not dispatched.
     osc_too_long: bool,
+    // feathercritty: how far the current OSC string has been recognised as an inline image; see
+    // `OscStream`. Reset with the rest of the OSC state.
+    osc_stream: OscStream,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
 }
@@ -109,6 +132,14 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                // feathercritty: these states consume a run of bytes at a time (see the methods
+                // they call). Like the ground state they are not re-entered between the bytes of a
+                // run; no action they dispatch can end the parse early.
+                State::DcsPassthrough => i += self.advance_dcs_passthrough(performer, &bytes[i..]),
+                State::ApcString => i += self.advance_apc_string(performer, &bytes[i..]),
+                State::OscImagePayload => {
+                    i += self.advance_osc_image_payload(performer, &bytes[i..])
+                },
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -144,6 +175,14 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() && !performer.terminated() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                // feathercritty: run-based states (see `Self::advance`); [`Perform::terminated`] is
+                // checked once per run instead of once per byte, and none of the actions in a run
+                // can set it.
+                State::DcsPassthrough => i += self.advance_dcs_passthrough(performer, &bytes[i..]),
+                State::ApcString => i += self.advance_apc_string(performer, &bytes[i..]),
+                State::OscImagePayload => {
+                    i += self.advance_osc_image_payload(performer, &bytes[i..])
+                },
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -167,12 +206,16 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::DcsIgnore => self.anywhere(performer, byte),
             State::DcsIntermediate => self.advance_dcs_intermediate(performer, byte),
             State::DcsParam => self.advance_dcs_param(performer, byte),
-            State::DcsPassthrough => self.advance_dcs_passthrough(performer, byte),
             State::Escape => self.advance_esc(performer, byte),
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
             State::SosPmApcString => self.anywhere(performer, byte),
-            State::Ground => unreachable!(),
+            // feathercritty: `DcsPassthrough` and the two streaming string states consume runs of
+            // bytes, so the read loop calls them itself with the rest of the input; they are never
+            // reached one byte at a time.
+            State::DcsPassthrough | State::ApcString | State::OscImagePayload | State::Ground => {
+                unreachable!()
+            },
         }
     }
 
@@ -305,13 +348,33 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         }
     }
 
-    #[inline(always)]
-    fn advance_dcs_passthrough<P: Perform>(&mut self, performer: &mut P, byte: u8) {
-        match byte {
-            0x00..=0x17 | 0x19 | 0x1C..=0x7E => performer.put(byte),
+    /// Handle a run of device control string bytes.
+    ///
+    /// feathercritty: the bytes vte hands to the handler one at a time are collected into a run and
+    /// passed with [`Perform::put_slice`], so a sixel payload arrives in pieces instead of single
+    /// bytes. Which bytes are passed on, which are dropped and which end the string is unchanged;
+    /// `CAN` and `SUB` report the cancellation with [`Perform::unhook_cancelled`].
+    ///
+    /// Returns the number of bytes consumed, up to and including the byte that left the state (or
+    /// stopped the run), so the read loop re-enters with whatever state that byte set.
+    #[inline]
+    fn advance_dcs_passthrough<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        // The handler receives `0x00..=0x17`, `0x19` and `0x1C..=0x7E`; the byte that stops the run
+        // is one of the ones matched below.
+        let run = bytes.iter().position(|&byte| !matches!(byte, 0x00..=0x17 | 0x19 | 0x1C..=0x7E));
+        let run = run.unwrap_or(bytes.len());
+
+        if run != 0 {
+            performer.put_slice(&bytes[..run]);
+            if run == bytes.len() {
+                return run;
+            }
+        }
+
+        match bytes[run] {
             0x18 | 0x1A => {
-                performer.unhook();
-                performer.execute(byte);
+                performer.unhook_cancelled();
+                performer.execute(bytes[run]);
                 self.state = State::Ground
             },
             0x1B => {
@@ -319,13 +382,15 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.reset_params();
                 self.state = State::Escape
             },
-            0x7F => (),
             0x9C => {
                 performer.unhook();
                 self.state = State::Ground
             },
+            // `DEL` and the other C1 controls are dropped, as in vte; the state does not change.
             _ => (),
         }
+
+        run + 1
     }
 
     #[inline(always)]
@@ -348,6 +413,8 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
             },
+            // feathercritty: SOS is discarded as before; APC (`0x5F`) streams (see
+            // `advance_apc_string`).
             0x58 => self.state = State::SosPmApcString,
             0x59..=0x5A => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
@@ -362,13 +429,17 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.state = State::Ground
             },
             0x5D => {
-                self.osc_raw.clear();
-                self.osc_num_params = 0;
-                // feathercritty: clear the size-cap flag for the new OSC string.
-                self.osc_too_long = false;
+                // feathercritty: this also clears the inline-image streaming state (see
+                // `reset_osc`).
+                self.reset_osc();
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            // feathercritty: PM (`ESC ^`) is discarded as before; APC (`ESC _`) streams.
+            0x5E => self.state = State::SosPmApcString,
+            0x5F => {
+                performer.apc_start();
+                self.state = State::ApcString
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -399,6 +470,48 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
     #[inline(always)]
     fn advance_osc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        // feathercritty: an OSC 1337 whose second parameter starts with `File=` is streamed (see
+        // `OscStream`). The marker and the arguments are buffered like any other OSC string, so a
+        // string that turns out not to be an inline image dispatches exactly what vte dispatched;
+        // only the payload after the `:` bypasses the buffer.
+        match self.osc_stream {
+            OscStream::Marker { matched } if OSC_FILE_MARKER.get(matched) == Some(&byte) => {
+                self.action_osc_put(byte);
+                self.osc_stream = if matched + 1 == OSC_FILE_MARKER.len() {
+                    OscStream::Args { begin: self.osc_raw.len() }
+                } else {
+                    OscStream::Marker { matched: matched + 1 }
+                };
+                return;
+            },
+            // Not `File=` after all: an ordinary OSC, this byte included.
+            OscStream::Marker { .. } => self.osc_stream = OscStream::Buffered,
+            OscStream::Args { begin } => return self.advance_osc_args(performer, byte, begin),
+            // An aborted image: read on to the terminator and dispatch nothing.
+            OscStream::Dead => {
+                match byte {
+                    0x07 => {
+                        self.reset_osc();
+                        self.state = State::Ground
+                    },
+                    0x18 | 0x1A => {
+                        self.reset_osc();
+                        performer.execute(byte);
+                        self.state = State::Ground
+                    },
+                    0x1B => {
+                        self.reset_osc();
+                        self.reset_params();
+                        self.state = State::Escape
+                    },
+                    _ => (),
+                }
+
+                return;
+            },
+            OscStream::Buffered => (),
+        }
+
         match byte {
             0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (),
             0x07 => {
@@ -425,9 +538,149 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 if self.osc_num_params >= MAX_OSC_PARAMS {
                     self.action_osc_put(0x3B);
                 }
+
+                // feathercritty: `1337` as the first parameter starts the marker check.
+                if self.osc_num_params == 1 && self.osc_is_1337() {
+                    self.osc_stream = OscStream::Marker { matched: 0 };
+                }
             },
             _ => self.action_osc_put(byte),
         }
+    }
+
+    /// Handle one byte of an inline image's arguments (`File = <args> :`).
+    ///
+    /// The args run from `begin` in the buffer to the first `:`. Nothing has been announced yet, so
+    /// a string that ends here dispatches its buffered parameters as an ordinary OSC, as vte does;
+    /// one whose args pass `MAX_OSC_STREAM_ARGS` before a `:` aborts the image and is dropped.
+    fn advance_osc_args<P: Perform>(&mut self, performer: &mut P, byte: u8, begin: usize) {
+        match byte {
+            b':' => {
+                let args = &self.osc_raw[begin..];
+                performer.osc_stream_start(args);
+                self.reset_osc();
+                self.state = State::OscImagePayload;
+            },
+            // The string ends before any payload: an ordinary OSC.
+            0x07 => {
+                self.osc_end(performer, byte);
+                self.state = State::Ground
+            },
+            0x18 | 0x1A => {
+                self.osc_end(performer, byte);
+                performer.execute(byte);
+                self.state = State::Ground
+            },
+            0x1B => {
+                self.osc_end(performer, byte);
+                self.reset_params();
+                self.state = State::Escape
+            },
+            // The C0 controls an OSC string drops are dropped here too.
+            0x00..=0x06 | 0x08..=0x17 | 0x19 | 0x1C..=0x1F => (),
+            // Arguments keep their separators: they are the text between `File=` and the `:`. Past
+            // the cap with no `:` in sight, the image is aborted and the string dropped.
+            _ => {
+                if self.osc_raw.len().saturating_sub(begin) >= MAX_OSC_STREAM_ARGS {
+                    performer.osc_stream_abort();
+                    self.reset_osc();
+                    self.osc_stream = OscStream::Dead;
+                } else {
+                    self.action_osc_put(byte);
+                }
+            },
+        }
+    }
+
+    /// Handle a run of APC string bytes.
+    ///
+    /// feathercritty: vte discards APC content; here every byte up to the terminator is passed on
+    /// in one piece, so an APC string of any size costs the parser no memory. Everything but `ESC`,
+    /// `CAN` and `SUB` is content. `ESC` ends the string (the `ST` that normally follows it is
+    /// dispatched as an escape sequence, which the handler already ignores); `CAN` and `SUB` cancel
+    /// it. Returns the bytes consumed, so the read loop re-enters with the state the last byte left
+    /// behind.
+    #[inline]
+    fn advance_apc_string<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let run = bytes.iter().position(|&byte| matches!(byte, 0x18 | 0x1A | 0x1B));
+        let run = run.unwrap_or(bytes.len());
+
+        if run != 0 {
+            performer.apc_put(&bytes[..run]);
+            if run == bytes.len() {
+                return run;
+            }
+        }
+
+        // Only `ESC` (end) and `CAN`/`SUB` (cancel) can stop a run.
+        if bytes[run] == 0x1B {
+            performer.apc_end();
+            self.reset_params();
+            self.state = State::Escape;
+        } else {
+            let byte = bytes[run];
+            performer.apc_abort();
+            performer.execute(byte);
+            self.state = State::Ground;
+        }
+
+        run + 1
+    }
+
+    /// Handle a run of inline image payload bytes.
+    ///
+    /// feathercritty: the bytes an ordinary OSC string would have kept are given to
+    /// [`Perform::osc_stream_put`] in one piece instead of buffered, and the C0 controls an OSC
+    /// string drops are dropped here, so the handler sees exactly the payload the buffered path
+    /// would have dispatched. `BEL` and `ST` end it, `CAN` and `SUB` abort it. Returns the bytes
+    /// consumed, so the read loop re-enters with the state the last byte left behind.
+    #[inline]
+    fn advance_osc_image_payload<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        // Below `0x20` sit only the terminators (`BEL`, `CAN`, `SUB`, `ESC`) and the controls an
+        // OSC string drops anyway, so a run is the printable part of the input.
+        let run = bytes.iter().position(|&byte| byte < 0x20).unwrap_or(bytes.len());
+
+        if run != 0 {
+            performer.osc_stream_put(&bytes[..run]);
+            if run == bytes.len() {
+                return run;
+            }
+        }
+
+        match bytes[run] {
+            0x07 => {
+                self.osc_stream_end(performer);
+                self.state = State::Ground
+            },
+            0x1B => {
+                self.osc_stream_end(performer);
+                self.reset_params();
+                self.state = State::Escape
+            },
+            0x18 | 0x1A => {
+                self.osc_stream_abort(performer);
+                performer.execute(bytes[run]);
+                self.state = State::Ground
+            },
+            // A control character, dropped as in an ordinary OSC string; the state does not change.
+            _ => (),
+        }
+
+        run + 1
+    }
+
+    /// feathercritty: the inline image payload ended (`BEL` or `ST`).
+    #[inline]
+    fn osc_stream_end<P: Perform>(&mut self, performer: &mut P) {
+        performer.osc_stream_end();
+        self.reset_osc();
+    }
+
+    /// feathercritty: the inline image payload was cancelled by `CAN` or `SUB`.
+    #[inline]
+    fn osc_stream_abort<P: Perform>(&mut self, performer: &mut P) {
+        performer.osc_stream_abort();
+        self.reset_osc();
     }
 
     #[inline(always)]
@@ -567,9 +820,16 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         if !self.osc_too_long {
             self.osc_dispatch(performer, byte);
         }
+        self.reset_osc();
+    }
+
+    /// Reset the OSC string state, including the inline-image streaming state (feathercritty).
+    #[inline]
+    fn reset_osc(&mut self) {
         self.osc_raw.clear();
         self.osc_num_params = 0;
         self.osc_too_long = false;
+        self.osc_stream = OscStream::default();
     }
 
     /// Reset escape sequence parameters and intermediates.
@@ -766,9 +1026,36 @@ enum State {
     Escape,
     EscapeIntermediate,
     OscString,
+    // feathercritty: the streamed payload of an OSC 1337 inline image (see `advance_osc_string`).
+    OscImagePayload,
     SosPmApcString,
+    // feathercritty: APC (`ESC _`), which streams; SOS and PM stay discarded in `SosPmApcString`.
+    ApcString,
     #[default]
     Ground,
+}
+
+/// feathercritty: how far the current OSC string has been recognised as an inline image
+/// (`ESC ] 1337 ; File = <args> : <payload>`).
+///
+/// The marker and the arguments stay in the ordinary OSC buffer, so a string that turns out not to
+/// be an image dispatches exactly what vte dispatched. After the `:` that ends the args the parser
+/// moves to `State::OscImagePayload` and the payload goes straight to the performer; `Dead` means
+/// the args ran over `MAX_OSC_STREAM_ARGS` and the string is dropped instead of dispatched.
+#[derive(Debug, Default, Copy, Clone)]
+enum OscStream {
+    /// An ordinary OSC string: buffer it and dispatch it at the terminator.
+    #[default]
+    Buffered,
+
+    /// The first parameter is `1337`; matching `OSC_FILE_MARKER` from index `matched` on.
+    Marker { matched: usize },
+
+    /// The marker matched; the args are the buffered bytes from `begin` to the first `:`.
+    Args { begin: usize },
+
+    /// Aborted: read on to the terminator and dispatch nothing.
+    Dead,
 }
 
 /// Performs actions requested by the Parser
@@ -805,14 +1092,66 @@ pub trait Perform {
     /// `hook`. C0 controls will also be passed to the handler.
     fn put(&mut self, _byte: u8) {}
 
+    /// Pass a run of device control string bytes to the handler chosen in `hook`.
+    ///
+    /// feathercritty: the parser calls this with whole runs instead of single bytes (the sixel
+    /// payload of a `DCS ... q` is streamed). The default passes the run on to [`Self::put`] byte
+    /// by byte, so a `Perform` that only implements `put` sees exactly what it saw before.
+    #[inline]
+    fn put_slice(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.put(byte);
+        }
+    }
+
     /// Called when a device control string is terminated.
     ///
     /// The previously selected handler should be notified that the DCS has
     /// terminated.
     fn unhook(&mut self) {}
 
+    /// Called instead of [`Self::unhook`] when a device control string was cancelled by `CAN` or
+    /// `SUB` instead of reaching its terminator.
+    ///
+    /// feathercritty: the default forwards to `unhook`, so a `Perform` that does not care how the
+    /// string ended sees exactly what it saw before.
+    fn unhook_cancelled(&mut self) {
+        self.unhook();
+    }
+
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    /// An APC string (`ESC _`) has begun; its content arrives with [`Self::apc_put`].
+    ///
+    /// feathercritty: vte discarded APC strings. They are streamed now (SOS and PM are still
+    /// discarded), so an APC string costs the parser no memory at all.
+    fn apc_start(&mut self) {}
+
+    /// A run of APC string bytes, as far as the reader had them.
+    fn apc_put(&mut self, _bytes: &[u8]) {}
+
+    /// The APC string ended (its terminator arrived).
+    fn apc_end(&mut self) {}
+
+    /// The APC string was cancelled by `CAN` or `SUB` before its terminator arrived.
+    fn apc_abort(&mut self) {}
+
+    /// An OSC 1337 inline image (`ESC ] 1337 ; File = <args> : <payload>`) has begun.
+    ///
+    /// feathercritty: `args` are the bytes between `File=` and the first `:` of the string, at most
+    /// 4 KiB of them (an image whose args are longer is aborted). The payload arrives with
+    /// [`Self::osc_stream_put`] and is never buffered.
+    fn osc_stream_start(&mut self, _args: &[u8]) {}
+
+    /// A run of inline image payload bytes, as far as the reader had them.
+    fn osc_stream_put(&mut self, _bytes: &[u8]) {}
+
+    /// The inline image ended (`BEL` or `ST`).
+    fn osc_stream_end(&mut self) {}
+
+    /// The inline image was cancelled (`CAN` or `SUB`) or its args passed the limit.
+    fn osc_stream_abort(&mut self) {}
 
     /// A final character has arrived for a CSI sequence
     ///

@@ -244,6 +244,11 @@ struct ProcessorState<T: Timeout> {
 
     /// State for synchronized terminal updates.
     sync_state: SyncState<T>,
+
+    /// feathercritty: whether the device control string being parsed is sixel (`DCS ... q`), whose
+    /// payload goes to [`Handler::sixel_put`] and which ends with `sixel_end` or `sixel_abort`. It
+    /// lives here, not in the performer, because a string can span two reads.
+    sixel: bool,
 }
 
 #[derive(Debug)]
@@ -713,6 +718,61 @@ pub trait Handler {
 
     // Set SCP control.
     fn set_scp(&mut self, _char_path: ScpCharPath, _update_mode: ScpUpdateMode) {}
+
+    /// An APC string (`ESC _ <string> ESC \`) has begun; its content arrives with
+    /// [`Self::apc_put`].
+    ///
+    /// feathercritty: this is how the kitty graphics protocol reaches the terminal.
+    fn apc_start(&mut self) {}
+
+    /// A run of APC string bytes, as far as the reader had them. Nothing is buffered for you.
+    fn apc_put(&mut self, _bytes: &[u8]) {}
+
+    /// The APC string reached its terminator.
+    fn apc_end(&mut self) {}
+
+    /// The APC string was cancelled by `CAN` or `SUB`.
+    fn apc_abort(&mut self) {}
+
+    /// A DCS whose final byte is `q` with no intermediates (`DCS Pan ; Pv ; Ph q`) has begun: sixel
+    /// data. `params` are the parameters in front of the `q`.
+    fn sixel_start(&mut self, _params: &[u16]) {}
+
+    /// A run of sixel data bytes, as far as the reader had them. Nothing is buffered for you.
+    fn sixel_put(&mut self, _bytes: &[u8]) {}
+
+    /// The sixel string reached its terminator.
+    fn sixel_end(&mut self) {}
+
+    /// The sixel string was cancelled by `CAN` or `SUB`.
+    fn sixel_abort(&mut self) {}
+
+    /// An OSC 1337 inline image (`ESC ] 1337 ; File = <args> : <payload>`) has begun.
+    ///
+    /// feathercritty: `args` are the bytes between `File=` and the first `:` of the string, at most
+    /// 4 KiB of them; the payload arrives with [`Self::inline_image_put`].
+    fn inline_image_start(&mut self, _args: &[u8]) {}
+
+    /// A run of inline image payload bytes, as far as the reader had them. Nothing is buffered for
+    /// you.
+    fn inline_image_put(&mut self, _bytes: &[u8]) {}
+
+    /// The inline image ended (`BEL` or `ST`).
+    fn inline_image_end(&mut self) {}
+
+    /// The inline image was cancelled (`CAN` or `SUB`) or its args passed the limit.
+    fn inline_image_abort(&mut self) {}
+
+    /// XTSMGRAPHICS: request a graphics attribute (`CSI ? Pi ; Pa ; Pv S`).
+    ///
+    /// `item` is `Pi`, `action` is `Pa` and `value` is the first component of `Pv`, absent when the
+    /// request carries none.
+    fn graphics_attributes(&mut self, _item: u16, _action: u16, _value: Option<u16>) {}
+
+    /// Report the cell size in pixels (`CSI 16 t`).
+    ///
+    /// feathercritty: image programs size their output from this.
+    fn cell_size_pixels(&mut self) {}
 }
 
 bitflags! {
@@ -1292,6 +1352,25 @@ where
 
     #[inline]
     fn hook(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        // feathercritty: a DCS whose final byte is `q` with no intermediates carries sixel data.
+        // Its parameters and payload are streamed to the handler; every other DCS keeps vte's
+        // `hook`/`put`/`unhook`, which nothing here acts on.
+        if action == 'q' && intermediates.is_empty() {
+            self.state.sixel = true;
+
+            // The parser holds at most `MAX_PARAMS` values in total, so this fills the buffer to
+            // its end at most and needs no allocation.
+            let mut raw = [0u16; crate::vte::params::MAX_PARAMS];
+            let mut len = 0;
+            for &value in params.iter().flatten() {
+                raw[len] = value;
+                len += 1;
+            }
+
+            self.handler.sixel_start(&raw[..len]);
+            return;
+        }
+
         debug!(
             "[unhandled hook] params={:?}, ints: {:?}, ignore: {:?}, action: {:?}",
             params, intermediates, ignore, action
@@ -1303,9 +1382,40 @@ where
         debug!("[unhandled put] byte={:?}", byte);
     }
 
+    /// feathercritty: sixel data reaches the handler in runs; any other DCS keeps vte's one message
+    /// per byte.
+    #[inline]
+    fn put_slice(&mut self, bytes: &[u8]) {
+        if self.state.sixel {
+            self.handler.sixel_put(bytes);
+        } else {
+            for &byte in bytes {
+                self.put(byte);
+            }
+        }
+    }
+
     #[inline]
     fn unhook(&mut self) {
+        if self.state.sixel {
+            self.state.sixel = false;
+            self.handler.sixel_end();
+            return;
+        }
+
         debug!("[unhandled unhook]");
+    }
+
+    /// feathercritty: `CAN` or `SUB` ended the string, so a sixel aborts instead of ending.
+    #[inline]
+    fn unhook_cancelled(&mut self) {
+        if self.state.sixel {
+            self.state.sixel = false;
+            self.handler.sixel_abort();
+            return;
+        }
+
+        self.unhook();
     }
 
     #[inline]
@@ -1505,6 +1615,47 @@ where
 
             _ => unhandled(params),
         }
+    }
+
+    // feathercritty: the streamed string sequences reach the handler unchanged.
+    #[inline]
+    fn apc_start(&mut self) {
+        self.handler.apc_start();
+    }
+
+    #[inline]
+    fn apc_put(&mut self, bytes: &[u8]) {
+        self.handler.apc_put(bytes);
+    }
+
+    #[inline]
+    fn apc_end(&mut self) {
+        self.handler.apc_end();
+    }
+
+    #[inline]
+    fn apc_abort(&mut self) {
+        self.handler.apc_abort();
+    }
+
+    #[inline]
+    fn osc_stream_start(&mut self, args: &[u8]) {
+        self.handler.inline_image_start(args);
+    }
+
+    #[inline]
+    fn osc_stream_put(&mut self, bytes: &[u8]) {
+        self.handler.inline_image_put(bytes);
+    }
+
+    #[inline]
+    fn osc_stream_end(&mut self) {
+        self.handler.inline_image_end();
+    }
+
+    #[inline]
+    fn osc_stream_abort(&mut self) {
+        self.handler.inline_image_abort();
     }
 
     #[allow(clippy::cognitive_complexity)]
@@ -1717,10 +1868,22 @@ where
                 handler.set_scrolling_region(top, bottom);
             },
             ('S', []) => handler.scroll_up(next_param_or(1) as usize),
+            // feathercritty: XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`); `Pv` may be absent (a request
+            // for what the terminal supports) or split into subparameters, of which only the first
+            // is reported.
+            ('S', [b'?']) => {
+                let item = next_param_or(0);
+                let action = next_param_or(0);
+                let value = params_iter.next().and_then(|subparams| subparams.first().copied());
+                handler.graphics_attributes(item, action, value);
+            },
             ('s', []) => handler.save_cursor_position(),
             ('T', []) => handler.scroll_down(next_param_or(1) as usize),
             ('t', []) => match next_param_or(1) as usize {
                 14 => handler.text_area_size_pixels(),
+                // feathercritty: the cell size in pixels, which image programs size their output
+                // by.
+                16 => handler.cell_size_pixels(),
                 18 => handler.text_area_size_chars(),
                 22 => handler.push_title(),
                 23 => handler.pop_title(),
