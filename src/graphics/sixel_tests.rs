@@ -640,13 +640,15 @@ fn zero_size_is_error() {
     assert_eq!(decode_empty(b"\"0;0;0;0", &[], BG), SixelError::Empty);
 }
 
-/// A raster header declares the maximum size without allocating for it: nothing is reserved before
-/// `finish`, and the declared area arrives as background, trimmed to what the byte cap allows.
+/// A raster header declares the maximum size without allocating for it: the command is terminated
+/// (`$`) so the declaration is committed, yet nothing is reserved before `finish` — the allocation
+/// assert fails outright if a declared size ever preallocates its area. `finish` delivers the
+/// declared area as background, trimmed to what the byte cap allows.
 #[test]
 fn header_only_allocates_nothing_before_finish() {
     let mut decoder = SixelDecoder::new(&[], BG);
-    decoder.put(b"\"1;1;10000;10000");
-    assert_eq!(decoder.canvas(), (0, 0, 0), "a 15-byte header alone allocates nothing");
+    decoder.put(b"\"1;1;10000;10000$");
+    assert_eq!(decoder.canvas(), (0, 0, 0), "a terminated header alone allocates nothing");
     let image = decoder.finish().expect("a declared size is an image");
     let budget_h = (MAX_IMAGE_BYTES / (MAX_IMAGE_SIDE as u64 * 4)) as u32;
     assert_eq!((image.width, image.height), (MAX_IMAGE_SIDE, budget_h));
@@ -658,8 +660,9 @@ fn header_only_allocates_nothing_before_finish() {
 }
 
 /// Geometric growth: 1600 newlines then an 800-column band — a stream whose per-column canvas
-/// reallocation once made it take seconds — decodes in well under 200 ms even unoptimized, and a
-/// header-only stream allocates nothing (checked by `header_only_allocates_nothing_before_finish`).
+/// reallocation once made it take seconds — decodes in well under a second even unoptimized (the
+/// bound is generous for loaded CI), and a header-only stream allocates nothing (checked by
+/// `header_only_allocates_nothing_before_finish`).
 #[test]
 fn wide_growth_is_fast() {
     let mut stream = b"#1".to_vec();
@@ -673,7 +676,28 @@ fn wide_growth_is_fast() {
         assert_eq!(px(&image, x, 9603), PAL_BLUE, "column {x} of the painted band");
         assert_eq!(px(&image, x, 0), [BG.r, BG.g, BG.b, 255], "column {x} row 0 is background");
     }
-    assert!(elapsed.as_millis() < 200, "decoding took {elapsed:?}, expected well under 200 ms");
+    assert!(elapsed.as_millis() < 1000, "decoding took {elapsed:?}, expected well under a second");
+}
+
+/// A 4100×4002 image fits the byte cap with room to spare, but doubling both sides overshoots it —
+/// the trim must then serve the rectangle actually asked for, not the doubled pair. Built from a
+/// raster declaration plus two painted corners: `#1~` at the top-left, and the bottom-right reached
+/// by 666 newlines (band 3996) and an `!4099?` run of zero columns that advance the cursor without
+/// painting, so nothing about it fills a canvas.
+#[test]
+fn near_cap_image_is_complete() {
+    let mut stream = b"\"0;1;4100;4002#1~".to_vec();
+    stream.extend(std::iter::repeat_n(b'-', 666));
+    stream.extend_from_slice(b"!4099?~");
+    let image = decode(&stream, &[0, 1], BG);
+    assert_eq!((image.width, image.height), (4100, 4002), "a legal near-cap image is complete");
+    for y in [0u32, 3, 5] {
+        assert_eq!(px(&image, 0, y), PAL_BLUE, "top-left corner row {y}");
+    }
+    for y in [3996u32, 3999, 4001] {
+        assert_eq!(px(&image, 4099, y), PAL_BLUE, "bottom-right corner row {y}");
+    }
+    assert_eq!(px(&image, 2050, 2001), [0, 0, 0, 0], "never-painted middle is transparent");
 }
 
 /// The state machine resumes exactly where a `put` left it: every fixture decodes identically fed

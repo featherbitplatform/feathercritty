@@ -35,11 +35,13 @@
 //! logical size once. Capacity is never more than [`MAX_IMAGE_SIDE`] per side or
 //! [`MAX_IMAGE_BYTES`] of RGBA8 data: a sixel that would push past a cap paints nothing beyond it,
 //! later ones are ignored the same way, and `finish` returns the image as far as it fits — an
-//! oversized sixel is truncated, not refused. Raster attributes allocate nothing up front: they
-//! only raise a minimum logical size applied in `finish`, so a 15-byte header may declare 10 000×10
-//! 000 without the decoder reserving for it before the first sixel. All size math is done in `u64`
-//! with saturating accumulators, so no input can overflow a length or make an allocation larger
-//! than the caps. A stream that paints nothing and declares no size has zero pixels and answers
+//! oversized sixel is truncated, not refused. When doubling would bust the byte cap but the
+//! rectangle actually asked for still fits, the trim serves that rectangle instead: geometric
+//! overshoot never truncates a legal image. Raster attributes allocate nothing up front: they only
+//! raise a minimum logical size applied in `finish`, so a 15-byte header may declare 10 000×10 000
+//! without the decoder reserving for it before the first sixel. All size math is done in `u64` with
+//! saturating accumulators, so no input can overflow a length or make an allocation larger than the
+//! caps. A stream that paints nothing and declares no size has zero pixels and answers
 //! [`SixelError::Empty`].
 //!
 //! Remote input never panics, hangs or grows memory without bound here: bytes outside the commands
@@ -484,10 +486,13 @@ impl SixelDecoder {
     /// Grow the allocated capacity to cover `w_needed` by `h_needed`. Each side doubles until it
     /// covers the need (so a run of columns costs logarithmically many reallocations, each copying
     /// the old rows once), clamped to [`MAX_IMAGE_SIDE`] per side and to [`MAX_IMAGE_BYTES`] in
-    /// total; when even that cannot hold both, width keeps what the height allows and height what
-    /// the width allows, never below the current capacity — earlier pixels always survive, only
-    /// newly asked-for area is dropped. All math is overflow-safe: sizes are compared in `u64`
-    /// against the caps before anything is reserved.
+    /// total. When the doubled pair busts the byte cap, the trim serves the rectangle actually
+    /// asked for — the painted extent plus what this sixel claims — if that still fits (capacity
+    /// may shrink toward it, since never-painted area is only fill): geometric overshoot never
+    /// denies a legal image its area. When even the asked-for rectangle busts the cap, only the
+    /// current capacity is a floor: no painted pixel is ever lost, only newly asked-for area is
+    /// dropped, width keeping what the height allows and height what the width allows. All math is
+    /// overflow-safe: sizes are compared in `u64` against the caps before anything is reserved.
     fn ensure_capacity(&mut self, w_needed: u32, h_needed: u32) {
         let target_w = w_needed.min(MAX_IMAGE_SIDE);
         let target_h = h_needed.min(MAX_IMAGE_SIDE);
@@ -496,27 +501,35 @@ impl SixelDecoder {
         }
         let mut w = doubled_capacity(self.cap_w, target_w);
         let mut h = doubled_capacity(self.cap_h, target_h);
+        let logical_w = self.painted_w.max(target_w);
+        let logical_h = self.painted_h.max(target_h);
+        let (floor_w, floor_h) = if (logical_w as u64) * (logical_h as u64) * 4 <= MAX_IMAGE_BYTES {
+            (logical_w, logical_h)
+        } else {
+            (self.cap_w, self.cap_h)
+        };
         loop {
             if (w as u64) * (h as u64) * 4 <= MAX_IMAGE_BYTES {
                 break;
             }
             // Trim height to what the width allows first, then width to what that height allows,
-            // each floored at the current capacity (which always fits by invariant): a round can
-            // only leave both untouched when both hit their floors, and then the area fits too.
+            // each floored at `floor_*` (a pair that fits by the branch above): a round can only
+            // leave both untouched when both hit their floors, and then the area fits too.
             let budget = (MAX_IMAGE_BYTES / (w.max(1) as u64 * 4)).min(MAX_IMAGE_SIDE as u64);
-            h = h.min(budget as u32).max(self.cap_h);
+            h = h.min(budget as u32).max(floor_h);
             if (w as u64) * (h as u64) * 4 <= MAX_IMAGE_BYTES {
                 break;
             }
             let budget = (MAX_IMAGE_BYTES / (h.max(1) as u64 * 4)).min(MAX_IMAGE_SIDE as u64);
-            w = w.min(budget as u32).max(self.cap_w);
+            w = w.min(budget as u32).max(floor_w);
         }
         self.resize_capacity(w, h);
     }
 
-    /// Rebuild the buffer at `cap_w` by `cap_h` (both at least the current capacity), keeping what
-    /// overlaps and filling everything else with the fill `P2` asks for: background-coloured area
-    /// that is later only ever changed by 1 bits, or transparent area.
+    /// Rebuild the buffer at `cap_w` by `cap_h` (each side at least [`painted_w`](Self::painted_w)
+    /// / [`painted_h`](Self::painted_h), so no painted pixel is lost even when a side shrinks),
+    /// keeping what overlaps and filling everything else with the fill `P2` asks for:
+    /// background-coloured area that is later only ever changed by 1 bits, or transparent area.
     fn resize_capacity(&mut self, w: u32, h: u32) {
         if w == self.cap_w && h == self.cap_h {
             return;
@@ -525,10 +538,11 @@ impl SixelDecoder {
         // At most MAX_IMAGE_BYTES: the caller's cap loop checked it before anything was reserved.
         let mut buf = pattern_vec(fill, (w as usize) * (h as usize) * 4);
         let (old_w, new_w) = (self.cap_w as usize * 4, w as usize * 4);
+        let copy_w = old_w.min(new_w);
         for y in 0..(self.cap_h.min(h) as usize) {
             let src = y * old_w;
             let dst = y * new_w;
-            buf[dst..dst + old_w].copy_from_slice(&self.buf[src..src + old_w]);
+            buf[dst..dst + copy_w].copy_from_slice(&self.buf[src..src + copy_w]);
         }
         self.buf = buf;
         self.cap_w = w;
