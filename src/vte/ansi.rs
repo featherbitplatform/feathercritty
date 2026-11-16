@@ -728,10 +728,10 @@ pub trait Handler {
     /// A run of APC string bytes, as far as the reader had them. Nothing is buffered for you.
     fn apc_put(&mut self, _bytes: &[u8]) {}
 
-    /// The APC string reached its terminator.
+    /// The APC string reached its terminator (`ST`).
     fn apc_end(&mut self) {}
 
-    /// The APC string was cancelled by `CAN` or `SUB`.
+    /// The APC string was cut short: `CAN`, `SUB` or an `ESC` that is not the start of `ST`.
     fn apc_abort(&mut self) {}
 
     /// A DCS whose final byte is `q` with no intermediates (`DCS Pan ; Pv ; Ph q`) has begun: sixel
@@ -741,10 +741,12 @@ pub trait Handler {
     /// A run of sixel data bytes, as far as the reader had them. Nothing is buffered for you.
     fn sixel_put(&mut self, _bytes: &[u8]) {}
 
-    /// The sixel string reached its terminator.
+    /// The sixel string reached its terminator (`ST`, as `ESC \` or `0x9c`).
     fn sixel_end(&mut self) {}
 
-    /// The sixel string was cancelled by `CAN` or `SUB`.
+    /// The sixel string was cut short: `CAN`, `SUB` or an `ESC` that is not the start of `ST`.
+    ///
+    /// The data that arrived is a truncated image, not a complete one.
     fn sixel_abort(&mut self) {}
 
     /// An OSC 1337 inline image (`ESC ] 1337 ; File = <args> : <payload>`) has begun.
@@ -760,7 +762,12 @@ pub trait Handler {
     /// The inline image ended (`BEL` or `ST`).
     fn inline_image_end(&mut self) {}
 
-    /// The inline image was cancelled (`CAN` or `SUB`) or its args passed the limit.
+    /// The inline image was cut short (`CAN`, `SUB` or an `ESC` that is not the start of `ST`), or
+    /// its args passed the limit.
+    ///
+    /// feathercritty: this can arrive with no preceding [`Self::inline_image_start`] — the limit is
+    /// passed while the arguments are still being read — so a handler must handle a lone abort as a
+    /// dropped image, not an unfinished one.
     fn inline_image_abort(&mut self) {}
 
     /// XTSMGRAPHICS: request a graphics attribute (`CSI ? Pi ; Pa ; Pv S`).

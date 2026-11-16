@@ -7,6 +7,7 @@
 
 use core::time::Duration;
 
+use crate::vte::MAX_OSC_STREAM_ARGS;
 use crate::vte::ansi::{Handler, Hyperlink, Processor, Timeout};
 
 /// APC (`ESC _ <string> ESC \`), as the kitty graphics protocol sends it.
@@ -210,13 +211,84 @@ fn join_puts(events: Vec<Event>) -> Vec<Event> {
 fn apc_round_trip() {
     assert_eq!(record(APC), vec![Event::ApcStart, Event::ApcPut(APC_DATA.to_vec()), Event::ApcEnd]);
 
-    // A bare `ESC` (not only `ST`) ends the string, and parsing goes on after it (the `CSI 31 m`
-    // that follows is an attribute change, which this recorder does not track).
+    // A bare `ESC` — one that is not the start of `ST` — aborts rather than ending: what arrived is
+    // not a complete command. Parsing goes on after it (the `CSI 31 m` that follows is an attribute
+    // change, which this recorder does not track).
     assert_eq!(record(b"\x1b_a=1\x1b[31m"), vec![
         Event::ApcStart,
         Event::ApcPut(b"a=1".to_vec()),
+        Event::ApcAbort
+    ]);
+}
+
+/// Only `ST` (`ESC \`) completes a stream; any other byte after the `ESC` aborts it.
+#[test]
+fn bare_escape_aborts_streams() {
+    // APC, sixel and inline image payload, each cut short by an `ESC` that starts another sequence.
+    assert_eq!(record(b"\x1b_Ga=T\x1b(B"), vec![
+        Event::ApcStart,
+        Event::ApcPut(b"Ga=T".to_vec()),
+        Event::ApcAbort
+    ]);
+    assert_eq!(record(b"\x1bP0;1;0q#0!137A\x1b(B"), vec![
+        Event::SixelStart(vec![0, 1, 0]),
+        Event::SixelPut(b"#0!137A".to_vec()),
+        Event::SixelAbort
+    ]);
+    assert_eq!(record(b"\x1b]1337;File=n:AAAA\x1b(B"), vec![
+        Event::ImageStart(b"n".to_vec()),
+        Event::ImagePut(b"AAAA".to_vec()),
+        Event::ImageAbort
+    ]);
+
+    // In the arguments nothing was ever announced, so a bare `ESC` there still dispatches an
+    // ordinary OSC (a 1337 one dispatches nothing this recorder sees) and aborts nothing.
+    assert_eq!(record(b"\x1b]1337;File=n\x1b(B"), Vec::new());
+
+    // `ST` does end it, in both of its forms.
+    assert_eq!(record(b"\x1b_Ga=T\x1b\\"), vec![
+        Event::ApcStart,
+        Event::ApcPut(b"Ga=T".to_vec()),
         Event::ApcEnd
     ]);
+    assert_eq!(record(b"\x1bP0;1;0q#0!137A\x9c"), vec![
+        Event::SixelStart(vec![0, 1, 0]),
+        Event::SixelPut(b"#0!137A".to_vec()),
+        Event::SixelEnd
+    ]);
+}
+
+/// A terminator split across two reads is still one terminator.
+#[test]
+fn terminator_across_a_read_boundary() {
+    // The `ESC` arrives as the last byte of a read and the `\` as the first of the next, so which
+    // one it was cannot be known at the `ESC`: the decision waits for that byte.
+    let apc_split = APC.len() - 1;
+    assert_eq!(join_puts(record_split(APC, apc_split)), vec![
+        Event::ApcStart,
+        Event::ApcPut(APC_DATA.to_vec()),
+        Event::ApcEnd
+    ]);
+
+    let sixel_split = SIXEL.len() - 1;
+    assert_eq!(join_puts(record_split(SIXEL, sixel_split)), vec![
+        Event::SixelStart(vec![0, 1, 0]),
+        Event::SixelPut(SIXEL_DATA.to_vec()),
+        Event::SixelEnd
+    ]);
+
+    // An image ends on `BEL`, which needs no lookahead; what matters for it is a split inside the
+    // payload, which hands the handler fewer bytes and then the rest.
+    let image_split = IMAGE.len() - 6;
+    assert_eq!(join_puts(record_split(IMAGE, image_split)), vec![
+        Event::ImageStart(IMAGE_ARGS.to_vec()),
+        Event::ImagePut(IMAGE_DATA.to_vec()),
+        Event::ImageEnd
+    ]);
+
+    // A read that ends on the `ESC` and no byte after it yet: nothing has been claimed about the
+    // string, so neither end nor abort arrives; the next byte decides.
+    assert_eq!(record(&APC[..apc_split]), vec![Event::ApcStart, Event::ApcPut(APC_DATA.to_vec())]);
 }
 
 /// `DCS 0 ; 1 ; 0 q` is sixel: its parameters and payload reach the handler, other DCS do not.
@@ -253,6 +325,15 @@ fn inline_image_round_trip() {
     assert_eq!(record(b"\x1b]1337;File=name;width=10:inline=1:AAAA\x1b\\"), vec![
         Event::ImageStart(b"name;width=10".to_vec()),
         Event::ImagePut(b"inline=1:AAAA".to_vec()),
+        Event::ImageEnd,
+    ]);
+
+    // A `;` inside the arguments is kept as its raw bytes: it ends nothing and dispatches nothing,
+    // and only the first `:` starts the payload. Here three `;`-separated pairs arrive as one set
+    // of arguments, and the payload keeps the `:` in the middle of it.
+    assert_eq!(record(b"\x1b]1337;File=a=1;b=2;c=3:AA:BB\x07"), vec![
+        Event::ImageStart(b"a=1;b=2;c=3".to_vec()),
+        Event::ImagePut(b"AA:BB".to_vec()),
         Event::ImageEnd,
     ]);
 
@@ -314,15 +395,55 @@ fn can_aborts_apc() {
     assert_eq!(record(b"\x1b]1337;File=nn\x18"), Vec::new());
 }
 
+/// An inline image with `args_len` bytes of arguments and a short payload.
+fn image_with_args(args_len: usize) -> Vec<u8> {
+    let mut input: Vec<u8> = Vec::with_capacity(args_len + 20);
+    input.extend_from_slice(b"\x1b]1337;File=");
+
+    // The arguments: the buffer grows to hold `args_len` more bytes, all of them filled in here.
+    input.resize(input.len() + args_len, b'a');
+
+    input.extend_from_slice(b":AAAA\x07");
+    input
+}
+
 /// Every split point gives the handler the same bytes in the same places.
 #[test]
 fn split_at_every_byte_is_identical() {
-    for input in [APC, SIXEL, IMAGE] {
+    // The three sequences, each ending `ESC \` so that a split point falls inside the terminator
+    // and one read has to carry the decision over to the next; the same three cut short by `CAN`,
+    // whose split points include ones right before and right after it; and both sides of the args
+    // cap.
+    let mut can_apc = APC[..2].to_vec();
+    can_apc.extend_from_slice(APC_DATA);
+    can_apc.push(0x18);
+
+    let mut can_sixel = b"\x1bP0;1;0q".to_vec();
+    can_sixel.extend_from_slice(SIXEL_DATA);
+    can_sixel.push(0x18);
+
+    let mut can_image = b"\x1b]1337;File=n:".to_vec();
+    can_image.extend_from_slice(b"AAAA");
+    can_image.push(0x18);
+
+    let capped = image_with_args(MAX_OSC_STREAM_ARGS);
+    let oversized = image_with_args(MAX_OSC_STREAM_ARGS + 1);
+
+    let inputs: [&[u8]; 8] =
+        [APC, SIXEL, IMAGE, &can_apc, &can_sixel, &can_image, &capped, &oversized];
+
+    for input in inputs {
         let whole = join_puts(record(input));
-        assert_eq!(whole.len(), 3, "{:?}", input);
+        assert!(!whole.is_empty(), "{:?}", input);
 
         for split in 1..input.len() {
-            assert_eq!(join_puts(record_split(input, split)), whole, "split at {}", split);
+            assert_eq!(
+                join_puts(record_split(input, split)),
+                whole,
+                "split at {} of {:?}",
+                split,
+                input
+            );
         }
     }
 }
