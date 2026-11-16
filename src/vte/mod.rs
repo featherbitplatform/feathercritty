@@ -415,7 +415,17 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.reset_params();
                 self.state = State::Escape
             },
-            0x3B => self.action_osc_put_param(),
+            0x3B => {
+                // feathercritty: separators up to `MAX_OSC_PARAMS - 1` only end a parameter and are
+                // not stored. From there on they are kept in the buffer so the last parameter holds
+                // their exact bytes (OSC 1337 arguments contain ';'), including empty parameters.
+                if self.osc_num_params < MAX_OSC_PARAMS {
+                    self.action_osc_put_param();
+                }
+                if self.osc_num_params >= MAX_OSC_PARAMS {
+                    self.action_osc_put(0x3B);
+                }
+            },
             _ => self.action_osc_put(byte),
         }
     }
@@ -544,7 +554,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Whether the current OSC string's first parameter is `1337`, exempt from `MAX_OSC_BYTES`.
     #[cold]
     fn osc_is_1337(&self) -> bool {
-        let end = self.osc_raw.iter().position(|&b| b == 0x3B).unwrap_or(self.osc_raw.len());
+        // The first parameter runs to where the first separator was recorded (`osc_params[0].1`),
+        // or to the end while none has arrived. Separators are not stored in `osc_raw` before the
+        // cap, so scanning raw for a ';' would miss it; read the recorded boundary instead.
+        let end = if self.osc_num_params == 0 { self.osc_raw.len() } else { self.osc_params[0].1 };
         matches!(str::from_utf8(&self.osc_raw[..end]), Ok(code) if code.parse::<u64>() == Ok(1337))
     }
 
@@ -579,8 +592,10 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
 
         for (i, slice) in slices.iter_mut().enumerate().take(self.osc_num_params) {
             let indices = self.osc_params[i];
-            // feathercritty: parameters past `MAX_OSC_PARAMS` are appended to the last parameter
-            // instead of dropped (OSC 1337 arguments contain ';'), so its slice runs to the end.
+            // feathercritty: parameters past `MAX_OSC_PARAMS` are kept in the last parameter
+            // instead of dropped; their separators are stored in the buffer (see the 0x3B
+            // handling), so this slice runs to the end and holds the remaining bytes exactly,
+            // including empty ones.
             let end = if self.osc_num_params == MAX_OSC_PARAMS && i + 1 == MAX_OSC_PARAMS {
                 self.osc_raw.len()
             } else {
@@ -937,8 +952,8 @@ mod tests {
 
     #[test]
     fn parse_osc_max_params() {
-        let params = ";".repeat(params::MAX_PARAMS + 1);
-        let input = format!("\x1b]{}\x1b", &params[..]).into_bytes();
+        let content = ";".repeat(params::MAX_PARAMS + 1);
+        let input = format!("\x1b]{}\x1b", &content).into_bytes();
         let mut dispatcher = Dispatcher::default();
         let mut parser = Parser::new();
 
@@ -947,8 +962,16 @@ mod tests {
         assert_eq!(dispatcher.dispatched.len(), 1);
         match &dispatcher.dispatched[0] {
             Sequence::Osc(params, _) => {
+                // feathercritty: MAX_OSC_PARAMS parameters are kept and the rest stay joined in the
+                // last one WITH their separators, so an all-empty OSC keeps 15 empty parameters and
+                // a last one holding the remaining ones joined by ';' (see `action_osc_put_param`).
+                let fields = content.split(';').collect::<Vec<_>>();
                 assert_eq!(params.len(), MAX_OSC_PARAMS);
-                assert!(params.iter().all(Vec::is_empty));
+                for (i, field) in fields.iter().take(MAX_OSC_PARAMS - 1).enumerate() {
+                    assert_eq!(params[i], field.as_bytes());
+                }
+                let joined = fields[MAX_OSC_PARAMS - 1..].join(";");
+                assert_eq!(params[MAX_OSC_PARAMS - 1], joined.as_bytes());
             },
             _ => panic!("expected osc sequence"),
         }
@@ -1078,27 +1101,36 @@ mod tests {
     #[test]
     fn osc_params_past_sixteen_are_joined() {
         // feathercritty: parameters past MAX_OSC_PARAMS are kept in the last parameter instead of
-        // dropped (OSC 1337 arguments contain ';').
-        let args: Vec<String> = (0..MAX_OSC_PARAMS + 9).map(|i| format!("p{i}")).collect();
-        let input = format!("\x1b]{}\x07", args.join(";")).into_bytes();
+        // dropped, together with their ';' separators, so it holds the remaining bytes exactly.
+        let check = |args: &[String]| {
+            let input = format!("\x1b]{}\x07", args.join(";")).into_bytes();
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+            parser.advance(&mut dispatcher, &input);
 
-        let mut dispatcher = Dispatcher::default();
-        let mut parser = Parser::new();
-        parser.advance(&mut dispatcher, &input);
+            assert_eq!(dispatcher.dispatched.len(), 1);
+            match &dispatcher.dispatched[0] {
+                Sequence::Osc(params, _) => {
+                    // MAX_OSC_PARAMS parameters are kept; the rest stay joined in the last one.
+                    assert_eq!(params.len(), MAX_OSC_PARAMS);
+                    for (i, arg) in args.iter().take(MAX_OSC_PARAMS - 1).enumerate() {
+                        assert_eq!(params[i], arg.as_bytes());
+                    }
+                    let joined = args[MAX_OSC_PARAMS - 1..].join(";");
+                    assert_eq!(params[MAX_OSC_PARAMS - 1], joined.as_bytes());
+                },
+                _ => panic!("expected osc sequence"),
+            }
+        };
 
-        assert_eq!(dispatcher.dispatched.len(), 1);
-        match &dispatcher.dispatched[0] {
-            Sequence::Osc(params, _) => {
-                // MAX_OSC_PARAMS parameters are kept; the rest are joined into the last one.
-                assert_eq!(params.len(), MAX_OSC_PARAMS);
-                for (i, arg) in args.iter().take(MAX_OSC_PARAMS - 1).enumerate() {
-                    assert_eq!(params[i], arg.as_bytes());
-                }
-                let joined = args[MAX_OSC_PARAMS - 1..].concat();
-                assert_eq!(params[MAX_OSC_PARAMS - 1], joined.as_bytes());
-            },
-            _ => panic!("expected osc sequence"),
-        }
+        // More than MAX_OSC_PARAMS parameters.
+        let named: Vec<String> = (0..MAX_OSC_PARAMS + 9).map(|i| format!("p{i}")).collect();
+        check(&named);
+
+        // An empty parameter past the sixteenth (`;;`) is kept in the joined text.
+        let mut with_empty = named;
+        with_empty[MAX_OSC_PARAMS] = String::new();
+        check(&with_empty);
     }
 
     #[test]
