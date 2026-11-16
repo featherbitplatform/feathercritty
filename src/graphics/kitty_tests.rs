@@ -12,7 +12,7 @@ use std::io::Write as _;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 
@@ -801,14 +801,22 @@ fn tick_drops_stalled_transmission() {
     assert!(parser.take_reject().is_none());
     assert!(parser.held_bytes() > 0);
 
-    // `tick` never disturbs a frame being parsed: only the stalled upload is released.
+    // A stalled upload is not dropped while a frame is being parsed: the open chunk belongs to
+    // that transmission, and its `end` runs the same stall check once the frame is closed.
     parser.start();
     parser.put(b"Ga=q,i=4");
     parser.tick(late + Duration::from_secs(30));
+    assert!(parser.take_reject().is_none(), "an open frame is progress");
+    assert!(parser.held_bytes() > 0, "the stalled upload is still held");
+
+    // `tick` never disturbs the frame itself; its `end` answers it and releases the upload.
     assert_eq!(
-        parser.end(late + Duration::from_secs(30)),
+        parser.end(late + Duration::from_secs(31)),
         Some(KittyCommand::Query { id: 4, quiet: 0 })
     );
+    let rej = parser.take_reject().expect("the closed frame released the stalled upload");
+    assert_eq!((rej.error, rej.id, rej.quiet), (KittyError::ENOMEM, 0, 0));
+    assert_eq!(parser.held_bytes(), 0);
 }
 
 #[test]
@@ -842,10 +850,14 @@ fn a_second_start_abandons_the_unfinished_frame() {
 #[test]
 fn bytes_after_a_finished_zlib_stream_are_dropped() {
     // A transmission whose zlib stream ends early: whatever decodes after the stream end is not
-    // image data, so it is dropped rather than appended to the pixels.
+    // image data, so it is dropped rather than appended to the pixels. The fixture uses unpadded
+    // base64 on purpose: a padded encoding closes the payload at its `=`, and the one to three
+    // trailing characters that only `finish` drains — the ones whose decoded bytes land after the
+    // stream end, which is exactly what this test is about — would never reach it.
     let mut payload = zlib(&[1, 2, 3]);
-    payload.extend_from_slice(b"trailing garbage past the end of the stream");
-    let (cmd, rej) = once(&apc("f=24,s=1,v=1,o=z", &b64(&payload)));
+    payload.extend_from_slice(b"trailing garbage past the end of the stream!");
+    assert_ne!(payload.len() % 3, 0, "the fixture must leave a partial final base64 group");
+    let (cmd, rej) = once(&apc("f=24,s=1,v=1,o=z", &STANDARD_NO_PAD.encode(&payload).into_bytes()));
     assert!(rej.is_none(), "trailing bytes must not fail the transmission: {rej:?}");
     let Some(KittyCommand::Transmit { bytes, format, .. }) = cmd else {
         panic!("expected a transmit command, got {cmd:?}");

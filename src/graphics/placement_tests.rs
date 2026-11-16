@@ -1,0 +1,689 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
+//! Tests for [`PlacementTable`] as driven through [`Term`]: placements following the grid,
+//! scrollback placeholders, ids and replies.
+
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+
+use crate::event::{Event, EventListener, ImageData, ImageDecodeError, ImageKey};
+use crate::graphics::kitty_diacritics::{PLACEHOLDER_CHAR, decode_placeholder_cell};
+use crate::grid::Dimensions;
+use crate::term::{Config, Term};
+use crate::vte::ansi::{Processor, Rgb};
+
+/// The concatenation of everything an event batch wrote back to the pty (kitty replies ride on it).
+fn writes_of(events: &[Event]) -> String {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::PtyWrite(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn released_of(events: &[Event]) -> Vec<ImageKey> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ImageReleased(key) => Some(*key),
+            _ => None,
+        })
+        .collect()
+}
+
+fn received_of(events: &[Event]) -> Vec<(ImageKey, ImageData)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            Event::ImageReceived { key, data } => Some((*key, data.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A test grid size.
+struct Size {
+    columns: usize,
+    lines: usize,
+}
+
+impl Dimensions for Size {
+    fn columns(&self) -> usize {
+        self.columns
+    }
+
+    fn screen_lines(&self) -> usize {
+        self.lines
+    }
+
+    fn total_lines(&self) -> usize {
+        self.lines
+    }
+}
+
+/// Collects every event the terminal sends, so tests can assert on deliveries.
+#[derive(Clone, Default)]
+struct Recorder(Arc<Mutex<Vec<Event>>>);
+
+impl EventListener for Recorder {
+    fn send_event(&self, event: Event) {
+        self.0.lock().unwrap().push(event);
+    }
+}
+
+impl Recorder {
+    /// Everything collected since the last drain, clearing the log.
+    fn take(&self) -> Vec<Event> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+
+    fn received(&self) -> Vec<(ImageKey, ImageData)> {
+        self.take()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ImageReceived { key, data } => Some((key, data)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn released(&self) -> Vec<ImageKey> {
+        self.take()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::ImageReleased(key) => Some(key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The concatenation of everything written back to the pty (kitty replies ride on it).
+    fn writes(&self) -> String {
+        self.take()
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::PtyWrite(text) => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// A terminal with a recording listener and its recorder.
+fn term(columns: usize, lines: usize) -> (Term<Recorder>, Recorder) {
+    let recorder = Recorder::default();
+    let term = Term::new(
+        Config { scrolling_history: 10_000, ..Config::default() },
+        &Size { columns, lines },
+        recorder.clone(),
+    );
+    (term, recorder)
+}
+
+fn feed(term: &mut Term<Recorder>, bytes: &[u8]) {
+    let mut parser: Processor = Processor::new();
+    parser.advance(term, bytes);
+}
+
+/// A complete `a=T` transmission of raw pixels, placed with any extra control keys (`,c=5,r=2`
+/// style string) appended to the frame.
+fn transmit(
+    id: u32,
+    format: &str,
+    size: Option<(u32, u32)>,
+    pixels: &[u8],
+    extra: &str,
+) -> Vec<u8> {
+    let mut out = format!("\x1b_Ga=T,i={id},{format}{extra}").into_bytes();
+    if let Some((width, height)) = size {
+        out.extend(format!(",s={width},v={height}").as_bytes());
+    }
+    out.push(b';');
+    out.extend(STANDARD.encode(pixels).into_bytes());
+    out.extend(b"\x1b\\");
+    out
+}
+
+/// RGBA payload for a `f=32` image of the given size.
+fn rgba(width: u32, height: u32) -> Vec<u8> {
+    vec![0x7F; (width as usize) * (height as usize) * 4]
+}
+
+/// RGB payload for a `f=24` image of the given size.
+fn rgb(width: u32, height: u32) -> Vec<u8> {
+    vec![0x7F; (width as usize) * (height as usize) * 3]
+}
+
+/// A one-pixel black sixel sequence: DCS `q`, register 0, one painted column.
+const SIXEL: &[u8] = b"\x1bPq#0?~\x1b\\";
+
+/// The minimal valid 1x1 RGBA PNG (header through IEND).
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE,
+    0x42, 0x60, 0x82,
+];
+
+/// The viewport row and column of the terminal's cursor.
+fn cursor(term: &Term<Recorder>) -> (i32, usize) {
+    let point = term.renderable_content().cursor.point;
+    (point.line.0, point.column.0)
+}
+
+#[test]
+fn sixel_places_at_cursor_and_moves_cursor() {
+    let (mut term, recorder) = term(10, 10);
+    feed(&mut term, b"\x1b[3;4H"); // row 2, column 3
+
+    feed(&mut term, SIXEL);
+    let images = recorder.received();
+    assert_eq!(images.len(), 1, "one image was received");
+    let (key, data) = &images[0];
+    let (width, height) = match data {
+        ImageData::Rgba { width, height, pixels } => {
+            assert_eq!(pixels.len(), (*width as usize) * (*height as usize) * 4);
+            (*width, *height)
+        },
+        ImageData::Encoded { .. } => panic!("sixels deliver decoded pixels"),
+    };
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].key, *key);
+    assert_eq!((placements[0].row_in_view, placements[0].col), (2, 3));
+    assert_eq!(placements[0].cols, width); // cell size is unset: each cell counts as one pixel
+    assert_eq!(placements[0].rows, height);
+
+    // DECSDM off (the default): the cursor lands below the image, same column.
+    assert_eq!(cursor(&term), (2 + height as i32, 3));
+    assert!(recorder.released().is_empty(), "the placement still references it");
+
+    // DECSDM set: a second sixel displays without moving the cursor.
+    feed(&mut term, b"\x1b[?80h\x1b[5;6H");
+    let before = cursor(&term);
+    feed(&mut term, SIXEL);
+    assert_eq!(cursor(&term), before, "DECSDM set parks the cursor");
+    assert_eq!(term.visible_placements().len(), 2);
+
+    // Scrolling both images off converts them to placeholders and releases each exactly once.
+    for _ in 0..20 {
+        feed(&mut term, b"\n");
+    }
+    assert_eq!(term.visible_placements().len(), 0);
+    assert_eq!(recorder.released().len(), 2);
+}
+
+#[test]
+fn kitty_place_with_cells() {
+    let (mut term, recorder) = term(20, 20);
+    term.set_cell_pixel_size(8, 16);
+    feed(&mut term, b"\x1b[4;3H"); // row 3, column 2
+
+    // A 40x32 RGBA image displayed as 5 cells by 2.
+    let seq = transmit(1, "f=32", Some((40, 32)), &rgba(40, 32), ",c=5,r=2");
+    feed(&mut term, &seq);
+    let events = recorder.take();
+    let received = received_of(&events);
+    assert_eq!(received.len(), 1);
+    let key = received[0].0;
+    assert!(writes_of(&events).contains("i=1"), "raw pixels are answered immediately");
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].key, key);
+    assert_eq!((placements[0].row_in_view, placements[0].col), (3, 2));
+    assert_eq!((placements[0].cols, placements[0].rows), (5, 2));
+    // `C=0`: last row of the image, one cell past its last column.
+    assert_eq!(cursor(&term), (4, 7));
+
+    // A second placement with a pid adds one; re-placing the same pid replaces it.
+    feed(&mut term, b"\x1b[1;1H\x1b_Ga=p,i=1,p=7,c=2,r=1\x1b\\");
+    assert_eq!(term.visible_placements().len(), 2);
+    feed(&mut term, b"\x1b[6;1H\x1b_Ga=p,i=1,p=7,c=3,r=1\x1b\\");
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 2, "the same pid replaces its placement");
+    assert!(placements.iter().any(|p| p.row_in_view == 5 && p.col == 0 && p.cols == 3));
+    assert!(placements.iter().any(|p| p.row_in_view == 3 && p.col == 2), "the original survives");
+
+    // `C=1` places without moving the cursor.
+    feed(&mut term, b"\x1b[2;2H\x1b_Ga=p,i=1,C=1\x1b\\");
+    assert_eq!(cursor(&term), (1, 1));
+}
+
+#[test]
+fn span_from_pixels_rounds_up() {
+    let (mut term, recorder) = term(20, 20);
+    term.set_cell_pixel_size(10, 20);
+    feed(&mut term, b"\x1b[1;1H");
+
+    // 25x21 pixels with no `c`/`r`: ceil(25/10) x ceil(21/20) cells.
+    let seq = transmit(1, "f=24", Some((25, 21)), &rgb(25, 21), "");
+    feed(&mut term, &seq);
+    recorder.received();
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!((placements[0].cols, placements[0].rows), (3, 2));
+
+    // One axis given keeps the aspect: 2 columns wide is 20px wide, and 21 source pixels tall
+    // scales to under one 20px row — which still rounds up to one.
+    feed(&mut term, b"\x1b[5;1H");
+    let seq = transmit(2, "f=24", Some((25, 21)), &rgb(25, 21), ",c=2");
+    feed(&mut term, &seq);
+    recorder.received();
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 2);
+    let second = placements.iter().find(|p| p.row_in_view == 4).unwrap();
+    assert_eq!((second.cols, second.rows), (2, 1));
+}
+
+#[test]
+fn tiny_and_oversized_spans() {
+    let (mut term, recorder) = term(10, 10);
+
+    // A 1x1 pixel image at the very last cell: span at least 1x1, cursor clamps to (9, 0).
+    feed(&mut term, b"\x1b[10;10H");
+    let seq = transmit(1, "f=24", Some((1, 1)), &rgb(1, 1), "");
+    feed(&mut term, &seq);
+    recorder.received();
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert!((placements[0].cols, placements[0].rows) >= (1, 1));
+    assert_eq!((placements[0].row_in_view, placements[0].col), (9, 9));
+    assert_eq!(cursor(&term), (9, 0), "the cursor wraps past the image onto its last row");
+
+    // A 500x300 pixel image from the top: it scrolls as text would and is clipped below.
+    feed(&mut term, b"\x1b[1;1H");
+    let seq = transmit(2, "f=24", Some((500, 300)), &rgb(500, 300), "");
+    feed(&mut term, &seq);
+    recorder.received();
+    let placements = term.visible_placements();
+    let big = placements.iter().find(|p| p.rows > 100).unwrap();
+    assert_eq!((big.cols, big.rows), (500, 300));
+    assert_eq!(big.row_in_view, 0, "its anchor is the cursor row after scrolling");
+    assert_eq!(cursor(&term), (9, 9), "the cursor clamps to the screen's last cell");
+}
+
+#[test]
+fn scroll_moves_placements() {
+    let (mut term, recorder) = term(10, 10);
+    feed(&mut term, b"\x1b[3;7r"); // scroll region rows 2..6
+    feed(&mut term, b"\x1b[5;1H");
+
+    // A placement anchored at row 4 inside the region.
+    let seq = transmit(1, "f=32", Some((8, 8)), &rgba(8, 8), ",c=1,r=2");
+    feed(&mut term, &seq);
+    recorder.received();
+    assert_eq!(term.visible_placements()[0].row_in_view, 4);
+
+    // Inserting two lines at region row 3 shoves content (and the anchor) down by two.
+    feed(&mut term, b"\x1b[4;1H\x1b[2L");
+    assert_eq!(term.visible_placements()[0].row_in_view, 6);
+
+    // Deleting them again moves it back.
+    feed(&mut term, b"\x1b[4;1H\x1b[2M");
+    assert_eq!(term.visible_placements()[0].row_in_view, 4);
+
+    // A full-viewport scroll needs no shifts: the anchor rides its own line into history while
+    // the viewport slides up to the counter. Feed text until the screen scrolls twice.
+    feed(&mut term, b"\x1b[r"); // reset the region to the whole screen
+    feed(&mut term, b"\x1b[10;1H");
+    for _ in 0..2 {
+        feed(&mut term, b"x\n");
+    }
+    let placements = term.visible_placements();
+    let moved = placements.iter().find(|p| p.key.0 == 0).unwrap();
+    // Scrolled two rows up: row_in_view 4 - 2 (the image is not fully out yet).
+    assert_eq!(moved.row_in_view, 2);
+    assert!(
+        recorder
+            .take()
+            .iter()
+            .all(|event| !matches!(event, Event::ImageReceived { .. } | Event::ImageReleased(_)))
+    );
+}
+
+#[test]
+fn clear_resize_and_screen_switch() {
+    let (mut term, recorder) = term(12, 12);
+
+    // ED 2 removes placements anchored in the viewport and releases their images.
+    feed(&mut term, b"\x1b[4;1H");
+    feed(&mut term, SIXEL);
+    assert_eq!(term.visible_placements().len(), 1);
+    recorder.received();
+    feed(&mut term, b"\x1b[2J");
+    assert_eq!(term.visible_placements().len(), 0);
+    let released = recorder.released();
+    assert_eq!(released.len(), 1, "ED 2 releases the sixel exactly once");
+
+    // ED 3 removes scrollback placements (with images kept, they were alive there until now).
+    term.set_scrollback_images(true);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, SIXEL);
+    let scrollback_key = recorder.received()[0].0;
+    for _ in 0..14 {
+        feed(&mut term, b"\n");
+    }
+    assert!(recorder.released().is_empty(), "kept placements are not released");
+    feed(&mut term, b"\x1b[3J");
+    assert_eq!(recorder.released(), vec![scrollback_key], "ED 3 releases it once");
+    term.set_scrollback_images(false);
+
+    // RIS removes everything: every stored image reports its release exactly once.
+    feed(&mut term, b"\x1b[2;2H");
+    let seq = transmit(20, "f=24", Some((2, 2)), &rgb(2, 2), "");
+    feed(&mut term, &seq);
+    feed(&mut term, SIXEL);
+    recorder.take(); // the receives are not what this step asserts
+    feed(&mut term, b"\x1bc");
+    let mut released = recorder.released();
+    released.sort_unstable();
+    assert_eq!(released.len(), 2, "the kitty image and the sixel both release");
+    assert_ne!(released[0], released[1], "two distinct images, each exactly once");
+    assert_eq!(term.visible_placements().len(), 0);
+
+    // Leaving the alternate screen drops its placements; the primary screen's survive.
+    feed(&mut term, SIXEL);
+    let primary_key = recorder.received()[0].0;
+    feed(&mut term, b"\x1b[?1049h");
+    assert_eq!(term.visible_placements().len(), 0, "the alt screen starts without images");
+    feed(&mut term, SIXEL);
+    let alt_key = recorder.received()[0].0;
+    assert_eq!(term.visible_placements().len(), 1);
+    feed(&mut term, b"\x1b[?1049l");
+    assert_eq!(recorder.released(), vec![alt_key], "leaving the alt screen releases its image");
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].key, primary_key, "the primary placement is back in view");
+
+    // A column resize drops placements whose anchor column reflowed away; a row-only resize
+    // keeps anchors.
+    feed(&mut term, b"\x1b[1;11H");
+    let seq = transmit(30, "f=32", Some((24, 8)), &rgba(24, 8), ",c=3,r=1");
+    feed(&mut term, &seq);
+    recorder.received();
+    term.resize(Size { columns: 5, lines: 12 });
+    assert!(
+        !term.visible_placements().iter().any(|p| p.key.0 > primary_key.0 && p.cols == 3),
+        "the placement anchored past the new width is gone"
+    );
+    assert!(recorder.released().is_empty(), "its id still references the stored image");
+
+    feed(&mut term, b"\x1b[3;1H");
+    feed(&mut term, SIXEL);
+    let row_key = recorder.received()[0].0;
+    term.resize(Size { columns: 5, lines: 16 });
+    assert!(
+        term.visible_placements().iter().any(|p| p.key == row_key),
+        "a row-only resize keeps anchors"
+    );
+    assert!(recorder.released().is_empty());
+}
+
+#[test]
+fn scrolled_off_becomes_placeholder() {
+    let (mut term, recorder) = term(10, 10);
+    feed(&mut term, b"\x1b[1;1H");
+
+    feed(&mut term, SIXEL);
+    let images = recorder.received();
+    assert_eq!(images.len(), 1);
+    let (key, data) = &images[0];
+    let ImageData::Rgba { width, height, .. } = data else { panic!("decoded pixels") };
+    let (width, height) = (*width, *height);
+
+    // Scroll the image fully out of view: exactly one release, and a placeholder on its line.
+    for _ in 0..10 {
+        feed(&mut term, b"\n");
+    }
+    assert_eq!(recorder.released(), vec![*key]);
+    assert!(term.visible_placements().is_empty());
+
+    // The placeholder says what scrolled off, as text on its row.
+    use crate::grid::Scroll;
+    term.scroll_display(Scroll::Top);
+    let placeholders = term.visible_placeholders();
+    assert_eq!(placeholders.len(), 1);
+    assert_eq!(placeholders[0].row_in_view, 0);
+    assert_eq!(placeholders[0].col, 0);
+    assert_eq!(placeholders[0].text, format!("[image {width}\u{d7}{height}]"));
+
+    // It is text: scrolling back down past it takes the placeholder with the rows.
+    term.scroll_display(Scroll::Bottom);
+    assert!(term.visible_placeholders().is_empty());
+    let _ = key;
+}
+
+#[test]
+fn scrollback_kept_when_enabled() {
+    let (mut term, recorder) = term(10, 10);
+    term.set_scrollback_images(true);
+    feed(&mut term, b"\x1b[1;1H");
+
+    feed(&mut term, SIXEL);
+    let key = recorder.received()[0].0;
+
+    // Scroll it out of view: kept, and nothing is released.
+    for _ in 0..10 {
+        feed(&mut term, b"\n");
+    }
+    assert!(recorder.released().is_empty());
+    assert!(term.visible_placeholders().is_empty(), "kept placements leave no placeholder");
+
+    // It scrolls back into view unchanged.
+    use crate::grid::Scroll;
+    term.scroll_display(Scroll::Top);
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].key, key);
+    assert_eq!(placements[0].row_in_view, 0);
+
+    // And back out of view again with no further image events (scrolling itself may notify the
+    // host about other things).
+    term.scroll_display(Scroll::Bottom);
+    assert!(term.visible_placements().is_empty());
+    let rest = recorder.take();
+    assert!(
+        rest.iter()
+            .all(|event| !matches!(event, Event::ImageReceived { .. } | Event::ImageReleased(_))),
+        "scrolling kept images makes no image events"
+    );
+}
+
+#[test]
+fn evict_oldest_scrollback_image() {
+    let (mut term, recorder) = term(10, 10);
+    term.set_scrollback_images(true);
+    feed(&mut term, b"\x1b[1;1H");
+
+    // Two images into scrollback: the first placed is the oldest.
+    feed(&mut term, SIXEL);
+    let first = recorder.received()[0].0;
+    for _ in 0..8 {
+        feed(&mut term, b"\n");
+    }
+    feed(&mut term, SIXEL);
+    let second = recorder.received()[0].0;
+    for _ in 0..8 {
+        feed(&mut term, b"\n");
+    }
+    assert!(recorder.released().is_empty(), "both are kept so far");
+
+    // The embedder's cap: evicting takes the oldest placement fully above the viewport first.
+    let evicted = term.evict_oldest_scrollback_image();
+    assert_eq!(evicted, Some(first));
+    assert_eq!(recorder.released(), vec![first], "eviction releases outright");
+
+    use crate::grid::Scroll;
+    term.scroll_display(Scroll::Top);
+    let placeholders = term.visible_placeholders();
+    assert_eq!(placeholders.len(), 1, "the evicted placement became a placeholder");
+    term.scroll_display(Scroll::Bottom);
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1, "the newer one is still in view and kept");
+    assert_eq!(placements[0].key, second);
+
+    // Scroll the second one fully into scrollback too, then drain the table.
+    for _ in 0..8 {
+        feed(&mut term, b"\n");
+    }
+    assert_eq!(term.evict_oldest_scrollback_image(), Some(second));
+    assert_eq!(recorder.released(), vec![second]);
+    assert_eq!(term.evict_oldest_scrollback_image(), None);
+}
+
+#[test]
+fn virtual_placement_resolves_placeholder_cells() {
+    let (mut term, recorder) = term(20, 20);
+    term.set_cell_pixel_size(8, 16);
+
+    // `U=1` records a virtual placement: no grid placement exists, but the id resolves.
+    let seq = transmit(3, "f=24", Some((80, 80)), &rgb(80, 80), ",U=1,c=10,r=5");
+    feed(&mut term, &seq);
+    let events = recorder.take();
+    let key = received_of(&events)[0].0;
+    assert!(writes_of(&events).contains("OK"));
+    assert!(term.visible_placements().is_empty(), "a virtual placement displays nothing itself");
+
+    let resolved = term.kitty_virtual_image(3, None).expect("the id resolves");
+    assert_eq!(resolved, (key, 10, 5));
+    assert_eq!(term.kitty_virtual_image(3, Some(9)), None, "no virtual placement has that pid");
+    assert_eq!(term.kitty_virtual_image(4, None), None, "unknown ids resolve to nothing");
+
+    // A printed placeholder cell decodes to (image id, row, column) and resolves through Term.
+    let mut cell = crate::term::cell::Cell {
+        c: PLACEHOLDER_CHAR,
+        fg: crate::vte::ansi::Color::Spec(Rgb { r: 0, g: 0, b: 3 }),
+        ..crate::term::cell::Cell::default()
+    };
+    cell.push_zerowidth('\u{30D}'); // table index 1
+    cell.push_zerowidth('\u{30E}'); // table index 2
+    assert_eq!(decode_placeholder_cell(&cell), Some((3, 1, 2)));
+    let resolved = term.kitty_virtual_image(3, None).unwrap();
+    assert_eq!(resolved.0, key, "the renderer can resolve the cell to the stored image");
+
+    // A third mark carries the high id byte; fewer than two marks inherit from the left.
+    cell.push_zerowidth('\u{305}'); // table index 0
+    assert_eq!(decode_placeholder_cell(&cell), Some((3, 1, 2)));
+    let short = {
+        let mut c = crate::term::cell::Cell {
+            c: PLACEHOLDER_CHAR,
+            fg: crate::vte::ansi::Color::Spec(Rgb { r: 0, g: 0, b: 3 }),
+            ..crate::term::cell::Cell::default()
+        };
+        c.push_zerowidth('\u{30D}');
+        c
+    };
+    assert_eq!(decode_placeholder_cell(&short), None);
+}
+
+#[test]
+fn kitty_delete_selectors() {
+    let (mut term, recorder) = term(12, 12);
+
+    // Three placements: a sixel across rows 0..5, kitty id 3 on rows 1..2, and id 4 with pid 9
+    // at z=5 on row 8.
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, SIXEL);
+    let sixel_key = recorder.received()[0].0;
+    feed(&mut term, b"\x1b[2;1H");
+    feed(&mut term, &transmit(3, "f=32", Some((32, 32)), &rgba(32, 32), ",c=4,r=2"));
+    let id3_key = recorder.received()[0].0;
+    feed(&mut term, b"\x1b[9;1H");
+    feed(&mut term, &transmit(4, "f=32", Some((8, 8)), &rgba(8, 8), ",c=1,r=1,p=9,z=5"));
+    let id4_key = recorder.received()[0].0;
+    assert_eq!(term.visible_placements().len(), 3);
+
+    // `d=Y` (uppercase: placements and data) removes what crosses viewport row 9 — the z-5
+    // image, whose key releases.
+    recorder.take();
+    feed(&mut term, b"\x1b_Ga=d,d=Y,y=9\x1b\\");
+    let events = recorder.take();
+    assert!(writes_of(&events).contains("OK"));
+    assert_eq!(released_of(&events), vec![id4_key]);
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 2);
+    assert!(!placements.iter().any(|p| p.key == id4_key));
+
+    // `d=i` (lowercase) removes one image's placements but keeps the stored data.
+    feed(&mut term, b"\x1b_Ga=d,d=i,i=3\x1b\\");
+    let events = recorder.take();
+    assert!(writes_of(&events).contains("OK"));
+    assert!(released_of(&events).is_empty(), "lowercase deletes keep the data");
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert!(!placements.iter().any(|p| p.key == id3_key));
+
+    // `d=a` clears the view: the sixel (no id) releases; the numbered kitty image does not.
+    feed(&mut term, b"\x1b_Ga=d,d=a\x1b\\");
+    assert_eq!(recorder.released(), vec![sixel_key]);
+    assert!(term.visible_placements().is_empty());
+
+    // `d=I` frees an image by id outright, even with no placements left.
+    feed(&mut term, b"\x1b_Ga=d,d=I,i=3\x1b\\");
+    assert_eq!(recorder.released(), vec![id3_key]);
+
+    // Unknown ids answer ENOENT.
+    feed(&mut term, b"\x1b_Ga=d,d=i,i=99\x1b\\");
+    assert!(recorder.writes().contains("ENOENT"));
+}
+
+#[test]
+fn decode_failure_sends_ebadpng() {
+    let (mut term, recorder) = term(10, 10);
+    feed(&mut term, b"\x1b[1;1H");
+
+    // A PNG transmission: the reply waits for the embedder's decode result.
+    let seq = format!("\x1b_Ga=T,i=9,f=100,m=0;{}\x1b\\", STANDARD.encode(PNG_1X1));
+    feed(&mut term, seq.as_bytes());
+    let events = recorder.take();
+    let received = received_of(&events);
+    assert_eq!(received.len(), 1);
+    let (key, data) = &received[0];
+    match data {
+        ImageData::Encoded { bytes, width, height, .. } => {
+            assert_eq!(bytes.as_slice(), PNG_1X1);
+            assert_eq!((*width, *height), (1, 1));
+        },
+        ImageData::Rgba { .. } => panic!("PNG travels encoded"),
+    }
+    assert_eq!(term.visible_placements().len(), 1, "it is laid out before decoding");
+    assert!(writes_of(&events).is_empty(), "the reply waits on the decode result");
+
+    // Failure: EBADPNG travels to the client, and the placements go with the image.
+    term.image_decoded(*key, Err(ImageDecodeError::Corrupt));
+    let events = recorder.take();
+    let writes = writes_of(&events);
+    assert!(writes.contains("i=9") && writes.contains("EBADPNG"));
+    assert_eq!(released_of(&events), vec![*key]);
+    assert!(term.visible_placements().is_empty());
+
+    // Success answers OK and keeps the placement.
+    feed(&mut term, b"\x1b[2;1H");
+    let seq = format!("\x1b_Ga=T,i=10,f=100,m=0;{}\x1b\\", STANDARD.encode(PNG_1X1));
+    feed(&mut term, seq.as_bytes());
+    let good = received_of(&recorder.take())[0].0;
+    term.image_decoded(good, Ok(()));
+    let events = recorder.take();
+    let writes = writes_of(&events);
+    assert!(writes.contains("i=10") && writes.contains("OK"));
+    assert_eq!(term.visible_placements().len(), 1);
+    assert!(released_of(&events).is_empty());
+
+    // `q=2` suppresses even the failure reply.
+    feed(&mut term, b"\x1b[3;1H");
+    let seq = format!("\x1b_Ga=T,i=11,f=100,m=0,q=2;{}\x1b\\", STANDARD.encode(PNG_1X1));
+    feed(&mut term, seq.as_bytes());
+    let quiet = received_of(&recorder.take())[0].0;
+    term.image_decoded(quiet, Err(ImageDecodeError::TooLarge));
+    let events = recorder.take();
+    assert!(writes_of(&events).is_empty(), "q=2 hides every reply");
+    assert_eq!(released_of(&events), vec![quiet]);
+
+    term.tick(Instant::now()); // the stall watchdog must not trip on idle parsers
+}

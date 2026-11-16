@@ -40,7 +40,8 @@
 //! command or a frame that starts another transmission ends one (the protocol asks a delete to
 //! abort an upload). Time is injected: `end(now)` and [`tick`](KittyParser::tick) drop a
 //! transmission that has made no progress for [`STALL`] with `ENOMEM` — `tick` so that an idle
-//! terminal releases a client that stopped mid-upload — and tests never sleep. Every buffer is
+//! terminal releases a client that stopped mid-upload, though never while an APC frame is open —
+//! and tests never sleep. Every buffer is
 //! bounded: the staged payload of one APC frame and the accumulated bytes of one transmission by
 //! [`MAX_PAYLOAD_BYTES`], the inflated output by [`MAX_IMAGE_BYTES`] or, for a declared raw
 //! format, by its own declared size; base64 is decoded incrementally by [`Decoder`], which carries
@@ -498,8 +499,14 @@ impl KittyParser {
     /// Nothing arrived on the wire: callers run this on a timer so that a client which stops
     /// mid-upload while the terminal sits idle is released anyway. It drops a chunked transmission
     /// that has made no progress for [`STALL`], with the `ENOMEM` rejection waiting in
-    /// [`take_reject`](Self::take_reject); the frame being parsed, if any, is left alone.
+    /// [`take_reject`](Self::take_reject). While an APC frame is being parsed nothing is dropped:
+    /// its staged payload belongs to the transmission it continues, and dropping under it would
+    /// strand those bytes against a transmission that no longer exists; the frame's own `end`
+    /// runs the same check once the frame is closed.
     pub fn tick(&mut self, now: Instant) {
+        if self.frame.active {
+            return;
+        }
         self.drop_stalled(now);
     }
 

@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 use std::borrow::Cow;
 use std::fmt::{self, Debug, Formatter};
 use std::process::ExitStatus;
@@ -5,6 +7,48 @@ use std::sync::Arc;
 
 use crate::term::ClipboardType;
 use crate::vte::ansi::Rgb;
+
+/// Identifies one image the terminal handed to the embedder.
+///
+/// Keys are handed out in increasing order by [`crate::term::Term`] and each names exactly one
+/// image: the payload of [`Event::ImageReceived`] and the subject of [`Event::ImageReleased`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ImageKey(pub u64);
+
+/// An encoded image format the embedder is asked to decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFormat {
+    /// PNG data.
+    Png,
+    /// JPEG data.
+    Jpeg,
+    /// GIF data.
+    Gif,
+}
+
+/// The pixels or encoded bytes of one image, as [`Event::ImageReceived`] delivers them.
+///
+/// `Rgba` carries straight (non-premultiplied) 8-bit RGBA with `pixels.len()` equal to
+/// `width * height * 4`; the terminal converts its own pixel formats (sixel output, raw RGB) to
+/// that layout. `Encoded` carries a container format's bytes for the embedder to decode;
+/// `width`/`height` are the dimensions read from the header or declared by the sender, so
+/// placements can be laid out before decoding finishes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImageData {
+    /// Decoded pixels: `pixels.len() == width * height * 4`.
+    Rgba { width: u32, height: u32, pixels: Vec<u8> },
+    /// Encoded image bytes with the dimensions their header declares.
+    Encoded { format: ImageFormat, bytes: Vec<u8>, width: u32, height: u32 },
+}
+
+/// Why an image the embedder was asked to decode is not usable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageDecodeError {
+    /// The payload is not a valid image in its format.
+    Corrupt,
+    /// Decoding would exceed the terminal's image size limits.
+    TooLarge,
+}
 
 /// Terminal event.
 ///
@@ -56,6 +100,20 @@ pub enum Event {
 
     /// Child process exited.
     ChildExit(ExitStatus),
+
+    /// An image's payload arrived and is the embedder's to decode and draw (feathercritty).
+    ///
+    /// The key names this payload from then on; [`Term::image_decoded`] reports the decode result
+    /// back to the terminal, which answers any client waiting for it.
+    ///
+    /// [`Term::image_decoded`]: crate::term::Term::image_decoded
+    ImageReceived { key: ImageKey, data: ImageData },
+
+    /// Nothing references this image any more and the embedder should free it (feathercritty).
+    ///
+    /// Sent exactly once per key, when its last placement, placeholder or stored reference is
+    /// gone; a key that was released is never reused.
+    ImageReleased(ImageKey),
 }
 
 impl Debug for Event {
@@ -74,6 +132,20 @@ impl Debug for Event {
             Event::Bell => write!(f, "Bell"),
             Event::Exit => write!(f, "Exit"),
             Event::ChildExit(status) => write!(f, "ChildExit({status:?})"),
+            // The payload can be megabytes; the key is what identifies it in a log.
+            Event::ImageReceived { key, data } => match data {
+                ImageData::Rgba { width, height, pixels } => write!(
+                    f,
+                    "ImageReceived({key:?}, Rgba {{ {width}x{height}, {} bytes }})",
+                    pixels.len()
+                ),
+                ImageData::Encoded { format, bytes, width, height } => write!(
+                    f,
+                    "ImageReceived({key:?}, Encoded {{ {format:?} {width}x{height}, {} bytes }})",
+                    bytes.len()
+                ),
+            },
+            Event::ImageReleased(key) => write!(f, "ImageReleased({key:?})"),
         }
     }
 }
