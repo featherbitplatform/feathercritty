@@ -1,3 +1,5 @@
+// Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 //! The main event loop which performs I/O on the pseudoterminal.
 
 use std::borrow::Cow;
@@ -17,8 +19,8 @@ use polling::{Event as PollingEvent, Events, PollMode, Poller};
 use crate::event::{self, Event, EventListener, WindowSize};
 use crate::sync::FairMutex;
 use crate::term::Term;
+use crate::vte::ansi;
 use crate::{thread, tty};
-use vte::ansi;
 
 /// Max bytes to read from the PTY before forced terminal synchronization.
 pub(crate) const READ_BUFFER_SIZE: usize = 0x10_0000;

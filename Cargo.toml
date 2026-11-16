@@ -17,7 +17,7 @@ publish = false
 
 [features]
 default = ["serde"]
-serde = ["dep:serde", "bitflags/serde", "vte/serde"]
+serde = ["dep:serde", "bitflags/serde"]
 # Test-only hooks (not a stable API): `Grid::new_with_block_size`, so integration tests and the
 # differential test can use tiny history blocks. The crate enables it for its own tests through
 # the self dev-dependency below.
@@ -37,7 +37,12 @@ unicode-width = "0.2.0"
 # Compresses cold history blocks (src/grid/cold.rs); chosen in benches/RESULTS.md, "Compressor choice".
 # No default features: the bulk API needs none (not `legacy` formats, `arrays` or `zdict_builder`).
 zstd = { version = "0.14.3", default-features = false }
-vte = { version = "0.15.0", default-features = false, features = ["std", "ansi"] }
+# Vendored VT parser (`src/vte`): the dependencies `vte` 0.15.0 needed for its `std` + `ansi` build,
+# carried over here. `bitflags` and `log` above are shared; `serde` (optional, below) is wired through
+# this crate's own `serde` feature. Only what feathercritty uses is kept: no `arrayvec` (the parser
+# always uses `Vec`).
+cursor-icon = { version = "1", default-features = false }
+memchr = "2"
 serde = { version = "1", features = ["derive", "rc"], optional = true }
 
 [target.'cfg(unix)'.dependencies]

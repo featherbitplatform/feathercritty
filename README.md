@@ -236,6 +236,24 @@ The sites classified as history-capable in 0.26.0: `Term::line_to_string`, `Term
 
 **Open items for the owner** (the gates are unchanged; numbers and reasoning in `benches/RESULTS.md`, "History compression"): with compression off, some rows sit slightly above the fork's `main` in some sessions, and live bytes are slightly higher per block slot; with it on, parser-side ingest is borderline at its gate, the reflow comes slightly above "off plus one decompression of the old history", and switching on briefly goes about two blocks above the uncompressed size before it comes down.
 
+### 10. Vendored VT parser with OSC string caps
+
+`src/vte/` (new): feathercritty now carries its own copy of the `vte` 0.15.0 parser instead of depending on the crate, so it can cap string sequences without waiting for upstream. This is the first change of the inline-images work; it ships under the next fork revision when merged to `main`.
+
+**The copy.** `src/vte/mod.rs`, `src/vte/ansi.rs` and `src/vte/params.rs` are copies of vte 0.15.0's `src/lib.rs`, `src/ansi.rs` and `src/params.rs`, with the module paths adjusted (`crate::` becomes `crate::vte::`) and built for feathercritty's always-`std`, always-`ansi` configuration: the `no_std` / fixed-buffer branches are dropped (the parser always uses `Vec`), and the `serde` derives follow this crate's own `serde` feature. Each copied `.rs` starts with `// Copied from vte 0.15.0 (Apache-2.0 OR MIT) by the featherbit authors for feathercritty; see README.md for the list of changes.`; upstream provenance comments are kept as they were. `src/vte/LICENSE-APACHE` and `src/vte/LICENSE-MIT` are verbatim copies of the upstream license files, so (like the vendored oracle) they carry no notice line. vte's own tests move with the source and run as unit tests.
+
+**Caps.** `Parser` gains two limits on OSC strings:
+- `MAX_OSC_BYTES` (`64 * 1024`, public): once an OSC string reaches it, one whose first parameter is not `1337` stops collecting bytes and is discarded (not dispatched); `1337` keeps growing, because its arguments carry inline image data. This also bounds the buffer against a never-terminated oversized OSC: a non-`1337` string can no longer grow it without bound.
+- Parameters past `MAX_OSC_PARAMS` (`16`) are kept in the last parameter instead of dropped, so a `1337` command with more than 16 `;`-separated arguments keeps its later ones.
+
+**Public paths unchanged.** `feathercritty::vte::{Parser, Perform, Params, ParamsIter}` and `feathercritty::vte::ansi::*` are the same as the old re-export of the crate; `src/lib.rs` now has `pub mod vte;`. `src/event_loop.rs` is the only file that named the dependency crate directly (`use vte::ansi;`) and now uses `crate::vte::ansi`.
+
+**Cargo.toml.** The `vte` dependency is gone; `cursor-icon` and `memchr` are added (with `bitflags`, `log` and `serde` already present) — the dependencies the copy needs for its `std` + `ansi` build. No `arrayvec`. The `serde` feature is now `["dep:serde", "bitflags/serde"]`; the copy's serde derives read this crate's own `serde` feature.
+
+**Tests.** `oversized_osc_is_discarded` and `osc_params_past_sixteen_are_joined` in `src/vte/mod.rs`. The differential harness projects cell colors to a crate-neutral `ColorP` (`tests/support/project.rs`, `color_p` in `tests/support/term_impl.rs`): feathercritty's vendored `Color` is now a distinct type from 0.26.0's, but both are byte-identical copies of vte 0.15.0 with the same variants and discriminants, so named colors project to their shared discriminant and every variant still compares equal across crates. Two copied tests compare an empty intermediates list with `is_empty` rather than `assert_eq!(.., &[])`, whose element type is ambiguous once `serde_json` is a dev-dependency.
+
+**Merging / moving the oracle.** Re-vendor these files when adopting a new vte release, re-applying the path rewrite, the always-`std`/`ansi` collapse and the caps; if upstream changes OSC handling (`action_osc_put`, `action_osc_put_param`, `osc_end`, `osc_dispatch`), re-check the caps against it. The clippy allow in `src/vte/mod.rs` (for a lint newer than the copied code) can go once the copy is refreshed to a vte release that satisfies current clippy.
+
 ## Development
 
 ```sh

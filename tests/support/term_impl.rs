@@ -23,7 +23,8 @@ use k::vi_mode::{ViModeCursor, ViMotion};
 use k::vte::ansi::Processor;
 
 use crate::support::project::{
-    CellP, CursorP, LinkP, Panicked, QAns, QueryPlan, SearchQ, Snapshot, VI_MOTIONS, Walk, WalkEnd,
+    CellP, ColorP, CursorP, LinkP, Panicked, QAns, QueryPlan, SearchQ, Snapshot, VI_MOTIONS, Walk,
+    WalkEnd,
 };
 use crate::support::{Pt, SelTy, Start, Step, catch};
 
@@ -89,6 +90,17 @@ fn explicit_id(id: &str) -> Option<String> {
     (!generated).then(|| id.to_owned())
 }
 
+/// Project a color. Each crate's `Color` is its own type; both are byte-identical copies of vte
+/// 0.15.0, so named colors project to their shared discriminant and every variant compares equal
+/// across crates.
+fn color_p(color: k::vte::ansi::Color) -> ColorP {
+    match color {
+        k::vte::ansi::Color::Named(named) => ColorP::Named(named as usize),
+        k::vte::ansi::Color::Indexed(index) => ColorP::Indexed(index),
+        k::vte::ansi::Color::Spec(rgb) => ColorP::Spec([rgb.r, rgb.g, rgb.b]),
+    }
+}
+
 /// Project a cell. `index` is its row-major position, or `None` for a cursor template.
 fn cell_p(cell: &Cell, ids: &mut HashMap<String, usize>, index: Option<usize>) -> CellP {
     let link = cell.hyperlink().map(|link| {
@@ -106,10 +118,10 @@ fn cell_p(cell: &Cell, ids: &mut HashMap<String, usize>, index: Option<usize>) -
     CellP {
         c: cell.c,
         zerowidth: cell.zerowidth().map(<[char]>::to_vec).unwrap_or_default(),
-        fg: cell.fg,
-        bg: cell.bg,
+        fg: color_p(cell.fg),
+        bg: color_p(cell.bg),
         flags: cell.flags.bits(),
-        underline_color: cell.underline_color(),
+        underline_color: cell.underline_color().map(color_p),
         link,
     }
 }
