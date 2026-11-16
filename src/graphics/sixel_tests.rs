@@ -700,6 +700,53 @@ fn near_cap_image_is_complete() {
     assert_eq!(px(&image, 2050, 2001), [0, 0, 0, 0], "never-painted middle is transparent");
 }
 
+/// Growth near the byte cap must stay logarithmic: a fully painted 4100×4002 image — 667 bands of
+/// `!4100~-`, ~4.7 KB of input, an area within 2% of the cap — may rebuild its buffer at most 40
+/// times (doubling alone would need ~25; fitting one side exactly while giving the other all the
+/// slack once needed hundreds, each copying the whole 64 MiB buffer). The reallocation count is
+/// release-independent and exact; the time bound is a coarse debug backstop.
+#[test]
+fn full_paint_near_cap_reallocates_logarithmically() {
+    let mut stream = b"#1".to_vec();
+    for _ in 0..667 {
+        stream.extend_from_slice(b"!4100~-");
+    }
+    let start = Instant::now();
+    let mut decoder = SixelDecoder::new(&[], BG);
+    decoder.put(&stream);
+    let reallocs = decoder.reallocations();
+    let image = decoder.finish().expect("a legal near-cap image decodes");
+    let elapsed = start.elapsed();
+    assert_eq!((image.width, image.height), (4100, 4002));
+    assert!(image.rgba.chunks(4).all(|p| p == PAL_BLUE.as_slice()), "every pixel painted",);
+    assert!(reallocs <= 40, "{reallocs} buffer rebuilds for a fully painted 4100x4002 image");
+    assert!(elapsed.as_millis() < 2000, "decoding took {elapsed:?}, expected well under 2 s");
+}
+
+/// The staircase shape — one more column per band (`!7000~-`, `!7001~-`, ... for 300 bands, ending
+/// at 7299×1800 within 22% of the byte cap so growth enters the cap-bound zone) — likewise stays
+/// under 40 rebuilds. A count assertion, so it pins the growth rule rather than machine speed.
+#[test]
+fn staircase_toward_cap_reallocates_logarithmically() {
+    let mut stream = b"#1".to_vec();
+    for b in 0..300u32 {
+        stream.extend_from_slice(format!("!{}~-", 7000 + b).as_bytes());
+    }
+    let start = Instant::now();
+    let mut decoder = SixelDecoder::new(&[], BG);
+    decoder.put(&stream);
+    let reallocs = decoder.reallocations();
+    let image = decoder.finish().expect("the staircase decodes");
+    let elapsed = start.elapsed();
+    assert_eq!((image.width, image.height), (7299, 1800));
+    // The last band reaches the far corner; column 7298 was painted only there, not in band 0.
+    assert_eq!(px(&image, 7298, 1797), PAL_BLUE, "far corner of the last band");
+    assert_eq!(px(&image, 7298, 5), [BG.r, BG.g, BG.b, 255], "column 7298 not painted in band 0");
+    assert_eq!(px(&image, 6999, 3), PAL_BLUE, "band 0 reaches column 6999");
+    assert!(reallocs <= 40, "{reallocs} buffer rebuilds for the 300-band staircase");
+    assert!(elapsed.as_millis() < 2000, "decoding took {elapsed:?}, expected well under 2 s");
+}
+
 /// The state machine resumes exactly where a `put` left it: every fixture decodes identically fed
 /// whole, one byte at a time, or in chunks — including splits inside numbers, colour introducers
 /// and raster attributes.

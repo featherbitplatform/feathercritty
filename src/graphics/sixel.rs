@@ -36,8 +36,11 @@
 //! [`MAX_IMAGE_BYTES`] of RGBA8 data: a sixel that would push past a cap paints nothing beyond it,
 //! later ones are ignored the same way, and `finish` returns the image as far as it fits — an
 //! oversized sixel is truncated, not refused. When doubling would bust the byte cap but the
-//! rectangle actually asked for still fits, the trim serves that rectangle instead: geometric
-//! overshoot never truncates a legal image. Raster attributes allocate nothing up front: they only
+//! rectangle actually asked for still fits, that need is honored exactly — geometric overshoot
+//! never truncates a legal image — and the room left above it is split between both sides
+//! geometrically (capacity area keeps doubling toward the cap), so growth stays logarithmic in
+//! image size right up to the cap instead of reallocating per band. Raster attributes allocate
+//! nothing up front: they only
 //! raise a minimum logical size applied in `finish`, so a 15-byte header may declare 10 000×10 000
 //! without the decoder reserving for it before the first sixel. All size math is done in `u64` with
 //! saturating accumulators, so no input can overflow a length or make an allocation larger than the
@@ -235,6 +238,10 @@ pub struct SixelDecoder {
     /// [`finish`](Self::finish); it never allocates anything by itself.
     declared_w: u32,
     declared_h: u32,
+    /// How many times the working buffer has been rebuilt
+    /// ([`resize_capacity`](Self::resize_capacity)); a growth-shape witness for tests, not an API
+    /// promise.
+    reallocs: usize,
     /// Sixel cursor: the column the next data character paints, and the top row of its band.
     x: u32,
     band: u32,
@@ -258,6 +265,7 @@ impl SixelDecoder {
             painted_h: 0,
             declared_w: 0,
             declared_h: 0,
+            reallocs: 0,
             x: 0,
             band: 0,
             state: State::Normal,
@@ -315,6 +323,13 @@ impl SixelDecoder {
     #[cfg(test)]
     pub(crate) fn canvas(&self) -> (u32, u32, usize) {
         (self.painted_w, self.painted_h, self.buf.len())
+    }
+
+    /// How many times the working buffer was rebuilt so far: a test hook pinning that growth is
+    /// logarithmic in image size even near the byte cap.
+    #[cfg(test)]
+    pub(crate) fn reallocations(&self) -> usize {
+        self.reallocs
     }
 
     /// Decode what arrived and hand out the image. A stream cut short before its terminator
@@ -486,13 +501,17 @@ impl SixelDecoder {
     /// Grow the allocated capacity to cover `w_needed` by `h_needed`. Each side doubles until it
     /// covers the need (so a run of columns costs logarithmically many reallocations, each copying
     /// the old rows once), clamped to [`MAX_IMAGE_SIDE`] per side and to [`MAX_IMAGE_BYTES`] in
-    /// total. When the doubled pair busts the byte cap, the trim serves the rectangle actually
-    /// asked for — the painted extent plus what this sixel claims — if that still fits (capacity
-    /// may shrink toward it, since never-painted area is only fill): geometric overshoot never
-    /// denies a legal image its area. When even the asked-for rectangle busts the cap, only the
-    /// current capacity is a floor: no painted pixel is ever lost, only newly asked-for area is
-    /// dropped, width keeping what the height allows and height what the width allows. All math is
-    /// overflow-safe: sizes are compared in `u64` against the caps before anything is reserved.
+    /// total. When the doubled pair busts the byte cap but the rectangle actually asked for — the
+    /// painted extent plus what this sixel claims — still fits, that need is honored exactly (a
+    /// legal image is never denied its area) *and* the room left above it is split between both
+    /// sides geometrically: capacity area doubles toward the cap, each side taking its share, so
+    /// growth near the cap stays logarithmic instead of fitting one side exactly and giving all
+    /// the slack to the other (which reallocated — copying the whole buffer — on every new band).
+    /// Capacity may shrink toward the needed rectangle when rebalancing, since never-painted area
+    /// is only fill. When even the asked-for rectangle busts the cap, only the current capacity is
+    /// a floor: no painted pixel is ever lost, only newly asked-for area is dropped, width keeping
+    /// what the height allows and height what the width allows. All math is overflow-safe: sizes
+    /// are compared in `u64` against the caps before anything is reserved.
     fn ensure_capacity(&mut self, w_needed: u32, h_needed: u32) {
         let target_w = w_needed.min(MAX_IMAGE_SIDE);
         let target_h = h_needed.min(MAX_IMAGE_SIDE);
@@ -501,27 +520,30 @@ impl SixelDecoder {
         }
         let mut w = doubled_capacity(self.cap_w, target_w);
         let mut h = doubled_capacity(self.cap_h, target_h);
-        let logical_w = self.painted_w.max(target_w);
-        let logical_h = self.painted_h.max(target_h);
-        let (floor_w, floor_h) = if (logical_w as u64) * (logical_h as u64) * 4 <= MAX_IMAGE_BYTES {
-            (logical_w, logical_h)
-        } else {
-            (self.cap_w, self.cap_h)
-        };
-        loop {
-            if (w as u64) * (h as u64) * 4 <= MAX_IMAGE_BYTES {
-                break;
+        if (w as u64) * (h as u64) * 4 > MAX_IMAGE_BYTES {
+            let logical_w = self.painted_w.max(target_w);
+            let logical_h = self.painted_h.max(target_h);
+            if (logical_w as u64) * (logical_h as u64) * 4 <= MAX_IMAGE_BYTES {
+                (w, h) = balanced_capacity(self.cap_w, self.cap_h, logical_w, logical_h);
+            } else {
+                // Even the asked-for rectangle busts the cap: trim to the budget from the current
+                // capacity, floored at it — a pair that fits by invariant, so a round can only
+                // leave both untouched when both hit their floors, and then the area fits too.
+                loop {
+                    if (w as u64) * (h as u64) * 4 <= MAX_IMAGE_BYTES {
+                        break;
+                    }
+                    let budget =
+                        (MAX_IMAGE_BYTES / (w.max(1) as u64 * 4)).min(MAX_IMAGE_SIDE as u64);
+                    h = h.min(budget as u32).max(self.cap_h);
+                    if (w as u64) * (h as u64) * 4 <= MAX_IMAGE_BYTES {
+                        break;
+                    }
+                    let budget =
+                        (MAX_IMAGE_BYTES / (h.max(1) as u64 * 4)).min(MAX_IMAGE_SIDE as u64);
+                    w = w.min(budget as u32).max(self.cap_w);
+                }
             }
-            // Trim height to what the width allows first, then width to what that height allows,
-            // each floored at `floor_*` (a pair that fits by the branch above): a round can only
-            // leave both untouched when both hit their floors, and then the area fits too.
-            let budget = (MAX_IMAGE_BYTES / (w.max(1) as u64 * 4)).min(MAX_IMAGE_SIDE as u64);
-            h = h.min(budget as u32).max(floor_h);
-            if (w as u64) * (h as u64) * 4 <= MAX_IMAGE_BYTES {
-                break;
-            }
-            let budget = (MAX_IMAGE_BYTES / (h.max(1) as u64 * 4)).min(MAX_IMAGE_SIDE as u64);
-            w = w.min(budget as u32).max(floor_w);
         }
         self.resize_capacity(w, h);
     }
@@ -547,6 +569,7 @@ impl SixelDecoder {
         self.buf = buf;
         self.cap_w = w;
         self.cap_h = h;
+        self.reallocs += 1;
     }
 }
 
@@ -559,6 +582,34 @@ fn doubled_capacity(current: u32, needed: u32) -> u32 {
         c = (c * 2).min(MAX_IMAGE_SIDE);
     }
     c.max(current)
+}
+
+/// The capacity pair when doubling busts [`MAX_IMAGE_BYTES`] but the needed `fw`-by-`fh` rectangle
+/// still fits: aim for double the needed area, capped at the byte budget, and split that area
+/// between the sides in proportion to the need (so each side grows by the same factor, never past
+/// [`MAX_IMAGE_SIDE`]) instead of flooring one side exactly and giving the other all the slack.
+/// The pair covers the need, fits the budget, and multiplies the covered area by up to 2 per
+/// realloc even in the last few percent before the cap — reallocations stay logarithmic. Existing
+/// capacity slack is kept when keeping it still fits.
+fn balanced_capacity(cap_w: u32, cap_h: u32, fw: u32, fh: u32) -> (u32, u32) {
+    let budget_px = MAX_IMAGE_BYTES / 4; // pixels at RGBA8
+    let need_px = (fw as u64) * (fh as u64);
+    let target_px = (need_px * 2).min(budget_px);
+    // Aspect-preserving split: w keeps the needed ratio, h takes what is left of the area.
+    let mut w = ((target_px * fw as u64 / fh as u64).isqrt() as u32).clamp(fw, MAX_IMAGE_SIDE);
+    let h = (target_px / w as u64).clamp(fh as u64, MAX_IMAGE_SIDE as u64) as u32;
+    if (w as u64) * (h as u64) > target_px {
+        // An upward clamp (a side cap, or `h`'s floor) can push the product over the target area;
+        // take width back to what the height leaves room for — never below the needed width,
+        // which the fit precondition guarantees has room.
+        w = (target_px / h as u64).max(fw as u64) as u32;
+    }
+    let (kw, kh) = (cap_w.max(w), cap_h.max(h));
+    if (kw as u64) * (kh as u64) <= budget_px {
+        (kw, kh) // keeping what the image already had costs nothing — keep it.
+    } else {
+        (w, h)
+    }
 }
 
 /// `len` bytes of a repeating four-byte pixel pattern: zeroed pages when the pattern is all zero
