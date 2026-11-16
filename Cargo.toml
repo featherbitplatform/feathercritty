@@ -44,6 +44,8 @@ zstd = { version = "0.14.3", default-features = false }
 cursor-icon = { version = "1", default-features = false }
 memchr = "2"
 serde = { version = "1", features = ["derive", "rc"], optional = true }
+flate2 = "1.1.11"
+imagesize = "0.15.0"
 
 [target.'cfg(unix)'.dependencies]
 rustix-openpty = "0.2.0"
