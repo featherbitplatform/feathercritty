@@ -957,7 +957,7 @@ impl PlacementTable {
         for (_, list) in taken {
             for p in list {
                 self.placement_order.remove(&p.seq);
-                self.placement_total -= 1;
+                self.uncount_placements(1);
                 self.drop_ref(p.key);
                 touched.push(p.key);
             }
@@ -1224,7 +1224,7 @@ impl PlacementTable {
             self.placement_order.remove(&p.seq);
             self.drop_ref(p.key);
         }
-        self.placement_total -= dead.len();
+        self.uncount_placements(dead.len());
         let mut keys: Vec<ImageKey> = dead.iter().map(|p| p.key).collect();
         keys.sort_unstable();
         keys.dedup();
@@ -1286,7 +1286,7 @@ impl PlacementTable {
             }
         };
         if went {
-            self.placement_total -= 1;
+            self.uncount_placements(1);
             if let Some(list) = self.placements[idx].get(&p.line) {
                 if list.is_empty() {
                     self.placements[idx].remove(&p.line);
@@ -1298,18 +1298,19 @@ impl PlacementTable {
     }
 
     /// Move a placement's record to `(new_line, new_col)`, keeping its identity and eviction
-    /// stamp (the age index entry follows).
+    /// stamp (the age index entry follows). A record the maps do not hold at `p.line` is left
+    /// alone: a missing record is a desync, not a reason to insert another copy of it.
     fn move_placement(&mut self, p: Placement, new_line: i64, new_col: usize) {
         let screen = p.screen.index();
-        let mut seq = p.seq;
-        if let Some(list) = self.placements[screen].get_mut(&p.line) {
-            if let Some(pos) = list.iter().position(|other| same_placement(other, &p)) {
-                seq = list[pos].seq;
-                list.swap_remove(pos);
-            }
-            if list.is_empty() {
-                self.placements[screen].remove(&p.line);
-            }
+        // feathercritty: bail before touching anything when the record is not where `p` says
+        // it is. Inserting a copy there double-counted one placement against no eviction stamp
+        // and survived every removal aimed at the original. Not upstream.
+        let Some(list) = self.placements[screen].get_mut(&p.line) else { return };
+        let Some(pos) = list.iter().position(|other| same_placement(other, &p)) else { return };
+        let seq = list[pos].seq;
+        list.swap_remove(pos);
+        if list.is_empty() {
+            self.placements[screen].remove(&p.line);
         }
         self.placement_order.remove(&seq);
         let mut moved = p;
@@ -1390,6 +1391,24 @@ impl PlacementTable {
     /// pointed at it).
     fn add_ref(&mut self, key: ImageKey) {
         *self.refs.entry(key).or_insert(0) += 1;
+    }
+
+    /// Take `n` off the live-placement count for records the caller has just removed from the
+    /// maps. A desync must leak at worst, never panic in release: debug builds assert, release
+    /// saturates at zero (as [`drop_ref`](Self::drop_ref) does — a wrapped count would make
+    /// every later `place` take its eviction branch against an empty table).
+    fn uncount_placements(&mut self, n: usize) {
+        match self.placement_total.checked_sub(n) {
+            Some(total) => self.placement_total = total,
+            None => {
+                debug_assert!(
+                    false,
+                    "{n} placements leave but only {} are counted",
+                    self.placement_total
+                );
+                self.placement_total = 0;
+            },
+        }
     }
 
     /// Undo one counted reference the caller has just removed from its map. A desync must leak at
@@ -1520,7 +1539,7 @@ impl PlacementTable {
                         if list.is_empty() {
                             self.placements[screen_idx].remove(&line);
                         }
-                        self.placement_total -= 1;
+                        self.uncount_placements(1);
                         Some(p.key)
                     },
                     None => None,

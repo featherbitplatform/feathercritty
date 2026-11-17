@@ -2,6 +2,7 @@
 
 //! Exports the `Term` type which is a high-level API for the Grid.
 
+use std::collections::HashMap;
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
 use std::time::Instant;
@@ -1778,6 +1779,17 @@ impl<T> Term<T> {
                 );
             }
 
+            // feathercritty: those shifts moved the inactive screen's records to their new
+            // lines. `apply_reflow` looks each placement up where it sits now, so that
+            // screen's anchors are re-read after the shifts — the copies collected before
+            // the resize carry pre-shift lines, and pairing an outcome with one either
+            // skipped a live record or inserted a stale copy beside it (which outlived
+            // every removal and put `placement_total` out of step with the maps). Outcomes
+            // come out in input order, so each is paired by insertion stamp: the one
+            // identity a shift keeps. Not upstream.
+            let shifted_inactive: HashMap<u64, placements::Placement> =
+                self.placements.anchor_list(inactive).into_iter().map(|p| (p.seq, p)).collect();
+
             for (screen, anchors, outcomes) in [
                 (active, &active_anchors, &active_outcomes),
                 (inactive, &inactive_anchors, &inactive_outcomes),
@@ -1786,7 +1798,14 @@ impl<T> Term<T> {
                     .iter()
                     .copied()
                     .zip(outcomes.iter())
-                    .map(|(p, &(line, col, lost))| (p, line, col, lost))
+                    .map(|(p, &(line, col, lost))| {
+                        let p = if screen == inactive {
+                            shifted_inactive.get(&p.seq).copied().unwrap_or(p)
+                        } else {
+                            p
+                        };
+                        (p, line, col, lost)
+                    })
                     .collect();
                 self.placements.apply_reflow(&remapped, &mut events);
                 self.placements.after_resize(

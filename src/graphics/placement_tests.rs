@@ -1083,3 +1083,191 @@ fn placement_cap_eviction_is_indexed() {
     assert_eq!(term.visible_placements().len(), MAX_PLACEMENTS, "the cap holds exactly");
     assert!(recorder.released().is_empty(), "the shared image never loses its last reference");
 }
+
+#[test]
+fn alternate_screen_resize_does_not_duplicate_primary_placements() {
+    // An image on the shell screen, a full-screen program (`?1049h`) and two resizes: while the
+    // alternate screen is active the primary grid's placements are shifted to their post-scroll
+    // lines, and `apply_reflow` must move *those* records — collecting the anchor list before
+    // the shift handed it stale copies, which left a second record beside the shifted one (and,
+    // past the next removal, a `placement_total` out of step with the maps).
+    let (mut term, recorder) = term(20, 8);
+    term.set_cell_pixel_size(4, 8);
+    feed(&mut term, b"\x1b[7;2H\x1bPq#0~~~~-~~\x1b\\"); // a 4x12 px sixel at row 6, column 1
+    let key = recorder.received()[0].0;
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!((placements[0].row_in_view, placements[0].col), (6, 1));
+
+    feed(&mut term, b"\x1b[?1049h"); // a full-screen program takes over; the image stays put
+    term.resize(Size { columns: 9, lines: 6 });
+    term.resize(Size { columns: 8, lines: 5 });
+    feed(&mut term, b"\x1b[?1049l"); // back to the shell screen
+
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1, "one record for one placement, not a stale copy beside it");
+    assert_eq!(placements[0].key, key);
+
+    // Scrolling it off releases it exactly once...
+    feed(
+        &mut term,
+        b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\
+                       \r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+    );
+    assert!(term.visible_placements().is_empty(), "the image scrolled off the shell screen");
+    assert_eq!(recorder.released(), vec![key]);
+
+    // ...and a later image still displays: the desync used to jam every placement after it.
+    feed(&mut term, b"\x1b[1;1H\x1bPq#0~~~~-~~\x1b\\");
+    let events = recorder.take();
+    assert_eq!(received_of(&events).len(), 1, "the new sixel is received");
+    assert!(released_of(&events).is_empty(), "and nothing releases with it");
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1, "the new sixel is placed and visible");
+    assert_eq!((placements[0].row_in_view, placements[0].col), (0, 0));
+}
+
+/// A tiny deterministic generator: a linear congruential PRNG with Knuth's multiplier, seeded by
+/// the test. Fixed seeds so any failure reproduces exactly, and no dependency beyond the crate.
+struct Lcg(u64);
+
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 =
+            self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+        self.0 >> 32
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+#[test]
+fn image_lifecycle_balances_across_mixed_operations() {
+    // The release-once contract under a mixed stream — images of all three protocols, newlines,
+    // alternate-screen switches, resizes, `ED` and scroll regions, ending in a full reset. Every
+    // key handed to the host must come back as exactly one `ImageReleased`, nothing may stay
+    // placed after `RIS`, and placement must still work afterwards: a desynced placement count
+    // used to refuse every later image until then. Fixed seeds, so a failure reproduces.
+    for seed in 0..24u64 {
+        let mut rng = Lcg(seed.wrapping_mul(0x9E37_79B9_85EB_C6C7).wrapping_add(1));
+        let columns = 4 + rng.below(20) as usize;
+        let lines = 4 + rng.below(8) as usize;
+        let (mut term, recorder) = term(columns, lines);
+        term.set_cell_pixel_size(4, 8);
+
+        let mut received: Vec<ImageKey> = Vec::new();
+        let mut released: Vec<ImageKey> = Vec::new();
+        let mut unanswered: Vec<ImageKey> = Vec::new();
+        let mut alt = false;
+        for step in 0..150u64 {
+            // Answer the oldest encoded payload every so often, as a host would.
+            if step % 5 == 4 && !unanswered.is_empty() {
+                let key = unanswered.remove(0);
+                term.image_decoded(key, Ok(()));
+            }
+
+            let bytes: Vec<u8> = match rng.below(9) {
+                // A two-row sixel at a random cell.
+                0 => {
+                    let line = 1 + rng.below(term.screen_lines() as u64);
+                    let col = 1 + rng.below(term.columns() as u64);
+                    format!("\x1b[{line};{col}H\x1bPq#0~-~\x1b\\").into_bytes()
+                },
+                // A small kitty transmission placing at the cursor.
+                1 | 2 => {
+                    let id = 1 + rng.below(4) as u32;
+                    let (w, h) = (1 + rng.below(3) as u32, 1 + rng.below(3) as u32);
+                    transmit(id, "f=32", Some((w, h)), &rgba(w, h), "")
+                },
+                // An OSC 1337 inline PNG at the cursor.
+                3 => {
+                    let mut out = b"\x1b]1337;File=inline=1:".to_vec();
+                    out.extend_from_slice(STANDARD.encode(PNG_1X1).as_bytes());
+                    out.extend(b"\x1b\\");
+                    out
+                },
+                // Newlines.
+                4 => vec![b'\r'; 2 * (1 + rng.below(3) as usize)]
+                    .into_iter()
+                    .flat_map(|c| [c, b'\n'])
+                    .collect(),
+                // Alternate screen in, alternate screen out.
+                5 => {
+                    alt = !alt;
+                    if alt { b"\x1b[?1049h".to_vec() } else { b"\x1b[?1049l".to_vec() }
+                },
+                // A window resize.
+                6 => {
+                    term.resize(Size {
+                        columns: 3 + rng.below(30) as usize,
+                        lines: 2 + rng.below(12) as usize,
+                    });
+                    Vec::new()
+                },
+                // Erase in display.
+                7 => match rng.below(3) {
+                    0 => b"\x1b[2J".to_vec(),
+                    1 => b"\x1b[1J".to_vec(),
+                    _ => b"\x1b[0J\x1b[H".to_vec(),
+                },
+                // A scroll region, or back to the whole screen.
+                _ => {
+                    if rng.below(2) == 0 {
+                        b"\x1b[r".to_vec()
+                    } else {
+                        let lines = term.screen_lines();
+                        let start = (1 + rng.below(lines as u64)) as usize;
+                        let end = start + 1 + rng.below((lines - start).max(1) as u64) as usize;
+                        format!("\x1b[{start};{end}r").into_bytes()
+                    }
+                },
+            };
+            if !bytes.is_empty() {
+                feed(&mut term, &bytes);
+            }
+
+            for event in recorder.take() {
+                match event {
+                    Event::ImageReceived { key, data } => {
+                        received.push(key);
+                        if matches!(data, ImageData::Encoded { .. }) {
+                            unanswered.push(key);
+                        }
+                    },
+                    Event::ImageReleased(key) => released.push(key),
+                    _ => {},
+                }
+            }
+        }
+
+        // A full reset releases everything the table still held.
+        feed(&mut term, b"\x1bc");
+        for event in recorder.take() {
+            match event {
+                Event::ImageReceived { key, .. } => received.push(key),
+                Event::ImageReleased(key) => released.push(key),
+                _ => {},
+            }
+        }
+
+        let mut expected = received.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        released.sort_unstable();
+        assert_eq!(released, expected, "seed {seed}: every received key releases exactly once");
+        assert!(term.visible_placements().is_empty(), "seed {seed}: nothing is placed after RIS");
+
+        // The table still works: a new image places and stays visible.
+        feed(&mut term, SIXEL);
+        let events = recorder.take();
+        assert_eq!(
+            received_of(&events).len(),
+            1,
+            "seed {seed}: a sixel still places after the reset"
+        );
+        assert!(released_of(&events).is_empty(), "seed {seed}: nothing releases with it");
+        assert_eq!(term.visible_placements().len(), 1, "seed {seed}: the new image is visible");
+    }
+}
