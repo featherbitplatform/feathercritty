@@ -44,7 +44,7 @@
 //! `reflow_window_one_matches_default` to reach it.
 
 use std::cmp::{Ordering, max, min};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::mem;
 
 use crate::index::{Boundary, Column, Line};
@@ -149,6 +149,7 @@ impl<T: HistoryCell> RowSource<'_, T> {
         &mut self,
         sink: &mut ReflowSink<T>,
         pass: Pass,
+        copied: &mut dyn FnMut(usize, usize, bool),
     ) -> Option<(usize, Row<T>)> {
         while sink.byte_copy {
             let Some(info) = self.history.oldest_reflow_info() else {
@@ -159,7 +160,14 @@ impl<T: HistoryCell> RowSource<'_, T> {
                 break;
             };
 
+            // feathercritty: report each copied row to `copied(i, stream, dropped)` — the
+            // caller's anchor hook (see `AnchorTracker::byte_copied`); `i` is upstream's index
+            // for it (rows remaining after this one, counted from the bottom line), matching
+            // what the decoded path below returns; `dropped` is true when the push evicted the
+            // row at the history limit.
+            let evicted_before = sink.evicted;
             sink.push_moved(self.history, width);
+            copied(self.len(), sink.stream_len() - 1, sink.evicted > evicted_before);
             if self.history.is_empty() {
                 self.history.clear();
             }
@@ -245,8 +253,9 @@ pub(crate) struct ReflowSink<T: HistoryCell> {
     window: usize,
     grow_to: Option<usize>,
 
-    /// Whether the history evicted a row (checked against `truncate_newest`, see above).
-    evicted: bool,
+    /// How many rows the history evicted at its limit (checked against `truncate_newest`, see
+    /// above; also counted by `stream_len` so anchor positions stay in produced-row coordinates).
+    evicted: usize,
 
     /// Whether `RowSource::next_reflow` may copy records instead of decoding them (always,
     /// unless a test turns it off to compare, `Grid::set_reflow_byte_copy`).
@@ -266,7 +275,7 @@ impl<T: HistoryCell> ReflowSink<T> {
             history,
             window,
             grow_to,
-            evicted: false,
+            evicted: 0,
             byte_copy: true,
             spare_row: None,
         }
@@ -309,7 +318,9 @@ impl<T: HistoryCell> ReflowSink<T> {
         while let Some(row) = self.dense.pop_front() {
             self.store(row);
         }
-        self.evicted |= self.history.len() >= self.history.limit();
+        if self.history.len() >= self.history.limit() {
+            self.evicted += 1;
+        }
         source.move_oldest_to(&mut self.history, width);
         self.history.take_spares(source);
     }
@@ -337,9 +348,15 @@ impl<T: HistoryCell> ReflowSink<T> {
         self.dense.len() + self.history.len()
     }
 
+    /// Rows produced including those already evicted at the limit — stream coordinates for
+    /// feathercritty's anchor tracking (see `AnchorTracker`).
+    pub(crate) fn stream_len(&self) -> usize {
+        self.len() + self.evicted
+    }
+
     /// Keep the oldest `len` rows, dropping the newest ones (upstream `Vec::truncate`).
     pub(crate) fn truncate_newest(&mut self, len: usize) {
-        debug_assert!(!self.evicted || self.len() <= len, "truncating after an eviction");
+        debug_assert!(self.evicted == 0 || self.len() <= len, "truncating after an eviction");
         while self.len() > len {
             if self.dense.pop_back().is_none() {
                 self.history.remove_newest();
@@ -386,7 +403,9 @@ impl<T: HistoryCell> ReflowSink<T> {
 
     /// Encode `row` as the newest history row.
     fn store(&mut self, row: Row<T>) {
-        self.evicted |= self.history.len() >= self.history.limit();
+        if self.history.len() >= self.history.limit() {
+            self.evicted += 1;
+        }
         let row = self.grown(row);
         self.history.push_newest(&row);
         self.spare_row = Some(row);
@@ -441,18 +460,34 @@ impl<T: HistoryCell> Grid<T> {
     }
 
     /// Store a reflow's rows as the new screen and history (feathercritty: upstream
-    /// `self.raw.replace_inner`).
-    fn replace_rows(&mut self, rows: ReflowSink<T>) {
+    /// `self.raw.replace_inner`), then resolve the anchor tracker's outcomes against the result
+    /// and hand it back (see `resize_tracked`; `None` when there was nothing to track).
+    fn replace_rows(
+        &mut self,
+        rows: ReflowSink<T>,
+        pending: Option<AnchorTracker>,
+    ) -> Option<AnchorTracker> {
+        let produced = rows.stream_len();
         let (screen, history) = rows.finish(self.lines, self.history.limit());
         let compression = self.history.compression();
+        let kept = history.len() + self.lines;
         self.screen.raw = screen;
         self.history = history;
         self.history.set_compression(compression);
         self.history_epoch += 1;
         debug_assert_eq!(self.screen.raw.len(), self.lines);
+        let dropped_oldest = produced.saturating_sub(kept);
+        if let Some(mut pending) = pending {
+            pending.resolve(self.scrolled_lines, self.lines, produced, dropped_oldest);
+            Some(pending)
+        } else {
+            None
+        }
     }
 }
 
+// feathercritty: upstream's bound was `T: GridCell + Default + PartialEq`, which `HistoryCell`
+// includes.
 // feathercritty: upstream's bound was `T: GridCell + Default + PartialEq`, which `HistoryCell`
 // includes.
 impl<T: HistoryCell> Grid<T> {
@@ -462,19 +497,96 @@ impl<T: HistoryCell> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        self.resize_impl::<D>(reflow, lines, columns, None);
+    }
+
+    /// Resize, reporting where anchor cells went (feathercritty; not upstream).
+    ///
+    /// `anchors` are `(stable line, column)` cells on this grid before the resize — hosts pin
+    /// image placements to text with these. A row-only resize keeps every stable line, so those
+    /// outcomes echo the inputs. A column resize maps each anchor through the reflow exactly as
+    /// the loop moves content: the outcome is `(new stable line, new column, false)` when the
+    /// cell followed its row's content, or `(line, column, true)` when it cannot follow — its
+    /// cells were cut at the new width (no reflow), its line was merged away, or its content was
+    /// destroyed by the height shrink — with the line nearest where it used to sit, so the caller
+    /// can mark its place instead of losing it silently. Outcomes come out in input order and
+    /// are appended to `out` (which must start empty for them).
+    pub fn resize_tracked<D>(
+        &mut self,
+        reflow: bool,
+        lines: usize,
+        columns: usize,
+        anchors: &[(i64, usize)],
+        out: &mut Vec<(i64, usize, bool)>,
+    ) where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
+        debug_assert_eq!(out.len(), 0);
+        // The tracking state borrows `anchors`/`out` only for the duration of this call; the
+        // `'static` cast keeps its type simple (neither buffer escapes through the grid).
+        let track = (!anchors.is_empty()).then(|| ReflowTracking {
+            anchors: anchors.to_vec(),
+            // SAFETY: `track`, and everything that reads `out` through it, is dropped before
+            // this returns.
+            out: unsafe { &mut *(&mut *out as *mut Vec<(i64, usize, bool)>) },
+            pending: None,
+        });
+        self.resize_impl::<D>(reflow, lines, columns, track);
+        debug_assert_eq!(out.len(), anchors.len());
+    }
+
+    fn resize_impl<D>(
+        &mut self,
+        reflow: bool,
+        lines: usize,
+        columns: usize,
+        mut track: Option<ReflowTracking>,
+    ) where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
         // Use empty template cell for resetting cells due to resize.
         let template = mem::take(&mut self.cursor.template);
 
         match self.lines.cmp(&lines) {
             Ordering::Less => self.grow_lines(lines),
-            Ordering::Greater => self.shrink_lines(lines),
+            Ordering::Greater => self.shrink_lines::<D>(lines, &mut track),
             Ordering::Equal => (),
         }
 
         match self.columns.cmp(&columns) {
-            Ordering::Less => self.grow_columns(reflow, columns),
-            Ordering::Greater => self.shrink_columns(reflow, columns),
-            Ordering::Equal => (),
+            // feathercritty: only a column pass moves content between rows; a row-only resize
+            // keeps stable lines, so its anchors are answered with their inputs.
+            Ordering::Less => {
+                let mut tracker = track.as_mut().map(|track| {
+                    track.lend(self.scrolled_lines, self.lines, columns, |_| ());
+                    track.pending.take().expect("just lent")
+                });
+                self.grow_columns(reflow, columns, &mut tracker);
+                if let Some(track) = track.as_mut() {
+                    if let Some(tracker) = tracker.take() {
+                        track.absorb(tracker);
+                    }
+                }
+            },
+            Ordering::Greater => {
+                let mut tracker = track.as_mut().map(|track| {
+                    track.lend(self.scrolled_lines, self.lines, columns, |_| ());
+                    track.pending.take().expect("just lent")
+                });
+                self.shrink_columns(reflow, columns, &mut tracker);
+                if let Some(track) = track.as_mut() {
+                    if let Some(tracker) = tracker.take() {
+                        track.absorb(tracker);
+                    }
+                }
+            },
+            Ordering::Equal => {
+                if let Some(track) = &mut track {
+                    track.fill_identity();
+                }
+            },
         }
 
         // Restore template cell.
@@ -517,6 +629,10 @@ impl<T: HistoryCell> Grid<T> {
         // Move existing lines up for every line that couldn't be pulled from history.
         if from_history != lines_added {
             let delta = lines_added - from_history;
+            // feathercritty: no anchor observer here. This rotation only runs with an empty
+            // scrolled-back view (the history was shorter than the growth), where every buffer
+            // index a surviving row holds is unchanged by it — `resize_tracked`'s index map
+            // stays correct without a report.
             self.scroll_up(&(Line(0)..Line(target as i32)), delta);
         }
 
@@ -551,7 +667,7 @@ impl<T: HistoryCell> Grid<T> {
     /// of the terminal window.
     ///
     /// Alacritty takes the same approach.
-    fn shrink_lines<D>(&mut self, target: usize)
+    fn shrink_lines<D>(&mut self, target: usize, track: &mut Option<ReflowTracking>)
     where
         T: ResetDiscriminant<D>,
         D: PartialEq,
@@ -559,7 +675,25 @@ impl<T: HistoryCell> Grid<T> {
         // Scroll up to keep content inside the window.
         let required_scrolling = (self.cursor.point.line.0 as usize + 1).saturating_sub(target);
         if required_scrolling > 0 {
-            self.scroll_up(&(Line(0)..Line(self.lines as i32)), required_scrolling);
+            // feathercritty: this scroll destroys the viewport's top rows and rotates survivors
+            // into history; `resize_tracked`'s tracker remaps its anchors to match, as every
+            // other caller of `scroll_up` keeps placements in step.
+            match track {
+                Some(track) => {
+                    let scrolled = self.scrolled_lines;
+                    let lines = self.lines;
+                    track.lend(scrolled, lines, self.columns, |t| {
+                        self.scroll_up_observed(
+                            &(Line(0)..Line(self.lines as i32)),
+                            required_scrolling,
+                            &mut |positions: usize, evicted: usize, history_before: usize| {
+                                t.scroll_up(positions, evicted, history_before);
+                            },
+                        );
+                    });
+                },
+                None => self.scroll_up(&(Line(0)..Line(self.lines as i32)), required_scrolling),
+            }
 
             // Clamp cursors to the new viewport size.
             self.cursor.point.line = min(self.cursor.point.line, Line(target as i32 - 1));
@@ -576,7 +710,11 @@ impl<T: HistoryCell> Grid<T> {
     }
 
     /// Grow number of columns in each row, reflowing if necessary.
-    fn grow_columns(&mut self, reflow: bool, columns: usize) {
+    ///
+    /// `track` carries the anchor tracker built by `resize_impl` (feathercritty; see
+    /// `resize_tracked`); its state threads through the loop and it is resolved in
+    /// `replace_rows`.
+    fn grow_columns(&mut self, reflow: bool, columns: usize, track: &mut Option<AnchorTracker>) {
         // Check if a row needs to be wrapped.
         let should_reflow = |row: &Row<T>| -> bool {
             let len = Column(row.len());
@@ -601,13 +739,31 @@ impl<T: HistoryCell> Grid<T> {
         let mut history = self.take_history();
         let mut rows = RowSource::new(&mut history, self.screen.raw.take_all());
 
-        while let Some((i, mut row)) =
-            rows.next_reflow(&mut reversed, Pass::Grow { columns, reflow })
-        {
+        while let Some((i, mut row)) = rows.next_reflow(
+            &mut reversed,
+            Pass::Grow { columns, reflow },
+            // feathercritty: byte-copied rows are reported through the tracker (see
+            // `RowSource::next_reflow`).
+            &mut |i, stream, dropped| {
+                if let Some(track) = track.as_mut() {
+                    track.byte_copied(i, stream, dropped, Pass::Grow { columns, reflow });
+                }
+            },
+        ) {
+            // feathercritty: the stream position of the row `last_row` sits at (the sink's
+            // newest row), captured before any borrow it is read under.
+            let last_stream = reversed.stream_len().wrapping_sub(1);
+
             // Check if reflowing should be performed.
             let last_row = match reversed.last_mut() {
                 Some(last_row) if should_reflow(last_row) => last_row,
                 _ => {
+                    // feathercritty: pushed whole at its own stream position: anchors keep
+                    // their columns.
+                    if let Some(track) = track.as_mut() {
+                        let stream = reversed.stream_len();
+                        track.piece_pushed(i, stream, usize::MAX, row.len(), false);
+                    }
                     reversed.push(row);
                     continue;
                 },
@@ -631,8 +787,12 @@ impl<T: HistoryCell> Grid<T> {
             let mut num_wrapped = columns - last_len;
             let len = min(row.len(), num_wrapped);
 
+            // feathercritty: the tail cell this merge pulls, if a wide char, keeps its visual
+            // column (it moves to the target row's end unchanged); see `AnchorTracker::merge`.
+            let wide_tail = row[Column(len - 1)].flags().contains(Flags::WIDE_CHAR);
+
             // Insert leading spacer when there's not enough room for reflowing wide char.
-            let mut cells = if row[Column(len - 1)].flags().contains(Flags::WIDE_CHAR) {
+            let mut cells = if wide_tail {
                 num_wrapped -= 1;
 
                 let mut cells = row.front_split_off(len - 1);
@@ -648,6 +808,14 @@ impl<T: HistoryCell> Grid<T> {
 
             // Add removed cells to previous row and reflow content.
             last_row.append(&mut cells);
+
+            // feathercritty: `pulled` real cells moved from this row's front to the target
+            // piece's end, landing at columns shifted by `last_len`; a wide tail cell stays on
+            // this row (its spacer went to the target) and reappears at the rest's column 0.
+            let pulled = len - usize::from(wide_tail);
+            if let Some(track) = track.as_mut() {
+                track.merge(i, last_stream, pulled, last_len);
+            }
 
             let cursor_buffer_line = self.lines - self.cursor.point.line.0 as usize - 1;
 
@@ -667,6 +835,10 @@ impl<T: HistoryCell> Grid<T> {
                 let line_delta = self.cursor.point.line - target.line;
 
                 if line_delta != 0 && row.is_clear() {
+                    // feathercritty: the rest of this row (blanks) is dropped.
+                    if let Some(track) = track.as_mut() {
+                        track.row_dropped(i, last_stream, last_len, last_len + pulled);
+                    }
                     continue;
                 }
 
@@ -682,6 +854,11 @@ impl<T: HistoryCell> Grid<T> {
                     self.cursor.point.line += 1;
                 }
 
+                // feathercritty: the rest of this row (blanks) is dropped.
+                if let Some(track) = track.as_mut() {
+                    track.row_dropped(i, last_stream, last_len, last_len + pulled);
+                }
+
                 // Don't push line into the new buffer.
                 continue;
             }
@@ -691,6 +868,11 @@ impl<T: HistoryCell> Grid<T> {
                 cell.flags_mut().insert(Flags::WRAPLINE);
             }
 
+            // feathercritty: the rest of this row becomes its own row after the merged part.
+            let stream = reversed.stream_len();
+            if let Some(track) = track.as_mut() {
+                track.piece_pushed(i, stream, usize::MAX, row.len(), false);
+            }
             reversed.push(row);
         }
 
@@ -699,6 +881,7 @@ impl<T: HistoryCell> Grid<T> {
             let delta = (self.lines - reversed.len()) as i32;
             self.cursor.point.line = max(self.cursor.point.line - delta, Line(0));
             // feathercritty: upstream `reversed.resize_with(self.lines, || Row::new(columns))`.
+            // Blank filler rows carry no anchors.
             reversed.resize_with_blank(self.lines, columns, &T::default());
         }
 
@@ -708,8 +891,13 @@ impl<T: HistoryCell> Grid<T> {
             let cursor_buffer_line = self.lines - self.cursor.point.line.0 as usize - 1;
             let available = min(cursor_buffer_line, reversed.len() - self.lines);
             let overflow = cursor_line_delta.saturating_sub(available);
-            // feathercritty: upstream `reversed.truncate`.
-            reversed.truncate_newest(reversed.len() + overflow - cursor_line_delta);
+            // feathercritty: upstream `reversed.truncate`. Rows dropped here resolve their
+            // anchors nearest the last surviving row.
+            let kept = reversed.len() + overflow - cursor_line_delta;
+            if let Some(track) = track.as_mut() {
+                track.truncated(kept, reversed.stream_len().saturating_sub(kept));
+            }
+            reversed.truncate_newest(kept);
             self.cursor.point.line = max(self.cursor.point.line - overflow, Line(0));
         }
 
@@ -720,14 +908,16 @@ impl<T: HistoryCell> Grid<T> {
         // as it leaves the window and in `finish`, which also reverses the rows into the screen
         // and the history (no trim here: `grow_columns` never has more rows than it started
         // with).
-        self.replace_rows(reversed);
+        *track = self.replace_rows(reversed, track.take());
 
         // Clamp display offset in case lines above it got merged.
         self.display_offset = min(self.display_offset, self.history_size());
     }
 
     /// Shrink number of columns in each row, reflowing if necessary.
-    fn shrink_columns(&mut self, reflow: bool, columns: usize) {
+    ///
+    /// `track` is the anchor tracker (see `grow_columns`).
+    fn shrink_columns(&mut self, reflow: bool, columns: usize, track: &mut Option<AnchorTracker>) {
         self.columns = columns;
 
         // Remove the linewrap special case, by moving the cursor outside of the grid.
@@ -739,17 +929,29 @@ impl<T: HistoryCell> Grid<T> {
         // feathercritty: upstream `Vec::with_capacity(self.raw.len())`; see `ReflowSink`.
         let mut new_raw = self.reflow_sink(None);
         let mut buffered: Option<Vec<T>> = None;
+        // feathercritty: anchors of the cells in `buffered`, carried to the row they prepend to.
+        let mut carry: Vec<usize> = Vec::new();
 
         // feathercritty: upstream `self.raw.take_all()`, then `for (i, mut row) in
         // rows.drain(..).enumerate().rev()`; see `RowSource::next_reflow`, which also passes
         // rows this loop would push unchanged straight to `new_raw` as bytes.
         let mut history = self.take_history();
         let mut rows = RowSource::new(&mut history, self.screen.raw.take_all());
-        while let Some((i, mut row)) = rows.next_reflow(&mut new_raw, Pass::Shrink {
-            columns,
-            reflow,
-            carried: buffered.is_some(),
-        }) {
+        while let Some((i, mut row)) = rows.next_reflow(
+            &mut new_raw,
+            Pass::Shrink { columns, reflow, carried: buffered.is_some() },
+            // feathercritty: byte-copied rows are reported through the tracker (see
+            // `RowSource::next_reflow`).
+            &mut |i, stream, dropped| {
+                if let Some(track) = track.as_mut() {
+                    track.byte_copied(i, stream, dropped, Pass::Shrink {
+                        columns,
+                        reflow,
+                        carried: false,
+                    });
+                }
+            },
+        ) {
             // Append lines left over from the previous row.
             if let Some(buffered) = buffered.take() {
                 // Add a column for every cell added before the cursor, if it goes beyond the new
@@ -759,12 +961,36 @@ impl<T: HistoryCell> Grid<T> {
                     self.cursor.point.column += buffered.len();
                 }
 
+                // feathercritty: prepending shifts this row's cells right by the carried
+                // cells' count and adopts their anchors (the carried indices re-key to this
+                // row). The shift applies whether or not any anchor rode along.
+                let n = buffered.len();
+                if let Some(track) = track.as_mut() {
+                    track.prepend(i, n, &carry);
+                }
+                carry.clear();
                 row.append_front(buffered);
             }
 
+            // feathercritty: the stream position new rows land at, captured outside the loop's
+            // borrows of `new_raw`.
+            let mut stream = new_raw.stream_len();
+
             loop {
+                // feathercritty: this row's content end for the anchor hooks' "no cell there"
+                // guard (see `AnchorTracker::piece_committed`): rows are padded to full width,
+                // so its trailing empty cells do not count — they are what `Row::shrink` drops.
+                let mut content_end = row.len();
+                while content_end > 0 && row[Column(content_end - 1)].is_empty() {
+                    content_end -= 1;
+                }
+
                 // Remove all cells which require reflowing.
-                let mut wrapped = match row.shrink(columns) {
+                // feathercritty: `shrunk`/`truncated` are read for the anchor hooks below;
+                // computing them here does not change what the loop does.
+                let shrunk = row.shrink(columns);
+                let truncated = shrunk.is_some();
+                let mut wrapped = match shrunk {
                     Some(wrapped) if reflow => wrapped,
                     _ => {
                         let cursor_buffer_line = self.lines - self.cursor.point.line.0 as usize - 1;
@@ -774,6 +1000,13 @@ impl<T: HistoryCell> Grid<T> {
                             Vec::new()
                         } else {
                             // Since it fits, just push the existing line without any reflow.
+                            // feathercritty: with reflow off a wider row's tail was already cut
+                            // and discarded (`truncated`), so its anchors cannot follow; with
+                            // reflow on nothing was cut and everything stays.
+                            if let Some(track) = track.as_mut() {
+                                let moved_from = if truncated { columns } else { usize::MAX };
+                                track.piece_pushed(i, stream, moved_from, content_end, false);
+                            }
                             new_raw.push(row);
                             break;
                         }
@@ -781,9 +1014,10 @@ impl<T: HistoryCell> Grid<T> {
                 };
 
                 // Insert spacer if a wide char would be wrapped into the last column.
-                if row.len() >= columns
-                    && row[Column(columns - 1)].flags().contains(Flags::WIDE_CHAR)
-                {
+                // feathercritty: read before the mutable borrow (see `AnchorTracker` hooks).
+                let wide_at_edge = row.len() >= columns
+                    && row[Column(columns - 1)].flags().contains(Flags::WIDE_CHAR);
+                if wide_at_edge {
                     let mut spacer = T::default();
                     spacer.flags_mut().insert(Flags::LEADING_WIDE_CHAR_SPACER);
 
@@ -796,6 +1030,11 @@ impl<T: HistoryCell> Grid<T> {
                 if len > 0 && wrapped[len - 1].flags().contains(Flags::LEADING_WIDE_CHAR_SPACER) {
                     if len == 1 {
                         row[Column(columns - 1)].flags_mut().insert(Flags::WRAPLINE);
+                        // feathercritty: the only wrapped cell is the drained spacer at this
+                        // row's old end — anchors up to `columns` stay, the spacer's cannot.
+                        if let Some(track) = track.as_mut() {
+                            track.piece_pushed(i, stream, columns, content_end, false);
+                        }
                         new_raw.push(row);
                         break;
                     } else {
@@ -805,7 +1044,13 @@ impl<T: HistoryCell> Grid<T> {
                     }
                 }
 
+                // feathercritty: the boundary between cells that stay on this row and cells
+                // that follow `wrapped`: with a spacer inserted, the wide char at the edge is
+                // in `wrapped` (an anchor on it follows the character to the run's column 0).
+                let moved_from = columns - usize::from(wide_at_edge);
+
                 new_raw.push(row);
+                stream = new_raw.stream_len();
 
                 // Set line as wrapped if cells got removed.
                 if let Some(cell) = new_raw.last_mut().and_then(|r| r.last_mut()) {
@@ -821,6 +1066,12 @@ impl<T: HistoryCell> Grid<T> {
                     // Make sure previous wrap flag doesn't linger around.
                     if let Some(cell) = wrapped.last_mut() {
                         cell.flags_mut().remove(Flags::WRAPLINE);
+                    }
+
+                    // feathercritty: the pushed row is final; its cut cells wait in `buffered`
+                    // with their anchors, which prepend to the next row.
+                    if let Some(track) = track.as_mut() {
+                        carry = track.piece_pushed(i, stream - 1, moved_from, content_end, true);
                     }
 
                     // Add removed cells to start of next row.
@@ -842,6 +1093,14 @@ impl<T: HistoryCell> Grid<T> {
                         self.cursor.point.column -= columns;
                     }
 
+                    // feathercritty: cells up to `moved_from` are final on the pushed row; the
+                    // rest continues as a new row with their anchors (they stay pending on the
+                    // row, at columns relative to the run that follows — the loop iterates
+                    // again for them).
+                    if let Some(track) = track.as_mut() {
+                        track.piece_committed(i, stream - 1, moved_from, content_end, true);
+                    }
+
                     // Make sure new row is at least as long as new width.
                     let occ = wrapped.len();
                     if occ < columns {
@@ -857,12 +1116,20 @@ impl<T: HistoryCell> Grid<T> {
             }
         }
 
+        // feathercritty: cells still buffered after the last row have no older row to prepend
+        // into; their anchors cannot follow and resolve nearest their last piece.
+        if !carry.is_empty() {
+            if let Some(track) = track.as_mut() {
+                track.stash_final(&carry);
+            }
+        }
+
         // Reverse iterator and use it as the new grid storage.
         //
         // feathercritty: upstream collected `new_raw` reversed into `reversed`, called
         // `reversed.truncate(self.max_scroll_limit + self.lines)` and
         // `self.raw.replace_inner(reversed)`; `ReflowSink::finish` does all three.
-        self.replace_rows(new_raw);
+        *track = self.replace_rows(new_raw, track.take());
 
         // Clamp display offset in case some lines went off.
         self.display_offset = min(self.display_offset, self.history_size());
@@ -885,4 +1152,437 @@ impl<T: HistoryCell> Grid<T> {
         // Clamp the saved cursor to the grid.
         self.saved_cursor.point.column = min(self.saved_cursor.point.column, Column(columns - 1));
     }
+}
+// --- anchor tracking (feathercritty; not upstream) -------------------------------------------
+
+/// The anchor list and outcome buffer of one [`Grid::resize_tracked`] call.
+struct ReflowTracking {
+    anchors: Vec<(i64, usize)>,
+    out: &'static mut Vec<(i64, usize, bool)>,
+    /// Built on first use while the resize runs; `shrink_lines` lends it to its scroll report
+    /// and a column pass takes it out and resolves it in `replace_rows`.
+    pending: Option<AnchorTracker>,
+}
+
+impl ReflowTracking {
+    /// Run `f` with the tracker, building it from the grid's current state on first use
+    /// (`scrolled`/`lines` are the grid's values now; a row at buffer index `i`, 0 oldest, sits
+    /// at stable `scrolled + lines - 1 - i`).
+    fn lend(
+        &mut self,
+        scrolled: i64,
+        lines: usize,
+        columns: usize,
+        f: impl FnOnce(&mut AnchorTracker),
+    ) {
+        if self.pending.is_none() {
+            let mut slots: Vec<Option<Slot>> = (0..self.anchors.len()).map(|_| None).collect();
+            let mut rows: HashMap<usize, Vec<usize>> = HashMap::new();
+            for (index, &(stable, col)) in self.anchors.iter().enumerate() {
+                let i = (scrolled + lines as i64 - 1 - stable).max(0) as usize;
+                slots[index] = Some(Slot::Pending { i, col });
+                rows.entry(i).or_default().push(index);
+            }
+            self.pending = Some(AnchorTracker {
+                scrolled,
+                lines,
+                columns,
+                slots,
+                rows,
+                last_piece: HashMap::new(),
+            });
+        }
+        // A later piece of the same resize (the column pass after a row pass): rebase the
+        // buffer-index coordinates onto the grid's current values; pending anchors move to
+        // their rows' new indices.
+        if let Some(tracker) = self.pending.as_mut() {
+            if tracker.scrolled != scrolled || tracker.lines != lines {
+                let delta =
+                    (scrolled + lines as i64 - 1) - (tracker.scrolled + tracker.lines as i64 - 1);
+                let keys: Vec<usize> = tracker.rows.keys().copied().collect();
+                for old_i in keys {
+                    let indices = tracker.rows.remove(&old_i).expect("key just listed");
+                    for &index in &indices {
+                        if let Some(Slot::Pending { i, col }) = tracker.slots[index] {
+                            let i = (i as i64 + delta).max(0) as usize;
+                            tracker.slots[index] = Some(Slot::Pending { i, col });
+                        }
+                    }
+                    tracker.rows.insert((old_i as i64 + delta).max(0) as usize, indices);
+                }
+                tracker.scrolled = scrolled;
+                tracker.lines = lines;
+            }
+            tracker.columns = columns;
+            f(tracker);
+        }
+    }
+
+    /// Answer every anchor with its input (a resize that did not reflow: stable lines survive
+    /// it; scrolls and destruction were already resolved through the tracker), in input order.
+    fn fill_identity(&mut self) {
+        match self.pending.take() {
+            Some(tracker) => self.absorb(tracker),
+            None => self.out.extend(self.anchors.iter().map(|&(stable, col)| (stable, col, false))),
+        }
+    }
+
+    /// Append a resolved tracker's outcomes to `out` in input order.
+    fn absorb(&mut self, tracker: AnchorTracker) {
+        let out = &mut *self.out;
+        tracker.collect_into(&self.anchors, out);
+    }
+}
+
+/// Where an anchor cell's content went, fed hook by hook from the reflow loop's own decisions
+/// (see [`Grid::resize_tracked`]). The tracker cannot desync from the grid: every decision that
+/// moves a cell has a hook, and anchors for rows the loop never touches keep their stable line.
+pub(crate) struct AnchorTracker {
+    /// Buffer-index coordinates at construction: a row at buffer index `i` (0 oldest) sat at
+    /// stable `scrolled + lines_before - 1 - i`; stream-keyed slots resolve through it once the
+    /// pass ends (`scroll_up` keeps that mapping current when a row pass moved content).
+    scrolled: i64,
+    /// The grid's height when the tracker was built (row passes run before any hook needs
+    /// this field, so it stays current).
+    lines: usize,
+    columns: usize,
+    /// One slot per anchor, in input order.
+    slots: Vec<Option<Slot>>,
+    /// Anchor indices per buffer index; `scroll_up` moves whole rows by re-keying this map.
+    rows: HashMap<usize, Vec<usize>>,
+    /// Each row's last surviving piece `(stream position, length)`: anchors that cannot follow
+    /// resolve nearest it.
+    last_piece: HashMap<usize, (usize, usize)>,
+}
+
+/// One anchor's state mid-resize. A `line` marked `stream_keyed` holds a produced-row stream
+/// position that [`AnchorTracker::resolve`] maps onto a stable line once the pass ends; an
+/// unmarked one is already final.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// Cells still in play: buffer index of the row holding them, column within their piece.
+    Pending { i: usize, col: usize },
+    /// Followed its content (line stream-keyed until `resolve`).
+    Placed { line: i64, col: usize },
+    /// Cannot follow; `line`/`col` are the nearest surviving cell — its own cell when the row's
+    /// content was destroyed outright (then never stream-keyed).
+    Lost { line: i64, col: usize, stream_keyed: bool },
+}
+
+impl AnchorTracker {
+    /// [`Grid::scroll_up_observed`]'s report (see there for the arguments); only whole-viewport
+    /// rotations arrive. The rotation moves every surviving row up by `positions` lines — its
+    /// buffer index (upstream's reflow numbering, distance from the bottom line) grows by that
+    /// much whatever end of the buffer it sits at — and evicts the `evicted` oldest rows: those
+    /// whose index reached `lines + history_before - evicted`. Their anchors cannot follow and
+    /// report their own cell (the caller makes a placeholder or a removal from it). `self`'s
+    /// coordinates are the grid's before the rotation (see `ReflowTracking::lend`).
+    fn scroll_up(&mut self, positions: usize, evicted: usize, history_before: usize) {
+        if self.rows.is_empty() {
+            return;
+        }
+
+        if evicted > 0 {
+            let doomed_base = self.lines + history_before.saturating_sub(evicted);
+            let doomed: Vec<(usize, Vec<usize>)> = self
+                .rows
+                .iter()
+                .filter(|&(&i, _)| i >= doomed_base)
+                .map(|(&i, indices)| (i, indices.clone()))
+                .collect();
+            for (i, indices) in doomed {
+                let stable = self.scrolled + self.lines as i64 - 1 - i as i64;
+                for &index in &indices {
+                    if let Some(Slot::Pending { col, .. }) = self.slots[index] {
+                        self.slots[index] =
+                            Some(Slot::Lost { line: stable, col, stream_keyed: false });
+                    }
+                }
+                self.rows.remove(&i);
+            }
+        }
+
+        let keys: Vec<usize> = self.rows.keys().copied().collect();
+        for old_i in keys {
+            let indices = self.rows.remove(&old_i).expect("key just listed");
+            for &index in &indices {
+                if let Some(Slot::Pending { i, col }) = self.slots[index] {
+                    self.slots[index] = Some(Slot::Pending { i: i + positions, col });
+                }
+            }
+            self.rows.insert(old_i + positions, indices);
+        }
+    }
+
+    /// A history row moved to stream position `stream` as bytes, unchanged except its recorded
+    /// width (see `RowSource::next_reflow`): nothing merged into it and nothing will (a copied
+    /// row never wraps into the next one), so its anchors keep their columns at that row. Two
+    /// exceptions: a copy evicted at the history limit (`dropped_row`) loses its content
+    /// outright, and shrinking keeps only the columns below the new width — those anchors clamp
+    /// to the last visible column of their (still present) line.
+    fn byte_copied(&mut self, i: usize, stream: usize, dropped_row: bool, pass: Pass) {
+        let Some(indices) = self.rows.remove(&i) else {
+            return;
+        };
+        for index in indices {
+            match self.slots[index] {
+                Some(Slot::Pending { col, .. }) => {
+                    if dropped_row {
+                        // The copy itself was evicted: its line leaves the buffer, and the
+                        // placeholder or prune the caller derives from this verdict replaces it.
+                        let stable = self.scrolled + self.lines as i64 - 1 - i as i64;
+                        self.slots[index] =
+                            Some(Slot::Lost { line: stable, col, stream_keyed: false });
+                    } else {
+                        match pass {
+                            Pass::Grow { .. } => {
+                                self.slots[index] = Some(Slot::Placed { line: stream as i64, col });
+                            },
+                            Pass::Shrink { columns, .. } if col < columns => {
+                                self.slots[index] = Some(Slot::Placed { line: stream as i64, col });
+                            },
+                            Pass::Shrink { columns, .. } => {
+                                // The record keeps cells the grid will not show; the anchor
+                                // clamps to the last visible column of its (still present) line.
+                                let stable = self.scrolled + self.lines as i64 - 1 - i as i64;
+                                self.slots[index] = Some(Slot::Lost {
+                                    line: stable,
+                                    col: columns - 1,
+                                    stream_keyed: false,
+                                });
+                            },
+                        }
+                    }
+                },
+                // A scroll report already resolved this anchor (an evicted row whose index a
+                // survivor now holds): leave the verdict.
+                Some(Slot::Lost { .. }) | None => {},
+                Some(Slot::Placed { .. }) => {},
+            }
+        }
+    }
+
+    /// Cells `[0, pulled)` of row `i` were appended to the piece at stream position `target`,
+    /// landing after its `last_len` cells; a wide tail cell stays on this row (only its spacer
+    /// went) and reappears at the rest's column 0. The rest of the row follows separately, at
+    /// columns shifted left by `pulled`.
+    fn merge(&mut self, i: usize, target: usize, pulled: usize, last_len: usize) {
+        let Some(indices) = self.rows.remove(&i) else {
+            return;
+        };
+        for &index in &indices {
+            if let Some(Slot::Pending { col, .. }) = self.slots[index] {
+                self.slots[index] = if col < pulled {
+                    Some(Slot::Placed { line: target as i64, col: col + last_len })
+                } else {
+                    Some(Slot::Pending { i, col: col - pulled })
+                };
+            }
+        }
+        self.rows.insert(i, indices);
+        self.last_piece.insert(i, (target, last_len + pulled));
+    }
+
+    /// The `n` cells carried from a newer row were prepended to row `i`: the carried anchors
+    /// re-key to this row keeping their columns at the piece's start, and this row's own cells
+    /// shift right by `n`.
+    fn prepend(&mut self, i: usize, n: usize, carried: &[usize]) {
+        if let Some(indices) = self.rows.get_mut(&i) {
+            for &index in indices.iter() {
+                if let Some(Slot::Pending { col, .. }) = self.slots[index] {
+                    self.slots[index] = Some(Slot::Pending { i, col: col + n });
+                }
+            }
+        }
+        for &index in carried {
+            // The anchor rode in under its source row's key; move it to this row's.
+            for indices in self.rows.values_mut() {
+                indices.retain(|&other| other != index);
+            }
+            if let Some(Slot::Pending { col, .. }) = self.slots[index] {
+                self.slots[index] = Some(Slot::Pending { i, col });
+            }
+            self.rows.entry(i).or_default().push(index);
+        }
+    }
+
+    /// Row `i`'s current piece `[0, moved_from)` was pushed at stream position `stream` and is
+    /// final: its anchors follow. The cells from `moved_from` on went to the cut run; their
+    /// anchor indices are returned so the caller can carry them (to `buffered`). They stay
+    /// pending at columns relative to the run's start until [`prepend`](Self::prepend) re-keys
+    /// them to the row they land on. `carries` is false when the cut cells were discarded
+    /// (shrinking without reflow): their anchors cannot follow. `content_end` is the row's
+    /// content length before the cut: an anchor at or beyond it, and beyond the new width, sits
+    /// on no cell that moves and cannot follow either.
+    fn piece_pushed(
+        &mut self,
+        i: usize,
+        stream: usize,
+        moved_from: usize,
+        content_end: usize,
+        carries: bool,
+    ) -> Vec<usize> {
+        self.piece_committed(i, stream, moved_from, content_end, carries)
+    }
+
+    /// [`piece_pushed`](Self::piece_pushed) for a push whose cut run continues as another row
+    /// over the same `i` in the loop: identical, only the carried indices are not needed.
+    fn piece_committed(
+        &mut self,
+        i: usize,
+        stream: usize,
+        moved_from: usize,
+        content_end: usize,
+        carries: bool,
+    ) -> Vec<usize> {
+        let mut carried = Vec::new();
+        if let Some(indices) = self.rows.get(&i) {
+            for &index in indices.iter() {
+                if let Some(Slot::Pending { col, .. }) = self.slots[index] {
+                    if col >= content_end && col >= self.columns {
+                        // No cell there at the new width: nothing carries it. Nearest is this
+                        // row's line, clamped to its last visible column.
+                        self.slots[index] = Some(Slot::Lost {
+                            line: stream as i64,
+                            col: self.columns - 1,
+                            stream_keyed: true,
+                        });
+                    } else if col < moved_from {
+                        // Kept on the pushed row at its unchanged visual column.
+                        self.slots[index] = Some(Slot::Placed { line: stream as i64, col });
+                    } else if carries {
+                        self.slots[index] = Some(Slot::Pending { i, col: col - moved_from });
+                        carried.push(index);
+                    } else {
+                        // A real tail cell, cut and discarded with reflow off.
+                        self.slots[index] = Some(Slot::Lost {
+                            line: stream as i64,
+                            col: col.min(self.columns - 1),
+                            stream_keyed: true,
+                        });
+                    }
+                }
+            }
+        }
+        self.last_piece.insert(i, (stream, moved_from));
+        carried
+    }
+
+    /// The cells left on row `i` after [`merge`](Self::merge) were dropped (the loop removed a
+    /// clear row): their anchors cannot follow and land clamped onto the merged run's end at
+    /// the target piece. Their columns are already relative to the rest, as `merge` rewrote
+    /// them; `run_len` is the merged run's visible length on the target row.
+    fn row_dropped(&mut self, i: usize, target: usize, last_len: usize, run_len: usize) {
+        if let Some(indices) = self.rows.remove(&i) {
+            for index in indices {
+                if let Some(Slot::Pending { col, .. }) = self.slots[index] {
+                    let col = (col + last_len).clamp(0, run_len.max(1) - 1);
+                    self.slots[index] =
+                        Some(Slot::Lost { line: target as i64, col, stream_keyed: true });
+                }
+            }
+        }
+    }
+
+    /// Pieces at produced stream positions `[kept, kept + dropped)` were dropped (a grow's
+    /// cursor pull-down): anchors on them, and still-pending anchors of rows whose last piece
+    /// was one, cannot follow; they resolve nearest the newest surviving piece.
+    fn truncated(&mut self, kept: usize, dropped: usize) {
+        if dropped == 0 {
+            return;
+        }
+        let in_dropped = |stream: i64| stream >= kept as i64 && stream < (kept + dropped) as i64;
+
+        // The newest surviving piece, for the nearest line and column clamp.
+        let nearest = self
+            .last_piece
+            .iter()
+            .map(|(&i, &(stream, len))| (i, stream, len))
+            .filter(|&(_, stream, _)| stream < kept)
+            .max_by_key(|&(_, stream, _)| stream)
+            .map(|(_, stream, len)| (stream, len));
+
+        for slot in self.slots.iter_mut() {
+            let doomed = match *slot {
+                Some(Slot::Placed { line, .. }) => in_dropped(line),
+                Some(Slot::Pending { i, .. }) => {
+                    self.last_piece.get(&i).is_some_and(|&(stream, _)| in_dropped(stream as i64))
+                },
+                _ => false,
+            };
+            if doomed {
+                let col = match *slot {
+                    Some(Slot::Placed { col, .. }) | Some(Slot::Pending { col, .. }) => col,
+                    _ => 0,
+                };
+                let (line, len) = nearest.unwrap_or((kept.saturating_sub(1), 1));
+                *slot = Some(Slot::Lost {
+                    line: line as i64,
+                    col: nearest_col(col, len, self.columns),
+                    stream_keyed: true,
+                });
+            }
+        }
+    }
+
+    /// Carried cells left over after the last processed row have no older row to prepend into:
+    /// their anchors cannot follow and resolve nearest their source row's last piece.
+    fn stash_final(&mut self, carried: &[usize]) {
+        for &index in carried {
+            if let Some(Slot::Pending { i, col }) = self.slots[index] {
+                let (stream, len) = self.last_piece.get(&i).copied().unwrap_or((0, 1));
+                let col = nearest_col(col, len, self.columns);
+                self.slots[index] =
+                    Some(Slot::Lost { line: stream as i64, col, stream_keyed: true });
+            }
+        }
+    }
+
+    /// Finalize: map every stream-keyed line onto a stable line — produced row `s` sits at
+    /// `scrolled + lines_after - 1 - (produced - 1 - s)` from the bottom of the finished buffer,
+    /// whose newest row is stream `produced - 1` — and turn placements whose piece was evicted
+    /// at the scrollback limit (`s < dropped`) into losses. Already-final lines (evicted rows,
+    /// cleared content) are untouched.
+    fn resolve(&mut self, scrolled: i64, lines_after: usize, produced: usize, dropped: usize) {
+        let stable =
+            |stream: i64| scrolled + lines_after as i64 - 1 - (produced as i64 - 1 - stream);
+        for slot in &mut self.slots {
+            match *slot {
+                Some(Slot::Placed { line: stream, col }) => {
+                    if stream < dropped as i64 {
+                        *slot = Some(Slot::Lost { line: stable(stream), col, stream_keyed: false });
+                    } else {
+                        *slot = Some(Slot::Placed { line: stable(stream), col });
+                    }
+                },
+                Some(Slot::Lost { line, col, stream_keyed: true }) => {
+                    *slot = Some(Slot::Lost { line: stable(line), col, stream_keyed: false });
+                },
+                _ => {},
+            }
+        }
+    }
+
+    /// Append the resolved outcomes to `out` in input order (after `resolve`).
+    fn collect_into(self, anchors: &[(i64, usize)], out: &mut Vec<(i64, usize, bool)>) {
+        for (index, slot) in self.slots.into_iter().enumerate() {
+            match slot {
+                None | Some(Slot::Pending { .. }) => {
+                    // Untouched: the row survived the resize unchanged (byte-copied within the
+                    // new width, or never reflowed).
+                    let (stable, col) = anchors[index];
+                    out.push((stable, col, false));
+                },
+                Some(Slot::Placed { line, col }) => out.push((line, col, false)),
+                Some(Slot::Lost { line, col, .. }) => out.push((line, col, true)),
+            }
+        }
+    }
+}
+
+/// The column an anchor that cannot follow lands on: the last cell of its nearest piece that
+/// the grid still shows.
+fn nearest_col(col: usize, len: usize, columns: usize) -> usize {
+    let visible = len.min(columns).saturating_sub(1);
+    col.min(visible)
 }

@@ -40,8 +40,8 @@
 //! command or a frame that starts another transmission ends one (the protocol asks a delete to
 //! abort an upload). Time is injected: `end(now)` and [`tick`](KittyParser::tick) drop a
 //! transmission that has made no progress for [`STALL`] with `ENOMEM` — `tick` so that an idle
-//! terminal releases a client that stopped mid-upload, though never while an APC frame is open —
-//! and tests never sleep. Every buffer is
+//! terminal releases a client that stopped mid-upload, counting an open APC frame as progress only
+//! while bytes keep arriving into it — and tests never sleep. Every buffer is
 //! bounded: the staged payload of one APC frame and the accumulated bytes of one transmission by
 //! [`MAX_PAYLOAD_BYTES`], the inflated output by [`MAX_IMAGE_BYTES`] or, for a declared raw
 //! format, by its own declared size; base64 is decoded incrementally by [`Decoder`], which carries
@@ -391,11 +391,24 @@ pub struct KittyParser {
     /// and padding that ends one chunk ends the payload).
     b64: Decoder,
     reject: Option<KittyReject>,
+    /// Bumps whenever bytes arrive in an open frame, so `tick` can tell a frame that is still
+    /// receiving from one that has gone quiet ([`tick`](Self::tick)).
+    put_gen: u64,
+    /// The last `put_gen` value `tick` observed; equal to [`put_gen`](Self::put_gen) means the
+    /// open frame made no progress since the previous check.
+    seen_put_gen: u64,
 }
 
 impl Default for KittyParser {
     fn default() -> Self {
-        Self { frame: Frame::inactive(), pending: None, b64: Decoder::default(), reject: None }
+        Self {
+            frame: Frame::inactive(),
+            pending: None,
+            b64: Decoder::default(),
+            reject: None,
+            put_gen: 0,
+            seen_put_gen: 0,
+        }
     }
 }
 
@@ -416,12 +429,17 @@ impl KittyParser {
         self.frame = Frame::inactive();
         self.frame.active = true;
         self.frame.region = Region::WaitingG;
+        // A new frame starts its own progress accounting for `tick`.
+        self.seen_put_gen = self.put_gen;
     }
 
     /// APC content arrived (`apc_put`), in arbitrary slices.
     pub fn put(&mut self, bytes: &[u8]) {
         if !self.frame.active {
             return;
+        }
+        if !bytes.is_empty() {
+            self.put_gen += 1;
         }
         match self.frame.region {
             Region::WaitingG => {
@@ -499,12 +517,16 @@ impl KittyParser {
     /// Nothing arrived on the wire: callers run this on a timer so that a client which stops
     /// mid-upload while the terminal sits idle is released anyway. It drops a chunked transmission
     /// that has made no progress for [`STALL`], with the `ENOMEM` rejection waiting in
-    /// [`take_reject`](Self::take_reject). While an APC frame is being parsed nothing is dropped:
-    /// its staged payload belongs to the transmission it continues, and dropping under it would
-    /// strand those bytes against a transmission that no longer exists; the frame's own `end`
-    /// runs the same check once the frame is closed.
+    /// [`take_reject`](Self::take_reject). An open APC frame does not exempt the transmission:
+    /// the frame counts as progress only while bytes keep arriving into it — if it has received
+    /// nothing since the previous check and the upload's own clock passed [`STALL`], the stalled
+    /// upload is dropped under it (the frame's staged payload belongs to a transmission that no
+    /// longer exists, and its `end` treats it as starting fresh). A client streaming one huge slow
+    /// chunk is never dropped: every `put` moves the progress marker.
     pub fn tick(&mut self, now: Instant) {
-        if self.frame.active {
+        if self.frame.active && self.put_gen != self.seen_put_gen {
+            // The open frame received bytes since the last check: that is progress.
+            self.seen_put_gen = self.put_gen;
             return;
         }
         self.drop_stalled(now);
@@ -1032,8 +1054,10 @@ fn build_place(keys: &Keys, quiet: u8) -> KittyPlace {
         id: keys.i,
         number: keys.number,
         placement_id: keys.p,
-        cols: keys.c.unwrap_or(0),
-        rows: keys.r.unwrap_or(0),
+        // A hostile `c`/`r` cannot ask for a span wider than the image limits allow; `0`
+        // (absent) stays `0` so `PlacementTable::span_for` computes it.
+        cols: keys.c.unwrap_or(0).min(MAX_IMAGE_SIDE),
+        rows: keys.r.unwrap_or(0).min(MAX_IMAGE_SIDE),
         src,
         x_off: keys.x_off.unwrap_or(0),
         y_off: keys.y_off.unwrap_or(0),

@@ -4,14 +4,20 @@
 //! scrollback placeholders, ids and replies.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 
 use crate::event::{Event, EventListener, ImageData, ImageDecodeError, ImageKey};
-use crate::graphics::kitty_diacritics::{PLACEHOLDER_CHAR, decode_placeholder_cell};
-use crate::grid::Dimensions;
+use crate::graphics::kitty_diacritics::{
+    PLACEHOLDER_CHAR, ROW_COLUMN_DIACRITICS, decode_placeholder_cell,
+};
+use crate::graphics::limits::MAX_IMAGE_SIDE;
+use crate::graphics::placements::{
+    GridWindow, MAX_PLACEHOLDERS, MAX_PLACEMENTS, PlacementTable, Screen,
+};
+use crate::grid::{Dimensions, Scroll};
 use crate::term::{Config, Term};
 use crate::vte::ansi::{Processor, Rgb};
 
@@ -686,4 +692,285 @@ fn decode_failure_sends_ebadpng() {
     assert_eq!(released_of(&events), vec![quiet]);
 
     term.tick(Instant::now()); // the stall watchdog must not trip on idle parsers
+}
+
+#[test]
+fn huge_span_does_not_panic() {
+    let (mut term, recorder) = term(12, 6);
+    feed(&mut term, b"\x1b[1;1H");
+
+    // A cell count near `u32::MAX` once overflowed the cursor arithmetic below the image:
+    // `rows as i32` wrapped negative and the next printed character panicked.
+    let seq = transmit(9, "f=32", Some((1, 1)), &rgba(1, 1), ",r=4294967295");
+    feed(&mut term, &seq);
+    recorder.received();
+    feed(&mut term, b"x"); // the print that used to index a negative line
+
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1, "the placement survives with its clamped span");
+    assert_eq!(placements[0].rows, MAX_IMAGE_SIDE, "an `r` above the cap clamps to it");
+    // The cursor parks at the bottom row (its column is the clamped image's right edge).
+    assert_eq!(cursor(&term).0, 5, "the cursor stops at the bottom row, not past it");
+}
+
+#[test]
+fn bottom_margin_scroll_keeps_fixed_row_placements() {
+    let (mut term, recorder) = term(8, 5);
+    feed(&mut term, b"\x1b[1;4r"); // DECSTBM: rows 0..3 scroll, row 4 is fixed below it
+    feed(&mut term, b"\x1b[5;1H");
+    feed(&mut term, SIXEL); // the placement anchors on the fixed row
+    recorder.received();
+
+    feed(&mut term, b"\x1b[4;1H"); // cursor back onto the region's last line
+    feed(&mut term, b"\n\n"); // two rotations of the region swap the fixed row back
+
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(
+        placements[0].row_in_view, 4,
+        "a placement anchored below a bottom margin keeps its screen row"
+    );
+}
+
+#[test]
+fn ed1_above_with_display_offset_keeps_history_images() {
+    let (mut term, recorder) = term(8, 5);
+    term.set_scrollback_images(true);
+    feed(&mut term, b"\x1b[3;1H");
+    feed(&mut term, SIXEL); // placement on absolute line 2
+    let key = recorder.received()[0].0;
+    for _ in 0..6 {
+        feed(&mut term, b"\n"); // scroll it into history (stable is 5 afterwards)
+    }
+    term.scroll_display(Scroll::Delta(3)); // the view shows absolute lines 2..
+
+    // ED 1 concerns the screen above the cursor, not the scrolled-back view: erasing from the
+    // top of the *view* used to wipe this placement and release its image.
+    feed(&mut term, b"\x1b[1J");
+    assert!(recorder.released().is_empty(), "ED 1 above does not touch scrollback");
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1, "the history placement is still there");
+    assert_eq!(placements[0].key, key);
+}
+
+#[test]
+fn virtual_placements_are_capped_and_added_in_constant_time() {
+    let (mut term, recorder) = term(8, 5);
+    let start = Instant::now();
+
+    // One image, 20 000 virtual placements with distinct placement ids (`a=p` re-displays the
+    // stored image; `U=1` records it virtually instead of placing it).
+    feed(&mut term, &transmit(7, "f=24", Some((8, 8)), &rgb(8, 8), ",U=1,p=1"));
+    for pid in 2..=20_000u32 {
+        let frame = format!("\x1b_Ga=p,i=7,U=1,p={pid}\x1b\\");
+        feed(&mut term, frame.as_bytes());
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "20 000 virtual placements must not take quadratic time in debug"
+    );
+
+    const _: () = assert!(20_000 > MAX_PLACEMENTS);
+    assert_eq!(term.kitty_virtual_image(7, Some(1)), None, "the oldest virtual evicted");
+    assert!(term.kitty_virtual_image(7, Some(20_000)).is_some(), "the newest survives");
+    assert!(
+        recorder.released().is_empty(),
+        "evicting a virtual whose image other virtuals still reference frees nothing"
+    );
+}
+
+#[test]
+fn placeholder_dedupe_keeps_the_latest_per_cell() {
+    let (mut term, recorder) = term(10, 6);
+
+    // Two placements anchored at the very same cell (line 0, column 0), different images.
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &transmit(11, "f=32", Some((24, 8)), &rgba(24, 8), ",c=6,r=1"));
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &transmit(12, "f=32", Some((16, 6)), &rgba(16, 6), ",c=4,r=1"));
+    recorder.received();
+
+    feed(&mut term, b"\x1b[6;1H");
+    feed(&mut term, b"\n"); // both scroll off together and convert to placeholders
+    term.scroll_display(Scroll::Delta(1)); // the placeholder line is back in view
+
+    let placeholders = term.visible_placeholders();
+    assert_eq!(placeholders.len(), 1, "one record per cell, not one per placement");
+    assert_eq!(placeholders[0].row_in_view, 0);
+    assert_eq!(placeholders[0].col, 0);
+    assert_eq!(placeholders[0].text, "[image 16×6]", "the latest stamp wins");
+    // Numbered kitty images are kept by their ids even when no placement references them.
+    assert!(recorder.released().is_empty());
+}
+
+#[test]
+fn placeholder_cap_and_visible_range_scans() {
+    // Scan bound: placements far above the view (beyond one clamped image's height of lookback)
+    // must not be touched by a frame query.
+    let mut table = PlacementTable::new();
+    let (key, events) = table.new_image(Some(1), None, 8, 8, None).unwrap();
+    assert!(events.is_empty());
+    for line in [-50_000i64, -20_000, -12_000] {
+        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None).unwrap();
+    }
+    table.place(Screen::Primary, key, 3, 0, 1, 1, None, 0, 0, 0, None).unwrap();
+    let window = GridWindow { stable: 0, lines: 5, history: 60_000 };
+    let (out, scanned) = table.visible_placements_scanned(window, Screen::Primary, 0);
+    assert_eq!(out.len(), 1, "only the in-view placement is returned");
+    assert_eq!(scanned, 1, "the query touched one map line, not the far-away ones");
+
+    // Scroll-off conversion turns the far-above placements into placeholders; a placeholder
+    // query needs no lookback at all and scans none of their lines.
+    table.after_scroll_up(
+        GridWindow { stable: 1, lines: 5, history: 60_001 },
+        Screen::Primary,
+        0,
+        5,
+        1,
+    );
+    let (out, scanned) = table.visible_placeholders_scanned(window, Screen::Primary, 0);
+    assert!(out.is_empty());
+    assert_eq!(scanned, 0, "placeholders above the view are outside the query range");
+
+    // Cap: one placeholder per scrolled-off row, oldest dropped past 100 000. A virtual holds
+    // a reference so the shared image stays stored across the whole loop.
+    let mut table = PlacementTable::new();
+    let (key, _) = table.new_image(Some(2), None, 8, 8, None).unwrap();
+    table.add_virtual(2, key, Some(1), 0, 0);
+    for line in 0..(MAX_PLACEHOLDERS + 5) as i64 {
+        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None).unwrap();
+        let events = table.after_scroll_up(
+            GridWindow { stable: line + 1, lines: 1, history: (line + 1) as usize },
+            Screen::Primary,
+            0,
+            1,
+            1,
+        );
+        assert!(events.is_empty(), "the virtual keeps the image referenced");
+    }
+    let window = GridWindow { stable: 0, lines: MAX_PLACEHOLDERS + 5, history: 0 };
+    let (out, _) = table.visible_placeholders_scanned(window, Screen::Primary, 0);
+    assert_eq!(out.len(), MAX_PLACEHOLDERS, "the cap holds");
+    assert_eq!(out[0].row_in_view, 5, "the five oldest placeholders were dropped");
+}
+
+#[test]
+fn resize_reflow_moves_placement_with_its_first_cell() {
+    let (mut term, recorder) = term(10, 8);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &[b'A'; 20]); // ten columns: fills rows 0 and 1, row 0 wraps
+    feed(&mut term, b"\x1b[2;5H");
+    feed(&mut term, &transmit(50, "f=32", Some((3, 1)), &rgba(3, 1), ",c=3,r=1"));
+    let key = recorder.received()[0].0;
+
+    // Growing to 20 columns merges the wrapped pair into row 0; the anchor cell (row 1,
+    // column 4) moves with its content to column 14 of the merged row.
+    term.resize(Size { columns: 20, lines: 8 });
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].key, key);
+    assert_eq!((placements[0].row_in_view, placements[0].col), (0, 14));
+    assert!(recorder.released().is_empty());
+}
+
+#[test]
+fn resize_unfollowable_anchor_becomes_a_placeholder() {
+    let (mut term, recorder) = term(12, 12);
+    feed(&mut term, b"\x1b[1;11H"); // anchor column 10 of a 12-column screen
+    feed(&mut term, &transmit(31, "f=32", Some((24, 8)), &rgba(24, 8), ",c=3,r=1"));
+    let key = recorder.received()[0].0;
+
+    // Shrinking to 5 columns destroys the anchor cell's column: spec 5 says the placement
+    // becomes its placeholder instead of vanishing silently.
+    term.resize(Size { columns: 5, lines: 12 });
+    assert!(
+        !term.visible_placements().iter().any(|p| p.key == key),
+        "the placement itself is gone"
+    );
+    let placeholders = term.visible_placeholders();
+    assert_eq!(placeholders.len(), 1, "a placeholder stands in for it");
+    assert_eq!((placeholders[0].row_in_view, placeholders[0].col), (0, 4));
+    assert_eq!(placeholders[0].text, "[image 24×8]");
+    assert!(recorder.released().is_empty(), "the id still references the stored image");
+}
+
+#[test]
+fn uppercase_delete_keeps_data_while_another_placement_references_it() {
+    let (mut term, recorder) = term(12, 12);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &transmit(40, "f=32", Some((8, 8)), &rgba(8, 8), ",c=4,r=1")); // row 0
+    let key = recorder.received()[0].0;
+    feed(&mut term, b"\x1b[9;1H");
+    feed(&mut term, b"\x1b_Ga=p,i=40,c=4,r=1\x1b\\"); // a second placement of the same image
+    assert_eq!(term.visible_placements().len(), 2);
+
+    // `d=Y` (uppercase) deletes the placements crossing viewport row 9 — only the row-8 one.
+    recorder.take();
+    feed(&mut term, b"\x1b_Ga=d,d=Y,y=9\x1b\\");
+    let events = recorder.take();
+    assert!(writes_of(&events).contains("OK"));
+    assert_eq!(term.visible_placements().len(), 1);
+    assert!(
+        released_of(&events).is_empty(),
+        "the row-0 placement still references the image, so its data stays"
+    );
+
+    // Lowercase `d=i` removes both placements and still keeps the data; `d=I` frees it once.
+    feed(&mut term, b"\x1b_Ga=d,d=i,i=40\x1b\\");
+    let events = recorder.take();
+    assert!(released_of(&events).is_empty());
+    assert!(term.visible_placements().is_empty());
+    feed(&mut term, b"\x1b_Ga=d,d=I,i=40\x1b\\");
+    assert_eq!(released_of(&recorder.take()), vec![key]);
+}
+
+#[test]
+fn scrollback_eviction_releases_only_when_unreferenced() {
+    let (mut term, recorder) = term(12, 5);
+    term.set_scrollback_images(true);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &transmit(41, "f=32", Some((8, 8)), &rgba(8, 8), ",c=4,r=1")); // line 0
+    let key = recorder.received()[0].0;
+    feed(&mut term, b"\x1b[3;1H");
+    feed(&mut term, b"\x1b_Ga=p,i=41,c=4,r=1\x1b\\"); // line 2, same image
+    for _ in 0..6 {
+        feed(&mut term, b"\n"); // stable reaches 4: both placements end fully above the viewport
+    }
+
+    // Evicting the oldest scrollback placement turns it into its placeholder; the second
+    // placement still references the image, so nothing releases.
+    assert_eq!(term.evict_oldest_scrollback_image(), Some(key));
+    let events = recorder.take();
+    assert!(released_of(&events).is_empty(), "the surviving placement keeps the pixels");
+    term.scroll_display(Scroll::Delta(4)); // scroll back to the evicted line
+    let placeholders = term.visible_placeholders();
+    assert_eq!(placeholders.len(), 1);
+    assert_eq!((placeholders[0].row_in_view, placeholders[0].col), (0, 0));
+    assert_eq!(placeholders[0].text, "[image 8×8]");
+
+    // Evicting the last placement converts it too; a numbered image is still kept by its id.
+    term.scroll_display(Scroll::Bottom);
+    recorder.take();
+    assert_eq!(term.evict_oldest_scrollback_image(), Some(key));
+    let events = recorder.take();
+    assert!(released_of(&events).is_empty(), "the id still names the image");
+    term.scroll_display(Scroll::Delta(4));
+    assert_eq!(term.visible_placeholders().len(), 2, "both lines now show placeholders");
+}
+
+#[test]
+fn third_diacritic_above_a_byte_does_not_decode() {
+    let mut cell = crate::term::cell::Cell {
+        c: PLACEHOLDER_CHAR,
+        fg: crate::vte::ansi::Color::Spec(Rgb { r: 0, g: 0, b: 3 }),
+        ..crate::term::cell::Cell::default()
+    };
+    cell.push_zerowidth(ROW_COLUMN_DIACRITICS[1]); // row 1
+    cell.push_zerowidth(ROW_COLUMN_DIACRITICS[2]); // column 2
+    assert_eq!(decode_placeholder_cell(&cell), Some((3, 1, 2)), "two marks decode");
+
+    // The third mark carries the most significant id byte; table index 256 does not fit in a
+    // byte, so the cell must decode to `None` rather than a truncated id.
+    cell.push_zerowidth(ROW_COLUMN_DIACRITICS[256]);
+    assert_eq!(decode_placeholder_cell(&cell), None);
 }

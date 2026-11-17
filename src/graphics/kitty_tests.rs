@@ -801,22 +801,40 @@ fn tick_drops_stalled_transmission() {
     assert!(parser.take_reject().is_none());
     assert!(parser.held_bytes() > 0);
 
-    // A stalled upload is not dropped while a frame is being parsed: the open chunk belongs to
-    // that transmission, and its `end` runs the same stall check once the frame is closed.
+    // An open frame counts as progress only while bytes arrive into it. The first check after a
+    // `put` sees new staged content and keeps the upload; a frame that has received nothing since
+    // the previous check does not exempt a stalled transmission from being dropped.
     parser.start();
     parser.put(b"Ga=q,i=4");
-    parser.tick(late + Duration::from_secs(30));
-    assert!(parser.take_reject().is_none(), "an open frame is progress");
-    assert!(parser.held_bytes() > 0, "the stalled upload is still held");
+    parser.tick(late + Duration::from_secs(25));
+    assert!(parser.take_reject().is_none(), "a frame that just received bytes is progress");
+    assert!(parser.held_bytes() > 0, "the upload is still held");
 
-    // `tick` never disturbs the frame itself; its `end` answers it and releases the upload.
+    // Nothing arrived since: the stalled upload is released even under the open frame.
+    parser.tick(late + Duration::from_secs(30));
+    let rej = parser.take_reject().expect("the stalled upload was dropped under the open frame");
+    assert_eq!((rej.error, rej.id, rej.quiet), (KittyError::ENOMEM, 0, 0));
+
+    // `tick` never disturbs the frame itself; its `end` still answers it.
     assert_eq!(
         parser.end(late + Duration::from_secs(31)),
         Some(KittyCommand::Query { id: 4, quiet: 0 })
     );
-    let rej = parser.take_reject().expect("the closed frame released the stalled upload");
-    assert_eq!((rej.error, rej.id, rej.quiet), (KittyError::ENOMEM, 0, 0));
+    assert!(parser.take_reject().is_none(), "the drop was already reported");
     assert_eq!(parser.held_bytes(), 0);
+
+    // A client streaming a slow chunk is never dropped: every `put` moves the progress marker.
+    assert_eq!(parse(&mut parser, &apc("f=24,s=1,v=1,m=1,i=8", b"AQID"), late), None);
+    parser.start();
+    for t in 35..45 {
+        parser.put(b"AAAA");
+        parser.tick(late + Duration::from_secs(t));
+        assert!(parser.take_reject().is_none(), "arriving bytes keep the upload alive");
+    }
+    // And once its puts stop, it goes on the next check past the stall window.
+    parser.tick(late + Duration::from_secs(60));
+    let rej = parser.take_reject().expect("a quiet frame past STALL drops the upload");
+    assert_eq!((rej.error, rej.id), (KittyError::ENOMEM, 8));
 }
 
 #[test]

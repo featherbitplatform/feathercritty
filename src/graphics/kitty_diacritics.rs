@@ -362,7 +362,7 @@ pub fn decode_placeholder_cell(cell: &Cell) -> Option<(u32, u32, u32)> {
     let column = diacritic_index(marks[1])? as u32;
     // The third mark carries the most significant id byte, so it must itself be a byte value.
     let high = match marks.len() {
-        3 => u32::try_from(diacritic_index(marks[2])?).ok()?,
+        3 => u32::from(u8::try_from(diacritic_index(marks[2])?).ok()?),
         _ => 0,
     };
     Some((id | (high << 24), row, column))

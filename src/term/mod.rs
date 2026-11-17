@@ -17,7 +17,7 @@ use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
 use crate::event::{Event, EventListener, ImageData, ImageDecodeError, ImageKey};
-use crate::graphics::{inline, kitty, placements, sixel};
+use crate::graphics::{inline, kitty, limits, placements, sixel};
 use crate::grid::{Dimensions, Done, Grid, GridIterator, Job, PlainText, RowReader, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
@@ -1133,9 +1133,13 @@ impl<T> Term<T> {
         let echo = place.id.unwrap_or(0);
         if place.virtual_ {
             // Placeholder cells reference virtual placements by image id, so one is required.
-            let created = kitty_id.and_then(|id| {
+            // Over the cap `add_virtual` evicts the oldest; those releases ride out as events.
+            let (created, eviction_events) = kitty_id.map_or((None, Vec::new()), |id| {
                 self.placements.add_virtual(id, key, place.placement_id, place.cols, place.rows)
             });
+            if !eviction_events.is_empty() {
+                self.queue_image_events(eviction_events);
+            }
             let result = match created {
                 Some(_) => Ok(()),
                 None => Err(kitty::KittyError::EINVAL),
@@ -1243,14 +1247,16 @@ impl<T> Term<T> {
     /// the same column — the DECSDM-off sixel and inline rule. Both clamp to the scroll region's
     /// bottom line.
     fn move_cursor_below_image(&mut self, col: usize, cols: u32, rows: u32, advance_column: bool) {
-        let bottom = Line(self.scroll_region.end.0 - 1);
-        let below = if advance_column { rows.saturating_sub(1) } else { rows };
-        let mut line = cmp::min(self.grid.cursor.point.line.0 + below as i32, bottom.0);
+        // Arithmetic in i64 clamped to the scroll region's bottom line: a span request that
+        // outgrows an i32 (a hostile `r`/`c` before placement clamps it) must not wrap negative.
+        let bottom = i64::from(self.scroll_region.end.0 - 1);
+        let below = i64::from(if advance_column { rows.saturating_sub(1) } else { rows });
+        let mut line = (i64::from(self.grid.cursor.point.line.0) + below).clamp(0, bottom);
         let col = if advance_column {
             let columns = self.columns();
-            let col = col + cols as usize;
+            let col = col.saturating_add(cols as usize);
             if col >= columns {
-                line = cmp::min(line + 1, bottom.0);
+                line = (line + 1).min(bottom);
                 col - columns
             } else {
                 col
@@ -1259,7 +1265,7 @@ impl<T> Term<T> {
             col
         };
         self.damage_cursor();
-        self.grid.cursor.point = Point::new(Line(line), Column(col.min(self.columns() - 1)));
+        self.grid.cursor.point = Point::new(Line(line as i32), Column(col.min(self.columns() - 1)));
         self.grid.cursor.input_needs_wrap = false;
         self.damage_cursor();
     }
@@ -1580,8 +1586,48 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
-        self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+
+        // feathercritty: placements follow the resize. Each grid's anchors (their first cells)
+        // go into `resize_tracked`, which replays the reflow's own decisions; outcomes move a
+        // placement with its cell or, when it cannot follow, replace it with its placeholder
+        // instead of dropping it silently (design spec 5). The alternate grid has no scroll
+        // observer — nothing it does destroys content — so its anchors keep their cells through
+        // the row passes and are shifted to their new absolute lines afterwards. Events have no
+        // `EventListener` bound here, so they ride out to the next bounded operation. Not
+        // upstream.
+        let tracking = !self.placements.is_empty();
+        let (active, inactive) = self.screen_pair();
+        let grew_lines = num_lines > old_lines;
+        // The inactive grid's own shrink scroll and history state, read before the resize:
+        // whichever grid is inactive still runs its row passes without an observer.
+        let alt_required =
+            (self.inactive_grid.cursor.point.line.0 as usize + 1).saturating_sub(num_lines);
+        let alt_history_full = self.inactive_grid.history_size() < alt_required;
+        let (active_anchors, inactive_anchors): (
+            Vec<placements::Placement>,
+            Vec<placements::Placement>,
+        ) = if tracking {
+            (self.placements.anchor_list(active), self.placements.anchor_list(inactive))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut active_outcomes = Vec::new();
+        let mut inactive_outcomes = Vec::new();
+
+        self.grid.resize_tracked(
+            !is_alt,
+            num_lines,
+            num_cols,
+            &active_anchors.iter().map(|p| (p.line, p.col)).collect::<Vec<_>>(),
+            &mut active_outcomes,
+        );
+        self.inactive_grid.resize_tracked(
+            is_alt,
+            num_lines,
+            num_cols,
+            &inactive_anchors.iter().map(|p| (p.line, p.col)).collect::<Vec<_>>(),
+            &mut inactive_outcomes,
+        );
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -1609,24 +1655,53 @@ impl<T> Term<T> {
         // Resize damage information.
         self.damage.resize(num_cols, num_lines);
 
-        // feathercritty: placements follow the resize (see `PlacementTable::after_resize`); events
-        // have no `EventListener` bound here, so they ride out to the next bounded operation. Not
-        // upstream.
-        if !self.placements.is_empty() {
+        if tracking {
             let mut events = Vec::new();
-            let (active, inactive) = self.screen_pair();
-            self.placements.after_resize(
-                self.grid_window(&self.grid),
-                active,
-                num_cols,
-                &mut events,
-            );
-            self.placements.after_resize(
-                self.grid_window(&self.inactive_grid),
-                inactive,
-                num_cols,
-                &mut events,
-            );
+
+            // Alternate grid: rows pulled from (or pushed into) history slide the viewport, so
+            // anchors outside it move by the count of lines that actually changed places;
+            // growth ate scrollback for `num_lines - old_lines - from_history` rows only.
+            if grew_lines {
+                let from_history =
+                    cmp::min(self.inactive_grid.history_size(), num_lines - old_lines);
+                let shift = (num_lines - old_lines - from_history) as i64;
+                self.placements.shift_anchored(
+                    inactive,
+                    i64::MIN..self.inactive_grid.scrolled_lines(),
+                    shift,
+                );
+            } else if alt_required > 0 && !alt_history_full {
+                // Only the rows that rode into history changed absolute position.
+                let scrolled = self.inactive_grid.scrolled_lines();
+                self.placements.shift_anchored(
+                    inactive,
+                    scrolled..i64::MAX,
+                    -(alt_required as i64),
+                );
+            }
+
+            for (screen, anchors, outcomes) in [
+                (active, &active_anchors, &active_outcomes),
+                (inactive, &inactive_anchors, &inactive_outcomes),
+            ] {
+                let remapped: Vec<(placements::Placement, i64, usize, bool)> = anchors
+                    .iter()
+                    .copied()
+                    .zip(outcomes.iter())
+                    .map(|(p, &(line, col, lost))| (p, line, col, lost))
+                    .collect();
+                self.placements.apply_reflow(&remapped, &mut events);
+                self.placements.after_resize(
+                    self.grid_window(if screen == active {
+                        &self.grid
+                    } else {
+                        &self.inactive_grid
+                    }),
+                    screen,
+                    num_cols,
+                    &mut events,
+                );
+            }
             self.queue_image_events(events);
         }
     }
@@ -2272,15 +2347,22 @@ fn sniff_format(bytes: &[u8]) -> Option<crate::event::ImageFormat> {
 /// absent argument) asks for 0 — which [`PlacementTable::span_for`] computes from the image
 /// itself (feathercritty; not upstream).
 fn inline_cells(dim: inline::Dim, cell_px: u32, terminal_px: u32) -> u32 {
+    // `span_for` treats 0 as "compute", so only a nonzero request is capped; the cap is the
+    // image-side limit (`MAX_IMAGE_SIDE` cells), which no display could exceed anyway.
+    let cap = |cells: u64| cells.clamp(1, u64::from(limits::MAX_IMAGE_SIDE)) as u32;
     match dim {
         inline::Dim::Auto => 0,
-        inline::Dim::Cells(cells) => cells,
+        // `span_for` treats 0 as "compute", so only a nonzero request is capped.
+        inline::Dim::Cells(0) => 0,
+        inline::Dim::Cells(cells) => cap(u64::from(cells)),
         inline::Dim::Pixels(pixels) => (u64::from(pixels) + u64::from(cell_px) - 1)
             .checked_div(u64::from(cell_px))
-            .unwrap_or(0) as u32,
+            .map_or(0, |cells| if cells == 0 { 0 } else { cap(cells) }),
         inline::Dim::Percent(percent) => {
             let pixels = u64::from(terminal_px) * u64::from(percent.min(100)) / 100;
-            (pixels + u64::from(cell_px) - 1).checked_div(u64::from(cell_px)).unwrap_or(0) as u32
+            (pixels + u64::from(cell_px) - 1)
+                .checked_div(u64::from(cell_px))
+                .map_or(0, |cells| if cells == 0 { 0 } else { cap(cells) })
         },
     }
 }
@@ -3115,10 +3197,13 @@ impl<T: EventListener> Handler for Term<T> {
                 let range = Line(0)..=cursor.line;
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
 
-                // feathercritty: placements anchored in the cleared rows are removed. Not upstream.
+                // feathercritty: placements anchored in the cleared rows are removed. The clear
+                // concerns the screen, not the scrolled-back view: `reset_region` only ever
+                // touches grid rows `0..=cursor.line`, so the wipe starts at the viewport's top
+                // stable line, never earlier (`display_offset` rows of history stay). Not upstream.
                 if !self.placements.is_empty() {
                     let window = self.grid_window(&self.grid);
-                    let from = window.stable - self.grid.display_offset() as i64;
+                    let from = window.stable;
                     let to = window.stable + i64::from(cursor.line.0) + 1;
                     let mut events = Vec::new();
                     self.placements.wipe_range(self.active_screen(), from, to, &mut events);
@@ -3178,6 +3263,18 @@ impl<T: EventListener> Handler for Term<T> {
 
                     self.vi_mode_cursor.point.line =
                         (self.vi_mode_cursor.point.line - lines).grid_clamp(self, Boundary::Grid);
+
+                    // feathercritty: riding the viewport into history may have pushed the oldest
+                    // rows past the scrollback limit; placements that fell off the end go with
+                    // them — the same prune a scrolling rotation runs. Not upstream.
+                    if !self.placements.is_empty() {
+                        let window = self.grid_window(&self.grid);
+                        self.placements.prune_out_of_view(
+                            window,
+                            self.active_screen(),
+                            &mut events,
+                        );
+                    }
                 }
 
                 self.selection = None;
