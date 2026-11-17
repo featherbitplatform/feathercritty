@@ -451,6 +451,21 @@ fn oversized_header_is_enomem() {
 }
 
 #[test]
+fn rgb_declared_size_is_checked_as_rgba() {
+    // `f=24` pixels are expanded to RGBA before the host sees them, so the per-image cap is
+    // measured at four bytes per pixel for every raw format. This blob fits as RGB (52.9 MB)
+    // but its RGBA expansion (70.6 MB) passes `MAX_IMAGE_BYTES`.
+    let (cmd, rej) = once(&apc("a=q,i=1,f=24,s=4200,v=4200", b""));
+    assert_eq!(cmd, None);
+    assert_eq!(rej.map(|r| r.error), Some(KittyError::ENOMEM));
+
+    // The largest `f=24` declaration whose RGBA expansion fits exactly is accepted.
+    let (cmd, rej) = once(&apc("a=q,i=1,f=24,s=4096,v=4096", b""));
+    assert!(rej.is_none(), "{rej:?}");
+    assert!(matches!(cmd, Some(KittyCommand::Query { id: 1, .. })));
+}
+
+#[test]
 fn endless_transmission_is_dropped_at_cap() {
     let now = Instant::now();
     let mut parser = KittyParser::new();
@@ -526,8 +541,9 @@ fn reply_quiet_levels() {
     // q=2 suppresses everything.
     assert_eq!(reply(5, None, Some(2), Ok(()), 2), None);
     assert_eq!(reply(5, None, None, Err(KittyError::ENOMEM), 2), None);
-    // Without an id and without a number nothing is echoed; only the message travels.
-    assert_eq!(reply(0, None, Some(3), Ok(()), 0), Some(b"\x1b_G;OK\x1b\\".to_vec()));
+    // Without an id and without a number there is no reply at all: clients that address no
+    // image do not read one, and the bytes would land in the program's stdin.
+    assert_eq!(reply(0, None, Some(3), Ok(()), 0), None);
     assert_eq!(
         reply(9, None, None, Err(KittyError::EBADPNG), 0),
         Some(b"\x1b_Gi=9;EBADPNG:malformed PNG data\x1b\\".to_vec())

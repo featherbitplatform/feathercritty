@@ -671,11 +671,11 @@ fn kitty_delete_selectors() {
     assert_eq!(term.visible_placements().len(), 3);
 
     // `d=Y` (uppercase: placements and data) removes what crosses viewport row 9 — the z-5
-    // image, whose key releases.
+    // image, whose key releases. With neither `i` nor `I` in the frame there is no answer.
     recorder.take();
     feed(&mut term, b"\x1b_Ga=d,d=Y,y=9\x1b\\");
     let events = recorder.take();
-    assert!(writes_of(&events).contains("OK"));
+    assert_eq!(writes_of(&events), "", "an unnumbered delete answers nothing");
     assert_eq!(released_of(&events), vec![id4_key]);
     let placements = term.visible_placements();
     assert_eq!(placements.len(), 2);
@@ -969,11 +969,12 @@ fn uppercase_delete_keeps_data_while_another_placement_references_it() {
     feed(&mut term, b"\x1b_Ga=p,i=40,c=4,r=1\x1b\\"); // a second placement of the same image
     assert_eq!(term.visible_placements().len(), 2);
 
-    // `d=Y` (uppercase) deletes the placements crossing viewport row 9 — only the row-8 one.
+    // `d=Y` (uppercase) deletes the placements crossing viewport row 9 — only the row-8 one,
+    // and with neither `i` nor `I` in the frame it answers nothing.
     recorder.take();
     feed(&mut term, b"\x1b_Ga=d,d=Y,y=9\x1b\\");
     let events = recorder.take();
-    assert!(writes_of(&events).contains("OK"));
+    assert_eq!(writes_of(&events), "");
     assert_eq!(term.visible_placements().len(), 1);
     assert!(
         released_of(&events).is_empty(),
@@ -1337,4 +1338,96 @@ fn image_lifecycle_balances_across_mixed_operations() {
         assert!(released_of(&events).is_empty(), "seed {seed}: nothing releases with it");
         assert_eq!(term.visible_placements().len(), 1, "seed {seed}: the new image is visible");
     }
+}
+
+#[test]
+fn delete_selectors_require_one_based_coordinates() {
+    // `d=p`/`d=q`/`d=x` (and their uppercase forms) name viewport cells with 1-based
+    // coordinates: a missing or zero `x`/`y` is refused with EINVAL instead of subtracting
+    // through zero, which panicked in debug builds on thirteen remote bytes.
+    let (mut term, recorder) = term(10, 5);
+    feed(&mut term, &transmit(1, "f=24", Some((1, 1)), &rgb(1, 1), "")); // at (0, 0)
+    let key = recorder.received()[0].0;
+
+    feed(&mut term, b"\x1b_Ga=d,d=p,i=1\x1b\\"); // no coordinates at all
+    assert_eq!(recorder.writes(), "\x1b_Gi=1;EINVAL:invalid control data\x1b\\");
+    feed(&mut term, b"\x1b_Ga=d,d=q,i=1,x=0,y=2\x1b\\"); // a zero column
+    assert_eq!(recorder.writes(), "\x1b_Gi=1;EINVAL:invalid control data\x1b\\");
+    feed(&mut term, b"\x1b_Ga=d,d=P,i=1,x=3,y=0\x1b\\"); // uppercase form, zero row
+    assert_eq!(recorder.writes(), "\x1b_Gi=1;EINVAL:invalid control data\x1b\\");
+
+    // `d=x` needs its column the same way; with no id or number to echo the refusal is
+    // silent (see `reply_without_image_or_number_is_silent`).
+    feed(&mut term, b"\x1b_Ga=d,d=x\x1b\\");
+    assert_eq!(recorder.writes(), "");
+
+    // The refusals deleted nothing; a well-addressed delete still works. `d=X` frees the
+    // stored image as well as the placement, and answers nothing (no id, no number).
+    assert_eq!(term.visible_placements().len(), 1);
+    feed(&mut term, b"\x1b_Ga=d,d=X,x=1\x1b\\");
+    let events = recorder.take();
+    assert_eq!(writes_of(&events), "");
+    assert!(term.visible_placements().is_empty());
+    assert_eq!(released_of(&events), vec![key]);
+}
+
+#[test]
+fn reply_without_image_or_number_is_silent() {
+    // The protocol ties acknowledgements to the image id: a client that sends neither `i` nor
+    // `I` does not read a reply, and writing one anyway puts bytes in the program's stdin —
+    // or, after it exits, at the shell prompt.
+    let (mut term, recorder) = term(10, 5);
+    feed(&mut term, b"\x1b_Ga=T,f=24,s=1,v=1;AQID\x1b\\");
+    let events = recorder.take();
+    assert_eq!(received_of(&events).len(), 1, "the image itself is still received");
+    assert_eq!(term.visible_placements().len(), 1, "and still placed");
+    assert_eq!(writes_of(&events), "", "nothing goes back to the pty");
+
+    // A refusal with neither travels too: the parser's EINVAL for a coordinate-less delete
+    // has no id to echo and says nothing (see `delete_selectors_require_one_based_coordinates`
+    // for the id-carrying cases).
+    feed(&mut term, b"\x1b_Ga=d,d=q\x1b\\");
+    assert_eq!(recorder.writes(), "");
+}
+
+#[test]
+fn transmission_replies_carry_the_placement_id() {
+    // `a=T,i=7,p=3` answers `i=7,p=3;OK`: the placement id belongs in the answer. Raw pixels
+    // are answered at once; an encoded transmission's pending reply carries it to
+    // `image_decoded`, which flushes it.
+    let (mut term, recorder) = term(10, 5);
+
+    feed(&mut term, &transmit(7, "f=24", Some((1, 1)), &rgb(1, 1), ",p=3"));
+    let events = recorder.take();
+    assert_eq!(received_of(&events).len(), 1);
+    assert_eq!(writes_of(&events), "\x1b_Gi=7,p=3;OK\x1b\\");
+
+    let seq = format!("\x1b_Ga=T,i=8,f=100,p=2,m=0;{}\x1b\\", STANDARD.encode(PNG_1X1));
+    feed(&mut term, seq.as_bytes());
+    let events = recorder.take();
+    let key = received_of(&events)[0].0;
+    assert!(writes_of(&events).is_empty(), "the reply waits on the decode result");
+    term.image_decoded(key, Ok(()));
+    assert_eq!(recorder.writes(), "\x1b_Gi=8,p=2;OK\x1b\\");
+}
+
+#[test]
+fn number_only_transmission_gets_an_id_it_can_place_by() {
+    // The protocol has the terminal assign an id when a client transmits by number alone, and
+    // answer `i=<new>,I=<n>`. Without an assigned id such an image cannot back a virtual
+    // placement either: `a=p` needs an id.
+    let (mut term, recorder) = term(10, 5);
+    let seq = format!("\x1b_Ga=T,I=13,f=24,s=1,v=1;{}\x1b\\", STANDARD.encode(rgb(1, 1)));
+    feed(&mut term, seq.as_bytes());
+
+    let events = recorder.take();
+    assert_eq!(received_of(&events).len(), 1);
+    assert_eq!(writes_of(&events), "\x1b_Gi=1,I=13;OK\x1b\\", "the terminal assigns the id");
+
+    // The assigned id resolves: a virtual placement by it lands, and `kitty_virtual_image`
+    // finds the image behind it.
+    feed(&mut term, b"\x1b_Ga=p,i=1,U=1\x1b\\");
+    assert_eq!(writes_of(&recorder.take()), "\x1b_Gi=1;OK\x1b\\");
+    let resolved = term.kitty_virtual_image(1, None).expect("the number-named image places by id");
+    assert_eq!(resolved.2, 1, "the virtual placement spans one cell");
 }

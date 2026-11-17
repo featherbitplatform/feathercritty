@@ -123,9 +123,10 @@ pub struct KittyReject {
 /// Builds a graphics protocol response frame: `ESC _ G i=<id>[,I=<number>][,p=<pid>]
 /// ; OK|<ECODE>:<message> ESC \`. When the client addressed an image by number the terminal
 /// answers with the id it assigned *and* echoes the number (`i=99,I=13` for `I=13`). A placement
-/// id only travels with an image id (the protocol ignores placement ids on images without one),
-/// and nothing is echoed for an unnamed, unnumbered image. `q=1` suppresses the OK answer, `q=2`
-/// suppresses every answer; failures survive `q=1`.
+/// id only travels with an image id (the protocol ignores placement ids on images without one).
+/// The protocol ties acknowledgements to an image id: a command naming neither `i` nor `I` gets
+/// no answer at all — such clients do not read one, and the bytes would land in the program's
+/// stdin. `q=1` suppresses the OK answer, `q=2` suppresses every answer; failures survive `q=1`.
 pub fn reply(
     id: u32,
     number: Option<u32>,
@@ -135,6 +136,10 @@ pub fn reply(
 ) -> Option<Vec<u8>> {
     let ok = result.is_ok();
     if quiet >= 2 || (quiet == 1 && ok) {
+        return None;
+    }
+    // feathercritty: nothing to acknowledge when the command names no image. Not upstream.
+    if id == 0 && number.is_none() {
         return None;
     }
     let mut out = Vec::with_capacity(64);
@@ -711,6 +716,19 @@ impl KittyParser {
                     self.pending = None;
                     self.b64.reset();
                     let selector = keys.d.unwrap_or(b'a');
+                    // feathercritty: `d=p`/`d=q` name a cell and `d=x` a column with 1-based
+                    // coordinates, so a missing or zero side is refused here instead of being
+                    // subtracted through zero downstream (a debug-build panic on thirteen
+                    // remote bytes). Not upstream.
+                    let bad_coordinates = match selector.to_ascii_lowercase() {
+                        b'p' | b'q' => keys.x.unwrap_or(0) == 0 || keys.y.unwrap_or(0) == 0,
+                        b'x' => keys.x.unwrap_or(0) == 0,
+                        _ => false,
+                    };
+                    if bad_coordinates {
+                        self.reject_once(keys, KittyError::EINVAL);
+                        return None;
+                    }
                     let target = match selector.to_ascii_lowercase() {
                         b'a' => DeleteTarget::All,
                         b'i' => DeleteTarget::ImageId { image: keys.i, placement: keys.p },
@@ -981,8 +999,9 @@ fn plan_transmit(keys: &Keys) -> Result<(), KittyError> {
                 (Some(w), Some(h)) if w > 0 && h > 0 => (w, h),
                 _ => return Err(KittyError::EINVAL), // raw data needs its dimensions
             };
-            let bpp = if keys.f == Some(24) { 3 } else { 4 };
-            checked_size(w, h, bpp)?;
+            // feathercritty: `f=24` is expanded to RGBA before the host sees it, so the cap
+            // counts four bytes per pixel for every raw format. Not upstream.
+            checked_size(w, h, 4)?;
         },
         Some(8 | 16) => return Err(KittyError::ENOTSUPPORTED),
         Some(100) | None => {},
@@ -1028,7 +1047,9 @@ fn resolve_format(
     let (Some(w), Some(h)) = (width_hint.filter(|w| *w > 0), height_hint.filter(|h| *h > 0)) else {
         return Err(KittyError::EINVAL); // raw data needs its dimensions
     };
-    checked_size(w, h, bpp)?;
+    // feathercritty: the cap is measured as RGBA even for `f=24`, whose pixels expand to it;
+    // the payload itself is still checked against the format's true size. Not upstream.
+    checked_size(w, h, 4)?;
     let expected = u64::from(w) * u64::from(h) * bpp;
     if out.len() as u64 != expected {
         return Err(KittyError::EINVAL); // short or long pixel data

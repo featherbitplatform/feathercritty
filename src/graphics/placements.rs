@@ -406,6 +406,13 @@ impl PlacementTable {
             .or_else(|| number.and_then(|n| self.numbers.get(&n).copied()))
     }
 
+    /// The smallest nonzero image id no stored image holds. A transmission addressed only by
+    /// number is assigned one: the protocol has the terminal pick an id and answer it, and a
+    /// scanned map of at most `MAX_STORED_IMAGES` entries makes the search trivial.
+    pub fn next_unused_id(&self) -> u32 {
+        (1..=u32::MAX).find(|id| !self.ids.contains_key(id)).unwrap_or(u32::MAX)
+    }
+
     /// The pixel size stored for `key`.
     pub fn image_size(&self, key: ImageKey) -> Option<(u32, u32)> {
         self.images.get(&key).map(|i| (i.width_px, i.height_px))

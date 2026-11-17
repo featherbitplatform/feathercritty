@@ -989,11 +989,19 @@ impl<T> Term<T> {
                     | kitty::KittyFormat::Rgb { width, height }
                     | kitty::KittyFormat::Rgba { width, height } => (width, height),
                 };
-                let echo = id.unwrap_or(0);
+                // feathercritty: a transmission addressed only by number gets an id assigned —
+                // the protocol has the terminal pick one and answer it, and without one the
+                // image could never be placed by id (`a=p`, `U=1`). Not upstream.
+                let assigned =
+                    (id.is_none() && number.is_some()).then(|| self.placements.next_unused_id());
+                let kitty_id = id.or(assigned);
+                let echo = kitty_id.unwrap_or(0);
                 // The reply waits on the decode result: raw pixels are already decoded here and
-                // answered at once; encoded data is answered by `image_decoded`.
-                let pending_reply = Some((echo, number, None, quiet));
-                match self.placements.new_image(id, number, width, height, pending_reply) {
+                // answered at once; encoded data is answered by `image_decoded`. It echoes the
+                // placement id an `a=T` frame carried.
+                let place_pid = then_place.as_ref().and_then(|place| place.placement_id);
+                let pending_reply = Some((echo, number, place_pid, quiet));
+                match self.placements.new_image(kitty_id, number, width, height, pending_reply) {
                     Ok((key, events)) => {
                         self.send_image_events(events);
                         let data = match format {
@@ -1015,7 +1023,7 @@ impl<T> Term<T> {
                         // Display is attempted before the answer goes out, so a failed placement
                         // can report its own error instead of `OK`.
                         let placed = match &then_place {
-                            Some(place) => self.place_kitty_image(key, id, place, false),
+                            Some(place) => self.place_kitty_image(key, kitty_id, place, false),
                             None => Ok(()),
                         };
                         match (decoded_here, &placed) {
@@ -1031,7 +1039,7 @@ impl<T> Term<T> {
                             (false, Ok(())) => {}, // the PNG reply waits for `image_decoded`
                         }
                     },
-                    Err(error) => self.send_kitty_reply(echo, number, None, Err(error), quiet),
+                    Err(error) => self.send_kitty_reply(echo, number, place_pid, Err(error), quiet),
                 }
             },
             kitty::KittyCommand::Place(place) => {
@@ -1117,10 +1125,12 @@ impl<T> Term<T> {
             },
             kitty::DeleteTarget::Cell { x, y } => {
                 let stable = view_top + i64::from(y.saturating_sub(1));
+                // feathercritty: saturating — the parser refuses zero coordinates for these
+                // selectors now, and an unchecked subtraction here would panic in debug builds.
                 let found = self.placements.delete_covering(
                     screen,
                     stable,
-                    (x - 1) as usize,
+                    x.saturating_sub(1) as usize,
                     None,
                     free,
                     &mut events,
@@ -1132,7 +1142,7 @@ impl<T> Term<T> {
                 let found = self.placements.delete_covering(
                     screen,
                     stable,
-                    (x - 1) as usize,
+                    x.saturating_sub(1) as usize,
                     Some(z),
                     free,
                     &mut events,
@@ -1140,8 +1150,12 @@ impl<T> Term<T> {
                 DeleteReply::none(found)
             },
             kitty::DeleteTarget::Column(x) => {
-                let found =
-                    self.placements.delete_column(screen, (x - 1) as usize, free, &mut events);
+                let found = self.placements.delete_column(
+                    screen,
+                    x.saturating_sub(1) as usize,
+                    free,
+                    &mut events,
+                );
                 DeleteReply::none(found)
             },
             kitty::DeleteTarget::Row(y) => {
@@ -5904,13 +5918,13 @@ mod tests {
             feed(&mut term, b"\x1b_Ga=p,i=3\x1b\\");
             assert_eq!(host.writes(), enotsupported(3));
             feed(&mut term, b"\x1b_Ga=d,d=a\x1b\\");
-            assert_eq!(host.writes(), enotsupported(0));
+            assert_eq!(host.writes(), "", "a delete with neither id nor number answers nothing");
 
             // A frame the parser refuses is refused as unsupported too — off, that is the only
             // graphics answer this terminal gives. The quiet level still applies: `a=f` (animation)
             // is refused at dispatch, after its `q` was read.
             feed(&mut term, b"\x1b_Ga=x\x1b\\"); // an action the protocol does not define
-            assert_eq!(host.writes(), enotsupported(0));
+            assert_eq!(host.writes(), "", "and with no id or number even that answers nothing");
             feed(&mut term, b"\x1b_Ga=f,i=8,q=2\x1b\\");
             assert_eq!(host.writes(), "", "q=2 suppresses the answer as it always did");
 
