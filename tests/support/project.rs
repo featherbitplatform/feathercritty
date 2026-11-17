@@ -4,11 +4,23 @@
 
 use std::fmt::Write as _;
 
-use feathercritty::vte::ansi::Color;
 use rand::Rng;
 use rand::seq::SliceRandom;
 
 use super::{Pt, SelTy};
+
+/// A cell color, comparable across crates.
+///
+/// The differential harness projects each crate's `vte::ansi::Color`. feathercritty vendors its own
+/// copy of the parser, so its `Color` is a distinct type from 0.26.0's; both enums are
+/// byte-identical copies of vte 0.15.0 with the same variants and discriminants, so they project to
+/// the same value here (named colors by their discriminant, which is what a color list index uses).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorP {
+    Named(usize),
+    Indexed(u8),
+    Spec([u8; 3]),
+}
 
 /// A hyperlink, comparable across crates.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,11 +39,11 @@ pub struct LinkP {
 pub struct CellP {
     pub c: char,
     pub zerowidth: Vec<char>,
-    pub fg: Color,
-    pub bg: Color,
+    pub fg: ColorP,
+    pub bg: ColorP,
     /// `Flags::bits()`.
     pub flags: u16,
-    pub underline_color: Option<Color>,
+    pub underline_color: Option<ColorP>,
     pub link: Option<Box<LinkP>>,
 }
 

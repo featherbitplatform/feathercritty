@@ -2,8 +2,10 @@
 
 //! Exports the `Term` type which is a high-level API for the Grid.
 
+use std::collections::HashMap;
 use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
+use std::time::Instant;
 use std::{cmp, mem, ptr, slice, str};
 
 #[cfg(feature = "serde")]
@@ -15,7 +17,8 @@ use bitflags::bitflags;
 use log::{debug, trace};
 use unicode_width::UnicodeWidthChar;
 
-use crate::event::{Event, EventListener};
+use crate::event::{Event, EventListener, ImageData, ImageDecodeError, ImageKey};
+use crate::graphics::{inline, kitty, limits, placements, sixel};
 use crate::grid::{Dimensions, Done, Grid, GridIterator, Job, PlainText, RowReader, Scroll};
 use crate::index::{self, Boundary, Column, Direction, Line, Point, Side};
 use crate::selection::{Selection, SelectionRange, SelectionType};
@@ -83,6 +86,8 @@ bitflags! {
         const REPORT_ASSOCIATED_TEXT  = 1 << 22;
         // feathercritty: DEC private mode 2027, grapheme clusters in one cell; not upstream.
         const GRAPHEME_CLUSTER        = 1 << 23;
+        // feathercritty: DEC private mode 80 (DECSDM), sixel images at the cursor; not upstream.
+        const DECSDM                  = 1 << 24;
         const MOUSE_MODE              = Self::MOUSE_REPORT_CLICK.bits() | Self::MOUSE_MOTION.bits() | Self::MOUSE_DRAG.bits();
         const KITTY_KEYBOARD_PROTOCOL = Self::DISAMBIGUATE_ESC_CODES.bits()
                                       | Self::REPORT_EVENT_TYPES.bits()
@@ -331,6 +336,32 @@ pub struct Term<T> {
     /// Information about damaged cells.
     damage: TermDamageState,
 
+    // feathercritty: graphics protocol state (placements, parsers); not upstream.
+    /// Image placements, kitty ids and scrollback placeholders.
+    placements: placements::PlacementTable,
+
+    /// The kitty graphics protocol parser, fed by the APC callbacks.
+    kitty_parser: kitty::KittyParser,
+
+    /// The sixel canvas the current DCS `q` sequence is drawing, if one is in progress.
+    sixel_decoder: Option<sixel::SixelDecoder>,
+
+    /// The OSC 1337 inline image being read, if one is in progress.
+    inline_parser: inline::InlineImageParser,
+
+    /// Placement events produced where the terminal has no `EventListener` bound (`resize`);
+    /// sent by the next bounded operation ([`flush_image_events`](Self::flush_image_events)).
+    pending_image_events: Vec<Event>,
+
+    /// Whether images are supported at all ([`set_images_enabled`](Self::set_images_enabled), on
+    /// by default). Off, no sequence stores or displays anything and the support reports say so.
+    images_enabled: bool,
+
+    /// Whether [`set_cell_pixel_size`](Self::set_cell_pixel_size) has been called: until it has,
+    /// the pixel size reports (`CSI 14 t`, `CSI 16 t`) ask the host through
+    /// [`Event::TextAreaSizeRequest`] instead of answering from the grid.
+    cell_size_known: bool,
+
     /// Config directly for the terminal.
     config: Config,
 }
@@ -495,6 +526,13 @@ impl<T> Term<T> {
             scroll_region,
             event_proxy,
             damage,
+            placements: Default::default(),
+            kitty_parser: Default::default(),
+            sixel_decoder: None,
+            inline_parser: Default::default(),
+            pending_image_events: Vec::new(),
+            images_enabled: true,
+            cell_size_known: false,
             config,
             grid,
             tabs,
@@ -593,6 +631,20 @@ impl<T> Term<T> {
             self.inactive_grid.update_history(self.config.scrolling_history);
         } else {
             self.grid.update_history(self.config.scrolling_history);
+        }
+
+        // feathercritty: a smaller history may have made scrollback placements unreachable; they
+        // go now. Not upstream.
+        if !self.placements.is_empty() {
+            let mut events = Vec::new();
+            let (active, inactive) = self.screen_pair();
+            self.placements.prune_out_of_view(self.grid_window(&self.grid), active, &mut events);
+            self.placements.prune_out_of_view(
+                self.grid_window(&self.inactive_grid),
+                inactive,
+                &mut events,
+            );
+            self.send_image_events(events);
         }
 
         // feathercritty: history compression, on both grids (the alternate one has a history
@@ -806,6 +858,767 @@ impl<T> Term<T> {
         text
     }
 
+    // --- graphics (feathercritty; not upstream) ---------------------------------------------
+
+    /// The [`placements::Screen`] the visible grid is, and the one `inactive_grid` holds.
+    #[inline]
+    fn screen_pair(&self) -> (placements::Screen, placements::Screen) {
+        if self.mode.contains(TermMode::ALT_SCREEN) {
+            (placements::Screen::Alternate, placements::Screen::Primary)
+        } else {
+            (placements::Screen::Primary, placements::Screen::Alternate)
+        }
+    }
+
+    /// The screen currently shown: the one new placements belong to.
+    #[inline]
+    fn active_screen(&self) -> placements::Screen {
+        self.screen_pair().0
+    }
+
+    /// The numbers [`placements::GridWindow`] translates placement lines with, read from `grid`.
+    #[inline]
+    fn grid_window(&self, grid: &Grid<crate::term::cell::Cell>) -> placements::GridWindow {
+        placements::GridWindow {
+            stable: grid.scrolled_lines(),
+            lines: grid.screen_lines(),
+            history: grid.history_size(),
+        }
+    }
+
+    /// Hand placement-table events to the embedder.
+    fn send_image_events(&mut self, events: Vec<Event>)
+    where
+        T: EventListener,
+    {
+        for event in events {
+            self.event_proxy.send_event(event);
+        }
+    }
+
+    /// Park events generated where no `EventListener` bound exists (`resize`); the next bounded
+    /// operation sends them.
+    fn queue_image_events(&mut self, events: Vec<Event>) {
+        self.pending_image_events.extend(events);
+    }
+
+    /// Send what [`queue_image_events`](Self::queue_image_events) parked, preserving order.
+    fn flush_image_events(&mut self)
+    where
+        T: EventListener,
+    {
+        if !self.pending_image_events.is_empty() {
+            let pending = mem::take(&mut self.pending_image_events);
+            for event in pending {
+                self.event_proxy.send_event(event);
+            }
+        }
+    }
+
+    /// Answer a sequence the kitty parser rejected, unless its quiet level suppresses it.
+    ///
+    /// With image support off the answer becomes `ENOTSUPPORTED`: off, "not supported" is the only
+    /// graphics answer this terminal gives, so a frame that would have been refused for a narrower
+    /// reason (a bad key, a file medium, a stalled upload) is refused as unsupported instead.
+    fn drain_kitty_reject(&mut self)
+    where
+        T: EventListener,
+    {
+        if let Some(reject) = self.kitty_parser.take_reject() {
+            let error =
+                if self.images_enabled { reject.error } else { kitty::KittyError::ENOTSUPPORTED };
+            self.send_kitty_reply(reject.id, reject.number, None, Err(error), reject.quiet);
+        }
+    }
+
+    /// Send one graphics protocol response frame (`None` result is `OK`).
+    fn send_kitty_reply(
+        &mut self,
+        id: u32,
+        number: Option<u32>,
+        placement: Option<u32>,
+        result: Result<(), kitty::KittyError>,
+        quiet: u8,
+    ) where
+        T: EventListener,
+    {
+        if let Some(reply) = kitty::reply(id, number, placement, result, quiet) {
+            let text = String::from_utf8_lossy(&reply).into_owned();
+            self.event_proxy.send_event(Event::PtyWrite(text));
+        }
+    }
+
+    /// Act on one completed graphics sequence: transmit, place, delete or the support query.
+    ///
+    /// With image support off ([`set_images_enabled`](Self::set_images_enabled)) nothing is stored
+    /// or displayed and every frame gets the protocol's "not supported" answer instead.
+    fn handle_kitty_command(&mut self, command: kitty::KittyCommand)
+    where
+        T: EventListener,
+    {
+        // feathercritty: off, the payload goes unused; only the answer remains (the quiet level
+        // still suppresses it). Not upstream.
+        if !self.images_enabled {
+            let (id, number, placement, quiet) = match &command {
+                kitty::KittyCommand::Transmit { id, number, quiet, .. } => {
+                    (id.unwrap_or(0), *number, None, *quiet)
+                },
+                kitty::KittyCommand::Place(place) => {
+                    (place.id.unwrap_or(0), place.number, place.placement_id, place.quiet)
+                },
+                kitty::KittyCommand::Delete(delete) => match delete.target {
+                    kitty::DeleteTarget::ImageId { image, placement } => {
+                        (image.unwrap_or(0), None, placement, delete.quiet)
+                    },
+                    kitty::DeleteTarget::Number { number, placement } => {
+                        (0, number, placement, delete.quiet)
+                    },
+                    _ => (0, None, None, delete.quiet),
+                },
+                kitty::KittyCommand::Query { id, quiet } => (*id, None, None, *quiet),
+            };
+            let error = Err(kitty::KittyError::ENOTSUPPORTED);
+            self.send_kitty_reply(id, number, placement, error, quiet);
+            return;
+        }
+
+        match command {
+            kitty::KittyCommand::Transmit { id, number, format, bytes, then_place, quiet } => {
+                let (width, height) = match format {
+                    kitty::KittyFormat::Png { width, height }
+                    | kitty::KittyFormat::Rgb { width, height }
+                    | kitty::KittyFormat::Rgba { width, height } => (width, height),
+                };
+                // feathercritty: a transmission addressed only by number gets an id assigned —
+                // the protocol has the terminal pick one and answer it, and without one the
+                // image could never be placed by id (`a=p`, `U=1`). Not upstream.
+                let assigned =
+                    (id.is_none() && number.is_some()).then(|| self.placements.next_unused_id());
+                let kitty_id = id.or(assigned);
+                let echo = kitty_id.unwrap_or(0);
+                // The reply waits on the decode result: raw pixels are already decoded here and
+                // answered at once; encoded data is answered by `image_decoded`. It echoes the
+                // placement id an `a=T` frame carried.
+                let place_pid = then_place.as_ref().and_then(|place| place.placement_id);
+                let pending_reply = Some((echo, number, place_pid, quiet));
+                match self.placements.new_image(kitty_id, number, width, height, pending_reply) {
+                    Ok((key, events)) => {
+                        self.send_image_events(events);
+                        let data = match format {
+                            kitty::KittyFormat::Png { .. } => ImageData::Encoded {
+                                format: crate::event::ImageFormat::Png,
+                                bytes,
+                                width,
+                                height,
+                            },
+                            kitty::KittyFormat::Rgb { .. } => {
+                                ImageData::Rgba { width, height, pixels: rgb_to_rgba(&bytes) }
+                            },
+                            kitty::KittyFormat::Rgba { .. } => {
+                                ImageData::Rgba { width, height, pixels: bytes }
+                            },
+                        };
+                        let decoded_here = !matches!(format, kitty::KittyFormat::Png { .. });
+                        self.event_proxy.send_event(Event::ImageReceived { key, data });
+                        // Display is attempted before the answer goes out, so a failed placement
+                        // can report its own error instead of `OK`.
+                        let placed = match &then_place {
+                            Some(place) => self.place_kitty_image(key, kitty_id, place, false),
+                            None => Ok(()),
+                        };
+                        match (decoded_here, &placed) {
+                            (true, Ok(())) => {
+                                // Raw pixels need no work from the embedder: answer now.
+                                let events = self.placements.image_decoded(key, Ok(()));
+                                self.send_image_events(events);
+                            },
+                            (_, Err(error)) => {
+                                let events = self.placements.fail_pending(key, *error);
+                                self.send_image_events(events);
+                            },
+                            (false, Ok(())) => {}, // the PNG reply waits for `image_decoded`
+                        }
+                    },
+                    Err(error) => self.send_kitty_reply(echo, number, place_pid, Err(error), quiet),
+                }
+            },
+            kitty::KittyCommand::Place(place) => {
+                match self.placements.resolve(place.id, place.number) {
+                    Some(key) => {
+                        let _ = self.place_kitty_image(key, place.id, &place, true);
+                    },
+                    None => self.send_kitty_reply(
+                        place.id.unwrap_or(0),
+                        place.number,
+                        place.placement_id,
+                        Err(kitty::KittyError::ENOENT),
+                        place.quiet,
+                    ),
+                }
+            },
+            kitty::KittyCommand::Delete(delete) => {
+                let (events, reply_to) = self.handle_kitty_delete(&delete);
+                self.send_image_events(events);
+                let result = if reply_to.found { Ok(()) } else { Err(kitty::KittyError::ENOENT) };
+                self.send_kitty_reply(
+                    reply_to.id,
+                    reply_to.number,
+                    reply_to.placement,
+                    result,
+                    delete.quiet,
+                );
+            },
+            // The support query: `OK` unless a host turned image support off.
+            kitty::KittyCommand::Query { id, quiet } => {
+                self.send_kitty_reply(id, None, None, Ok(()), quiet);
+            },
+        }
+    }
+
+    /// Run one `a=d` selector against the placement table; returns the events and what a reply
+    /// should echo.
+    fn handle_kitty_delete(&mut self, delete: &kitty::KittyDelete) -> (Vec<Event>, DeleteReply) {
+        let screen = self.active_screen();
+        let window = self.grid_window(&self.grid);
+        let offset = self.grid.display_offset() as i64;
+        // `d=p`/`d=q`/`d=x`/`d=y` address viewport cells, 1-based; the view's top row is this
+        // stable.
+        let view_top = window.stable - offset;
+        let free = delete.free_data;
+        let mut events = Vec::new();
+        let reply_to = match delete.target {
+            kitty::DeleteTarget::All => {
+                let found = self.placements.delete_all_in_view(
+                    window,
+                    screen,
+                    self.grid.display_offset(),
+                    free,
+                    &mut events,
+                );
+                DeleteReply::none(found)
+            },
+            kitty::DeleteTarget::ImageId { image, placement } => {
+                let found =
+                    image.and_then(|image| self.placements.resolve(Some(image), None)).is_some_and(
+                        |key| self.placements.delete_image(key, placement, free, &mut events),
+                    );
+                DeleteReply { id: image.unwrap_or(0), number: None, placement, found }
+            },
+            kitty::DeleteTarget::Number { number, placement } => {
+                let found = number.is_some_and(|number| {
+                    self.placements.delete_number(number, placement, free, &mut events)
+                });
+                DeleteReply { id: 0, number, placement, found }
+            },
+            kitty::DeleteTarget::CursorCells => {
+                let point = self.grid.cursor.point;
+                let stable = window.stable + i64::from(point.line.0);
+                let found = self.placements.delete_covering(
+                    screen,
+                    stable,
+                    point.column.0,
+                    None,
+                    free,
+                    &mut events,
+                );
+                DeleteReply::none(found)
+            },
+            kitty::DeleteTarget::Cell { x, y } => {
+                let stable = view_top + i64::from(y.saturating_sub(1));
+                // feathercritty: saturating — the parser refuses zero coordinates for these
+                // selectors now, and an unchecked subtraction here would panic in debug builds.
+                let found = self.placements.delete_covering(
+                    screen,
+                    stable,
+                    x.saturating_sub(1) as usize,
+                    None,
+                    free,
+                    &mut events,
+                );
+                DeleteReply::none(found)
+            },
+            kitty::DeleteTarget::CellZ { x, y, z } => {
+                let stable = view_top + i64::from(y.saturating_sub(1));
+                let found = self.placements.delete_covering(
+                    screen,
+                    stable,
+                    x.saturating_sub(1) as usize,
+                    Some(z),
+                    free,
+                    &mut events,
+                );
+                DeleteReply::none(found)
+            },
+            kitty::DeleteTarget::Column(x) => {
+                let found = self.placements.delete_column(
+                    screen,
+                    x.saturating_sub(1) as usize,
+                    free,
+                    &mut events,
+                );
+                DeleteReply::none(found)
+            },
+            kitty::DeleteTarget::Row(y) => {
+                let stable = view_top + i64::from(y.saturating_sub(1));
+                let found = self.placements.delete_row(screen, stable, free, &mut events);
+                DeleteReply::none(found)
+            },
+            kitty::DeleteTarget::ZIndex(z) => {
+                let found = self.placements.delete_z(screen, z, free, &mut events);
+                DeleteReply::none(found)
+            },
+            kitty::DeleteTarget::IdRange { from, to } => {
+                let found = self.placements.delete_id_range(from, to, free, &mut events);
+                DeleteReply::none(found)
+            },
+        };
+        (events, reply_to)
+    }
+
+    /// Display an image the table already has: `U=1` records a virtual placement (no grid entry);
+    /// otherwise the image anchors at the cursor and scrolls to fit like text would.
+    ///
+    /// Returns the protocol outcome for the caller's reply; `reply` says whether this call owns
+    /// the kitty answer (`a=p` does, an `a=T` frame answers through its transmission machinery).
+    fn place_kitty_image(
+        &mut self,
+        key: ImageKey,
+        kitty_id: Option<u32>,
+        place: &kitty::KittyPlace,
+        reply: bool,
+    ) -> Result<(), kitty::KittyError>
+    where
+        T: EventListener,
+    {
+        let echo = place.id.unwrap_or(0);
+        if place.virtual_ {
+            // Placeholder cells reference virtual placements by image id, so one is required.
+            // Over the cap `add_virtual` evicts the oldest; those releases ride out as events.
+            let (created, eviction_events) = kitty_id.map_or((None, Vec::new()), |id| {
+                self.placements.add_virtual(id, key, place.placement_id, place.cols, place.rows)
+            });
+            if !eviction_events.is_empty() {
+                self.queue_image_events(eviction_events);
+            }
+            let result = match created {
+                Some(_) => Ok(()),
+                None => Err(kitty::KittyError::EINVAL),
+            };
+            if reply {
+                self.send_kitty_reply(echo, place.number, place.placement_id, result, place.quiet);
+            }
+            return result;
+        }
+        let Some((width_px, height_px)) = self.placements.image_size(key) else {
+            if reply {
+                self.send_kitty_reply(
+                    echo,
+                    place.number,
+                    place.placement_id,
+                    Err(kitty::KittyError::ENOENT),
+                    place.quiet,
+                );
+            }
+            return Err(kitty::KittyError::ENOENT);
+        };
+        let (cols, rows) = self.placements.span_for(width_px, height_px, place.cols, place.rows);
+        let col = self.grid.cursor.point.column.0;
+        self.make_room(rows);
+        let anchor = self.grid_window(&self.grid).stable + i64::from(self.grid.cursor.point.line.0);
+        match self.placements.place(
+            self.active_screen(),
+            key,
+            anchor,
+            col,
+            cols,
+            rows,
+            place.src,
+            place.x_off,
+            place.y_off,
+            place.z,
+            place.placement_id,
+        ) {
+            Ok(events) => {
+                self.send_image_events(events);
+                if reply {
+                    self.send_kitty_reply(
+                        echo,
+                        place.number,
+                        place.placement_id,
+                        Ok(()),
+                        place.quiet,
+                    );
+                }
+                if place.cursor_movement {
+                    // `C=0`: the cursor lands on the first cell past the image's last row.
+                    self.move_cursor_below_image(col, cols, rows, true);
+                }
+                Ok(())
+            },
+            Err(placements::PlaceError::NotFound) => {
+                if reply {
+                    self.send_kitty_reply(
+                        echo,
+                        place.number,
+                        place.placement_id,
+                        Err(kitty::KittyError::ENOENT),
+                        place.quiet,
+                    );
+                }
+                Err(kitty::KittyError::ENOENT)
+            },
+            Err(placements::PlaceError::Full) => {
+                // Nothing could be evicted to make room; the image stays stored (a standalone
+                // `a=p` leaves it so), and the caller answers ENOMEM.
+                if reply {
+                    self.send_kitty_reply(
+                        echo,
+                        place.number,
+                        place.placement_id,
+                        Err(kitty::KittyError::ENOMEM),
+                        place.quiet,
+                    );
+                }
+                Err(kitty::KittyError::ENOMEM)
+            },
+        }
+    }
+
+    /// Scroll the screen so an image of `rows` lines starting at the cursor line fits. Only a
+    /// full-screen scroll region scrolls; inside a partial region the display is clipped at the
+    /// region's bottom edge instead. When it does scroll, the cursor moves up with the content
+    /// that rode through the rotation (clamped to the region top): the image's rows behave like
+    /// `rows` newlines, so its anchor — taken from the cursor right after this call — lands on
+    /// the line its content ends up on instead of staying at the viewport bottom while its
+    /// earlier rows scroll into history for nothing.
+    fn make_room(&mut self, rows: u32)
+    where
+        T: EventListener,
+    {
+        let overflow = i64::from(self.grid.cursor.point.line.0) + i64::from(rows)
+            - i64::from(self.scroll_region.end.0);
+        let full_region = self.scroll_region.start == Line(0)
+            && self.scroll_region.end.0 as usize == self.screen_lines();
+        if overflow > 0 && full_region {
+            self.scroll_up_relative(Line(0), overflow as usize);
+
+            // feathercritty: the cursor rides up with its line, exactly as a newline would
+            // carry it when the screen scrolls under it. Not upstream.
+            self.damage_cursor();
+            let line = cmp::max(
+                self.grid.cursor.point.line.0 - overflow as i32,
+                self.scroll_region.start.0,
+            );
+            self.grid.cursor.point.line = Line(line);
+            self.damage_cursor();
+        }
+    }
+
+    /// The DECSDM-off sixel/inline rule puts the cursor on the line *below* the image. When
+    /// the image's last row is the scroll region's bottom — the usual case at a prompt, where
+    /// `make_room` scrolled to fit it — that line does not exist yet: scroll one more row, as
+    /// the newline this placement stands in for would, so the cursor really ends below the
+    /// image as it does mid-screen. The image's last row is its region bottom exactly when the
+    /// cursor (left on the image's first row by `make_room`) plus `rows` names the row one
+    /// past the region. Only a full-screen region scrolls, matching `make_room`.
+    fn scroll_for_cursor_below_image(&mut self, rows: u32)
+    where
+        T: EventListener,
+    {
+        let full_region = self.scroll_region.start == Line(0)
+            && self.scroll_region.end.0 as usize == self.screen_lines();
+        if !full_region
+            || i64::from(self.grid.cursor.point.line.0) + i64::from(rows)
+                != i64::from(self.scroll_region.end.0)
+        {
+            return;
+        }
+        self.scroll_up_relative(Line(0), 1);
+        self.damage_cursor();
+        self.grid.cursor.point.line =
+            cmp::max(self.grid.cursor.point.line - 1, self.scroll_region.start);
+        self.damage_cursor();
+    }
+
+    /// Move the cursor past an image placed at viewport column `col` spanning `rows` lines.
+    ///
+    /// `advance_column` is the kitty rule (`C=0`: last row of the image, one cell past its last
+    /// column, wrapping onto the next line); without it the cursor goes one line below the image in
+    /// the same column — the DECSDM-off sixel and inline rule. Both clamp to the scroll region's
+    /// bottom line.
+    fn move_cursor_below_image(&mut self, col: usize, cols: u32, rows: u32, advance_column: bool) {
+        // Arithmetic in i64 clamped to the scroll region's bottom line: a span request that
+        // outgrows an i32 (a hostile `r`/`c` before placement clamps it) must not wrap negative.
+        let bottom = i64::from(self.scroll_region.end.0 - 1);
+        let below = i64::from(if advance_column { rows.saturating_sub(1) } else { rows });
+        let mut line = (i64::from(self.grid.cursor.point.line.0) + below).clamp(0, bottom);
+        let col = if advance_column {
+            let columns = self.columns();
+            let col = col.saturating_add(cols as usize);
+            if col >= columns {
+                line = (line + 1).min(bottom);
+                col - columns
+            } else {
+                col
+            }
+        } else {
+            col
+        };
+        self.damage_cursor();
+        self.grid.cursor.point = Point::new(Line(line as i32), Column(col.min(self.columns() - 1)));
+        self.grid.cursor.input_needs_wrap = false;
+        self.damage_cursor();
+    }
+
+    /// Display a decoded sixel at the cursor. With DECSDM off (the default) the cursor ends below
+    /// the image in the same column, as the standard specifies; set leaves it where it was.
+    fn place_sixel(&mut self, image: sixel::SixelImage)
+    where
+        T: EventListener,
+    {
+        let (width, height) = (image.width, image.height);
+        let Ok((key, events)) = self.placements.new_image(None, None, width, height, None) else {
+            return; // no reply pending means the decode cap cannot trip; the image cap evicts first
+        };
+        self.send_image_events(events);
+        let data = ImageData::Rgba { width, height, pixels: image.rgba };
+        self.event_proxy.send_event(Event::ImageReceived { key, data });
+        let Some((cols, rows)) = self.placements.image_span(key) else { return };
+        let col = self.grid.cursor.point.column.0;
+        self.make_room(rows);
+        let anchor = self.grid_window(&self.grid).stable + i64::from(self.grid.cursor.point.line.0);
+        match self.placements.place(
+            self.active_screen(),
+            key,
+            anchor,
+            col,
+            cols,
+            rows,
+            None,
+            0,
+            0,
+            0,
+            None,
+        ) {
+            Ok(events) => {
+                self.send_image_events(events);
+                if !self.mode.contains(TermMode::DECSDM) {
+                    self.scroll_for_cursor_below_image(rows);
+                    self.move_cursor_below_image(col, cols, rows, false);
+                }
+            },
+            Err(_) => {
+                // The table is full with nothing to evict; the image goes unused and releases.
+                let events = self.placements.image_decoded(key, Ok(()));
+                self.send_image_events(events);
+            },
+        }
+    }
+
+    /// Display an OSC 1337 inline image at the cursor, sized by its `width`/`height` arguments
+    /// (cells, pixels or a percent of the terminal; `auto` is the image's own pixels divided by the
+    /// cell size) and the DECSDM-off cursor rule.
+    fn place_inline(&mut self, image: inline::InlineImage)
+    where
+        T: EventListener,
+    {
+        let Some(format) = sniff_format(&image.bytes) else { return }; // the parser checked the header already
+        let (width, height) = image.pixel_size;
+        let (cw, ch) = self.placements.cell_pixel_size();
+        let cols_req = inline_cells(image.width, cw, (self.columns() as u64 * cw as u64) as u32);
+        let rows_req =
+            inline_cells(image.height, ch, (self.screen_lines() as u64 * ch as u64) as u32);
+        let Ok((key, events)) = self.placements.new_image(None, None, width, height, None) else {
+            return;
+        };
+        self.send_image_events(events);
+        let data = ImageData::Encoded { format, bytes: image.bytes, width, height };
+        self.event_proxy.send_event(Event::ImageReceived { key, data });
+        // `auto` asks for 0 here, which `span_for` computes from the pixels (keeping the ratio
+        // when only one axis was given); a failed placement releases the unused image.
+        let (cols, rows) = self.placements.span_for(width, height, cols_req, rows_req);
+        let col = self.grid.cursor.point.column.0;
+        self.make_room(rows);
+        let anchor = self.grid_window(&self.grid).stable + i64::from(self.grid.cursor.point.line.0);
+        match self.placements.place(
+            self.active_screen(),
+            key,
+            anchor,
+            col,
+            cols,
+            rows,
+            None,
+            0,
+            0,
+            0,
+            None,
+        ) {
+            Ok(events) => {
+                self.send_image_events(events);
+                if !self.mode.contains(TermMode::DECSDM) {
+                    self.scroll_for_cursor_below_image(rows);
+                    self.move_cursor_below_image(col, cols, rows, false);
+                }
+            },
+            Err(_) => {
+                let events = self.placements.image_decoded(key, Ok(()));
+                self.send_image_events(events);
+            },
+        }
+    }
+
+    /// The text area's extent in physical pixels, `(width, height)`, from the cell size
+    /// [`set_cell_pixel_size`](Self::set_cell_pixel_size) set and the grid's current size
+    /// (feathercritty; not upstream). `u64` so a host with enormous reported metrics cannot
+    /// overflow it.
+    fn text_area_pixels(&self) -> (u64, u64) {
+        let (cell_w, cell_h) = self.placements.cell_pixel_size();
+        (
+            (self.columns() as u64) * u64::from(cell_w),
+            (self.screen_lines() as u64) * u64::from(cell_h),
+        )
+    }
+
+    /// Set the physical pixel size of a text cell (feathercritty; not upstream).
+    ///
+    /// Placements convert pixel sizes to cell spans with this, so hosts that know their font
+    /// metrics should set it before images arrive. Each axis is clamped to at least 1. It is also
+    /// what `CSI 14 t` and `CSI 16 t` report; until it is set those ask the host instead (see
+    /// [`Handler::text_area_size_pixels`](crate::vte::ansi::Handler::text_area_size_pixels)).
+    #[inline]
+    pub fn set_cell_pixel_size(&mut self, width: u32, height: u32) {
+        self.placements.set_cell_pixel_size(width, height);
+        self.cell_size_known = true;
+    }
+
+    /// Whether image support is on (feathercritty; not upstream; on by default).
+    ///
+    /// On, the terminal behaves like one with graphics support: DA1 advertises sixel, XTSMGRAPHICS
+    /// reports the colour registers and the text area's pixel geometry, `CSI 14 t` and `CSI 16 t`
+    /// report physical pixels, and kitty, sixel and OSC 1337 sequences display images.
+    ///
+    /// Off, every image sequence is consumed and discarded: no payload reaches the embedder, no
+    /// placement is made, the kitty support query (`a=q`) answers `ENOTSUPPORTED` and every other
+    /// completed kitty frame does too (subject to its quiet level), XTSMGRAPHICS requests answer
+    /// with an error status, and DA1 leaves out the sixel bit. Switching off also drops everything
+    /// already stored or displayed — placements, virtuals, ids and images, each image released
+    /// exactly once — and abandons any transmission in progress; a decode result that arrives for
+    /// one of those keys afterwards answers nothing, as after a full reset.
+    ///
+    /// The switch is the host's setting, not the program's: neither a full reset (`RIS`) nor
+    /// [`set_options`](Self::set_options) changes it.
+    pub fn set_images_enabled(&mut self, on: bool)
+    where
+        T: EventListener,
+    {
+        if self.images_enabled == on {
+            return;
+        }
+        self.images_enabled = on;
+        if on {
+            return;
+        }
+        // Queued releases first: they name keys this is about to release too (see `reset_state`).
+        let mut events = mem::take(&mut self.pending_image_events);
+        self.placements.reset_all(&mut events);
+        self.kitty_parser = Default::default();
+        self.sixel_decoder = None;
+        self.inline_parser = Default::default();
+        for event in events {
+            self.event_proxy.send_event(event);
+        }
+    }
+
+    /// Whether image placements stay when they scroll into the history (feathercritty; not
+    /// upstream).
+    ///
+    /// Off (the default) turns a placement whose rows have all left the viewport into a placeholder
+    /// line (`[image 640×480]`, see [`Term::visible_placeholders`]) and releases its image. On
+    /// keeps the placement so it scrolls back into view; [`Term::evict_oldest_scrollback_image`]
+    /// then lets the embedder reclaim memory from the oldest one when it is over its own cap.
+    #[inline]
+    pub fn set_scrollback_images(&mut self, keep: bool) {
+        self.placements.set_scrollback_images(keep);
+    }
+
+    /// The image placements intersecting the current view (feathercritty; not upstream).
+    ///
+    /// `row_in_view` counts from the top of the view (the scrollback offset is applied), negative
+    /// when the placement starts above it. Draw in the returned order.
+    pub fn visible_placements(&self) -> Vec<placements::VisiblePlacement> {
+        let window = self.grid_window(&self.grid);
+        self.placements.visible_placements(window, self.active_screen(), self.grid.display_offset())
+    }
+
+    /// The placeholder lines of scrolled-off images that are in view (feathercritty; not upstream).
+    pub fn visible_placeholders(&self) -> Vec<placements::VisiblePlaceholder> {
+        let window = self.grid_window(&self.grid);
+        self.placements.visible_placeholders(
+            window,
+            self.active_screen(),
+            self.grid.display_offset(),
+        )
+    }
+
+    /// Resolve a kitty Unicode placeholder cell to its image (feathercritty; not upstream).
+    ///
+    /// Feed it the image id and placement id decoded from the printed cells
+    /// (`kitty_diacritics::decode_placeholder_cell`); it returns the stored image's key and the
+    /// virtual placement's cell span, or `None` when nothing matches.
+    #[inline]
+    pub fn kitty_virtual_image(
+        &self,
+        image_id: u32,
+        placement_id: Option<u32>,
+    ) -> Option<(ImageKey, u32, u32)> {
+        self.placements.kitty_virtual_image(image_id, placement_id)
+    }
+
+    /// Report the embedder's decode result for an image (feathercritty; not upstream).
+    ///
+    /// Sends the kitty reply that was waiting on it (`OK`, `EBADPNG` or `ENOMEM`) and, when the
+    /// decode failed, removes the image and its placements. Call for every `Event::ImageReceived`
+    /// carrying `ImageData::Encoded`; `Rgba` payloads were decoded by the terminal already.
+    pub fn image_decoded(&mut self, key: ImageKey, result: Result<(), ImageDecodeError>)
+    where
+        T: EventListener,
+    {
+        self.flush_image_events();
+        let events = self.placements.image_decoded(key, result);
+        self.send_image_events(events);
+    }
+
+    /// Run the graphics protocols' stall watchdog (feathercritty; not upstream).
+    ///
+    /// Drops a chunked kitty transmission that has not continued for ten seconds and answers it
+    /// with `ENOMEM`, and delivers image events parked by [`resize`](Self::resize) — control-only
+    /// output does not flush them, so this is what covers an idle terminal. Hosts call this
+    /// periodically with the current time, or after feeding bytes.
+    pub fn tick(&mut self, now: Instant)
+    where
+        T: EventListener,
+    {
+        self.flush_image_events();
+        self.kitty_parser.tick(now);
+        self.drain_kitty_reject();
+    }
+
+    /// Reclaim memory from the oldest placement in scrollback (feathercritty; not upstream).
+    ///
+    /// It becomes a placeholder line and its image is released outright — placements, id and number
+    /// references and virtuals included — so an embedder over its own image-memory cap can call
+    /// this until enough went. `None` when scrollback holds no placement.
+    pub fn evict_oldest_scrollback_image(&mut self) -> Option<ImageKey>
+    where
+        T: EventListener,
+    {
+        let window = self.grid_window(&self.grid);
+        let screen = self.active_screen();
+        let (key, events) = self.placements.evict_oldest_scrollback_image(window, screen)?;
+        self.send_image_events(events);
+        Some(key)
+    }
+
     /// Terminal content required for rendering.
     #[inline]
     pub fn renderable_content(&self) -> RenderableContent<'_>
@@ -930,8 +1743,48 @@ impl<T> Term<T> {
         self.vi_mode_cursor.point.line += delta;
 
         let is_alt = self.mode.contains(TermMode::ALT_SCREEN);
-        self.grid.resize(!is_alt, num_lines, num_cols);
-        self.inactive_grid.resize(is_alt, num_lines, num_cols);
+
+        // feathercritty: placements follow the resize. Each grid's anchors (their first cells)
+        // go into `resize_tracked`, which replays the reflow's own decisions; outcomes move a
+        // placement with its cell or, when it cannot follow, replace it with its placeholder
+        // instead of dropping it silently (design spec 5). The alternate grid has no scroll
+        // observer — nothing it does destroys content — so its anchors keep their cells through
+        // the row passes and are shifted to their new absolute lines afterwards. Events have no
+        // `EventListener` bound here, so they ride out to the next bounded operation. Not
+        // upstream.
+        let tracking = !self.placements.is_empty();
+        let (active, inactive) = self.screen_pair();
+        let grew_lines = num_lines > old_lines;
+        // The inactive grid's own shrink scroll and history state, read before the resize:
+        // whichever grid is inactive still runs its row passes without an observer.
+        let alt_required =
+            (self.inactive_grid.cursor.point.line.0 as usize + 1).saturating_sub(num_lines);
+        let alt_history_full = self.inactive_grid.history_size() < alt_required;
+        let (active_anchors, inactive_anchors): (
+            Vec<placements::Placement>,
+            Vec<placements::Placement>,
+        ) = if tracking {
+            (self.placements.anchor_list(active), self.placements.anchor_list(inactive))
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        let mut active_outcomes = Vec::new();
+        let mut inactive_outcomes = Vec::new();
+
+        self.grid.resize_tracked(
+            !is_alt,
+            num_lines,
+            num_cols,
+            &active_anchors.iter().map(|p| (p.line, p.col)).collect::<Vec<_>>(),
+            &mut active_outcomes,
+        );
+        self.inactive_grid.resize_tracked(
+            is_alt,
+            num_lines,
+            num_cols,
+            &inactive_anchors.iter().map(|p| (p.line, p.col)).collect::<Vec<_>>(),
+            &mut inactive_outcomes,
+        );
 
         // Invalidate selection and tabs only when necessary.
         if old_cols != num_cols {
@@ -958,6 +1811,74 @@ impl<T> Term<T> {
 
         // Resize damage information.
         self.damage.resize(num_cols, num_lines);
+
+        if tracking {
+            let mut events = Vec::new();
+
+            // Alternate grid: rows pulled from (or pushed into) history slide the viewport, so
+            // anchors outside it move by the count of lines that actually changed places;
+            // growth ate scrollback for `num_lines - old_lines - from_history` rows only.
+            if grew_lines {
+                let from_history =
+                    cmp::min(self.inactive_grid.history_size(), num_lines - old_lines);
+                let shift = (num_lines - old_lines - from_history) as i64;
+                self.placements.shift_anchored(
+                    inactive,
+                    i64::MIN..self.inactive_grid.scrolled_lines(),
+                    shift,
+                );
+            } else if alt_required > 0 && !alt_history_full {
+                // Only the rows that rode into history changed absolute position.
+                let scrolled = self.inactive_grid.scrolled_lines();
+                self.placements.shift_anchored(
+                    inactive,
+                    scrolled..i64::MAX,
+                    -(alt_required as i64),
+                );
+            }
+
+            // feathercritty: those shifts moved the inactive screen's records to their new
+            // lines. `apply_reflow` looks each placement up where it sits now, so that
+            // screen's anchors are re-read after the shifts — the copies collected before
+            // the resize carry pre-shift lines, and pairing an outcome with one either
+            // skipped a live record or inserted a stale copy beside it (which outlived
+            // every removal and put `placement_total` out of step with the maps). Outcomes
+            // come out in input order, so each is paired by insertion stamp: the one
+            // identity a shift keeps. Not upstream.
+            let shifted_inactive: HashMap<u64, placements::Placement> =
+                self.placements.anchor_list(inactive).into_iter().map(|p| (p.seq, p)).collect();
+
+            for (screen, anchors, outcomes) in [
+                (active, &active_anchors, &active_outcomes),
+                (inactive, &inactive_anchors, &inactive_outcomes),
+            ] {
+                let remapped: Vec<(placements::Placement, i64, usize, bool)> = anchors
+                    .iter()
+                    .copied()
+                    .zip(outcomes.iter())
+                    .map(|(p, &(line, col, lost))| {
+                        let p = if screen == inactive {
+                            shifted_inactive.get(&p.seq).copied().unwrap_or(p)
+                        } else {
+                            p
+                        };
+                        (p, line, col, lost)
+                    })
+                    .collect();
+                self.placements.apply_reflow(&remapped, &mut events);
+                self.placements.after_resize(
+                    self.grid_window(if screen == active {
+                        &self.grid
+                    } else {
+                        &self.inactive_grid
+                    }),
+                    screen,
+                    num_cols,
+                    &mut events,
+                );
+            }
+            self.queue_image_events(events);
+        }
     }
 
     /// Active terminal modes.
@@ -967,7 +1888,19 @@ impl<T> Term<T> {
     }
 
     /// Swap primary and alternate screen buffer.
-    pub fn swap_alt(&mut self) {
+    pub fn swap_alt(&mut self)
+    where
+        T: EventListener,
+    {
+        // feathercritty: both transitions clear the alternate screen's placements — entering
+        // starts a fresh alternate grid, leaving discards what was on it (the stored images stay
+        // available while an id or number names them). Not upstream.
+        if !self.placements.is_empty() {
+            let mut events = Vec::new();
+            self.placements.remove_screen(placements::Screen::Alternate, &mut events);
+            self.send_image_events(events);
+        }
+
         if !self.mode.contains(TermMode::ALT_SCREEN) {
             // Set alt screen cursor to the current primary screen cursor.
             self.inactive_grid.cursor = self.grid.cursor.clone();
@@ -995,7 +1928,10 @@ impl<T> Term<T> {
     /// Text moves down; clear at bottom
     /// Expects origin to be in scroll range.
     #[inline]
-    fn scroll_down_relative(&mut self, origin: Line, mut lines: usize) {
+    fn scroll_down_relative(&mut self, origin: Line, mut lines: usize)
+    where
+        T: EventListener,
+    {
         trace!("Scrolling down relative: origin={origin}, lines={lines}");
 
         lines = cmp::min(lines, (self.scroll_region.end - self.scroll_region.start).0 as usize);
@@ -1015,6 +1951,21 @@ impl<T> Term<T> {
 
         // Scroll between origin and bottom
         self.grid.scroll_down(&region, lines);
+
+        // feathercritty: placements inside the rotated range move with their content; not upstream.
+        if lines > 0 && !self.placements.is_empty() {
+            let screen = self.active_screen();
+            let window = self.grid_window(&self.grid);
+            let events = self.placements.after_scroll_down(
+                window,
+                screen,
+                region.start.0 as i64,
+                region.end.0 as i64,
+                lines,
+            );
+            self.send_image_events(events);
+        }
+
         self.mark_fully_damaged();
     }
 
@@ -1023,7 +1974,10 @@ impl<T> Term<T> {
     /// Text moves up; clear at top
     /// Expects origin to be in scroll range.
     #[inline]
-    fn scroll_up_relative(&mut self, origin: Line, mut lines: usize) {
+    fn scroll_up_relative(&mut self, origin: Line, mut lines: usize)
+    where
+        T: EventListener,
+    {
         trace!("Scrolling up relative: origin={origin}, lines={lines}");
 
         lines = cmp::min(lines, (self.scroll_region.end - self.scroll_region.start).0 as usize);
@@ -1034,6 +1988,22 @@ impl<T> Term<T> {
         self.selection = self.selection.take().and_then(|s| s.rotate(self, &region, lines as i32));
 
         self.grid.scroll_up(&region, lines);
+
+        // feathercritty: placements inside a sub-region rotation move with their content; a
+        // full-viewport one needs no shifts (its counter is the placement anchor's base) but does
+        // scroll rows out of view. Not upstream.
+        if lines > 0 && !self.placements.is_empty() {
+            let screen = self.active_screen();
+            let window = self.grid_window(&self.grid);
+            let events = self.placements.after_scroll_up(
+                window,
+                screen,
+                region.start.0 as i64,
+                region.end.0 as i64,
+                lines,
+            );
+            self.send_image_events(events);
+        }
 
         // Scroll vi mode cursor.
         let viewport_top = Line(-(self.grid.display_offset() as i32));
@@ -1507,10 +2477,213 @@ impl<T> Dimensions for Term<T> {
     }
 }
 
+/// What a delete reply echoes: the addressed `(id, number, placement)` from the command, plus
+/// whether anything went (the difference between `OK` and `ENOENT`).
+struct DeleteReply {
+    id: u32,
+    number: Option<u32>,
+    placement: Option<u32>,
+    found: bool,
+}
+
+impl DeleteReply {
+    /// A reply for a selector that addressed no image.
+    fn none(found: bool) -> DeleteReply {
+        DeleteReply { id: 0, number: None, placement: None, found }
+    }
+}
+
+/// Expand kitty's raw 3-bytes-per-pixel payload to the straight RGBA8 layout `ImageData::Rgba`
+/// uses, with every pixel opaque (feathercritty; not upstream).
+fn rgb_to_rgba(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 3);
+    for pixel in bytes.chunks_exact(3) {
+        out.extend_from_slice(pixel);
+        out.push(0xFF);
+    }
+    out
+}
+
+/// The encoded format of inline image bytes by their magic numbers (feathercritty; not upstream).
+fn sniff_format(bytes: &[u8]) -> Option<crate::event::ImageFormat> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some(crate::event::ImageFormat::Png)
+    } else if bytes.starts_with(b"\xFF\xD8\xFF") {
+        Some(crate::event::ImageFormat::Jpeg)
+    } else if bytes.starts_with(b"GIF8") {
+        Some(crate::event::ImageFormat::Gif)
+    } else {
+        None
+    }
+}
+
+/// An inline image's `width`/`height` argument in cells: `N` is already cells, `Npx` divides by
+/// the cell size, `N%` takes that share of the terminal's pixels on that axis, and `auto` (and an
+/// absent argument) asks for 0 — which [`PlacementTable::span_for`] computes from the image
+/// itself (feathercritty; not upstream).
+fn inline_cells(dim: inline::Dim, cell_px: u32, terminal_px: u32) -> u32 {
+    // `span_for` treats 0 as "compute", so only a nonzero request is capped; the cap is the
+    // image-side limit (`MAX_IMAGE_SIDE` cells), which no display could exceed anyway.
+    let cap = |cells: u64| cells.clamp(1, u64::from(limits::MAX_IMAGE_SIDE)) as u32;
+    match dim {
+        inline::Dim::Auto => 0,
+        // `span_for` treats 0 as "compute", so only a nonzero request is capped.
+        inline::Dim::Cells(0) => 0,
+        inline::Dim::Cells(cells) => cap(u64::from(cells)),
+        inline::Dim::Pixels(pixels) => (u64::from(pixels) + u64::from(cell_px) - 1)
+            .checked_div(u64::from(cell_px))
+            .map_or(0, |cells| if cells == 0 { 0 } else { cap(cells) }),
+        inline::Dim::Percent(percent) => {
+            let pixels = u64::from(terminal_px) * u64::from(percent.min(100)) / 100;
+            (pixels + u64::from(cell_px) - 1)
+                .checked_div(u64::from(cell_px))
+                .map_or(0, |cells| if cells == 0 { 0 } else { cap(cells) })
+        },
+    }
+}
+
+/// The XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`) items this terminal answers: `Pi=1` counts the colour
+/// registers one sixel image gets, `Pi=2` is the sixel geometry in pixels. The protocol's third
+/// item, ReGIS geometry, is not supported here (feathercritty; not upstream).
+const XTSM_ITEM_COLOUR_REGISTERS: u16 = 1;
+const XTSM_ITEM_SIXEL_GEOMETRY: u16 = 2;
+
+/// The XTSMGRAPHICS actions (`Pa`) this terminal answers — `1` read, `2` reset to the default, `3`
+/// set from `Pv`, `4` read the maximum allowed value (feathercritty; not upstream). Every item it
+/// reports is a fixed capability, so all four answer with what the attribute already is.
+const XTSM_ACTION_FIRST: u16 = 1;
+const XTSM_ACTION_LAST: u16 = 4;
+
 impl<T: EventListener> Handler for Term<T> {
+    // feathercritty: graphics protocol sequences; not upstream. APC frames feed the kitty parser,
+    // DCS `q` canvases the sixel decoder and OSC 1337 file transfers the inline image parser.
+
+    #[inline]
+    fn apc_start(&mut self) {
+        self.flush_image_events();
+        self.kitty_parser.start();
+    }
+
+    #[inline]
+    fn apc_put(&mut self, bytes: &[u8]) {
+        self.kitty_parser.put(bytes);
+    }
+
+    fn apc_end(&mut self) {
+        if let Some(command) = self.kitty_parser.end(Instant::now()) {
+            self.handle_kitty_command(command);
+        }
+        self.drain_kitty_reject();
+    }
+
+    #[inline]
+    fn apc_abort(&mut self) {
+        self.kitty_parser.abort();
+        self.drain_kitty_reject();
+    }
+
+    fn sixel_start(&mut self, params: &[u16]) {
+        self.flush_image_events();
+        // feathercritty: with image support off the canvas is never built — `sixel_put` drops the
+        // bytes and `sixel_end` has nothing to display. Not upstream.
+        if !self.images_enabled {
+            return;
+        }
+        // A black default background: the core does not know the host theme's colors, and
+        // `P2=0|2` images paint their canvas anyway.
+        self.sixel_decoder = Some(sixel::SixelDecoder::new(params, sixel::Rgba::new(0, 0, 0)));
+    }
+
+    #[inline]
+    fn sixel_put(&mut self, bytes: &[u8]) {
+        if let Some(decoder) = &mut self.sixel_decoder {
+            decoder.put(bytes);
+        }
+    }
+
+    fn sixel_end(&mut self) {
+        if let Some(decoder) = self.sixel_decoder.take() {
+            // A canvas that painted nothing displays nothing; no reply belongs to a sixel.
+            if let Ok(image) = decoder.finish() {
+                self.place_sixel(image);
+            }
+        }
+    }
+
+    #[inline]
+    fn sixel_abort(&mut self) {
+        self.sixel_decoder = None;
+    }
+
+    #[inline]
+    fn inline_image_start(&mut self, args: &[u8]) {
+        self.flush_image_events();
+        // feathercritty: with image support off nothing is started, so the payload is consumed and
+        // dropped by `put` without being collected. Not upstream.
+        if !self.images_enabled {
+            return;
+        }
+        self.inline_parser.start(args);
+    }
+
+    #[inline]
+    fn inline_image_put(&mut self, bytes: &[u8]) {
+        self.inline_parser.put(bytes);
+    }
+
+    fn inline_image_end(&mut self) {
+        if let Some(image) = self.inline_parser.end() {
+            self.place_inline(image);
+        }
+    }
+
+    #[inline]
+    fn inline_image_abort(&mut self) {
+        self.inline_parser.abort();
+    }
+
+    /// XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`): the colour registers and the sixel geometry.
+    ///
+    /// Both are fixed capabilities here — the colour-register count the sixel decoder gives each
+    /// image, and the text area in physical pixels capped at [`limits::MAX_IMAGE_SIDE`] per axis —
+    /// so read, read-maximum, set and reset all answer success with what stands. Nothing is adopted
+    /// from `Pv`, which is why the request's value goes unused; reporting a number the terminal did
+    /// not take would claim a capability it does not have. An unknown item answers status 1 (error
+    /// in `Pi`), an unknown action status 2 (error in `Pa`). With image support off
+    /// ([`Term::set_images_enabled`]) every request answers status 1, without a value.
+    fn graphics_attributes(&mut self, item: u16, action: u16, _value: Option<u16>) {
+        trace!("XTSMGRAPHICS item {item}, action {action}");
+        if !self.images_enabled {
+            self.event_proxy.send_event(Event::PtyWrite(format!("\x1b[?{item};1S")));
+            return;
+        }
+        let known_action = matches!(action, XTSM_ACTION_FIRST..=XTSM_ACTION_LAST);
+        let reply = match item {
+            // An action this terminal does not know, on an item it does: status 2 (error in `Pa`).
+            XTSM_ITEM_COLOUR_REGISTERS | XTSM_ITEM_SIXEL_GEOMETRY if !known_action => {
+                format!("\x1b[?{item};2S")
+            },
+            XTSM_ITEM_COLOUR_REGISTERS => format!("\x1b[?{item};0;{}S", sixel::REGISTERS),
+            XTSM_ITEM_SIXEL_GEOMETRY => {
+                let (width, height) = self.text_area_pixels();
+                let cap = u64::from(limits::MAX_IMAGE_SIDE);
+                format!("\x1b[?{item};0;{};{}S", width.min(cap), height.min(cap))
+            },
+            // An item this terminal does not have is status 1 (error in `Pi`), whatever it asked.
+            _ => format!("\x1b[?{item};1S"),
+        };
+        self.event_proxy.send_event(Event::PtyWrite(reply));
+    }
+
     /// A character to be displayed.
     #[inline(never)]
     fn input(&mut self, c: char) {
+        // feathercritty: `resize` parks its placement events until a bounded operation runs; any
+        // output counts as one. Not upstream.
+        if !self.pending_image_events.is_empty() {
+            self.flush_image_events();
+        }
+
         // feathercritty: grapheme clusters while mode 2027 is set; not upstream. The fast path
         // (Latin-1, or column 0 without a pending wrap) never looks at the previous cell.
         if c > '\u{FF}' && self.mode.contains(TermMode::GRAPHEME_CLUSTER) {
@@ -1726,7 +2899,14 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                // feathercritty: with image support on, the answer adds the sixel graphics bit
+                // (`4`) and ANSI colour (`22`) to the VT500-class conformance level (`62`); off it
+                // is what a terminal without graphics support says. Not upstream.
+                let text = if self.images_enabled {
+                    String::from("\x1b[?62;4;22c")
+                } else {
+                    String::from("\x1b[?6c")
+                };
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             Some('>') => {
@@ -2253,6 +3433,19 @@ impl<T: EventListener> Handler for Term<T> {
 
                 let range = Line(0)..=cursor.line;
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+
+                // feathercritty: placements anchored in the cleared rows are removed. The clear
+                // concerns the screen, not the scrolled-back view: `reset_region` only ever
+                // touches grid rows `0..=cursor.line`, so the wipe starts at the viewport's top
+                // stable line, never earlier (`display_offset` rows of history stay). Not upstream.
+                if !self.placements.is_empty() {
+                    let window = self.grid_window(&self.grid);
+                    let from = window.stable;
+                    let to = window.stable + i64::from(cursor.line.0) + 1;
+                    let mut events = Vec::new();
+                    self.placements.wipe_range(self.active_screen(), from, to, &mut events);
+                    self.send_image_events(events);
+                }
             },
             ansi::ClearMode::Below => {
                 let cursor = self.grid.cursor.point;
@@ -2267,8 +3460,34 @@ impl<T: EventListener> Handler for Term<T> {
 
                 let range = cursor.line..Line(screen_lines as i32);
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(range));
+
+                // feathercritty: placements anchored below the cursor's row are removed; one
+                // anchored on it survives its tail being erased (the documented anchor rule). Not
+                // upstream.
+                if !self.placements.is_empty() {
+                    let window = self.grid_window(&self.grid);
+                    let from = window.stable + i64::from(cursor.line.0) + 1;
+                    let to = window.stable + screen_lines as i64;
+                    let mut events = Vec::new();
+                    self.placements.wipe_range(self.active_screen(), from, to, &mut events);
+                    self.send_image_events(events);
+                }
             },
             ansi::ClearMode::All => {
+                // feathercritty: an ED 2 erases every placement anchored in the viewport (the
+                // rows they covered are gone even where their content scrolls on); scrollback
+                // placements keep their stable lines, as their rows do. Not upstream.
+                let wipe_from = self.grid.scrolled_lines();
+                let mut events = Vec::new();
+                if !self.placements.is_empty() {
+                    self.placements.wipe_range(
+                        self.active_screen(),
+                        wipe_from,
+                        wipe_from + screen_lines as i64,
+                        &mut events,
+                    );
+                }
+
                 if self.mode.contains(TermMode::ALT_SCREEN) {
                     self.grid.reset_region(..);
                 } else {
@@ -2281,17 +3500,50 @@ impl<T: EventListener> Handler for Term<T> {
 
                     self.vi_mode_cursor.point.line =
                         (self.vi_mode_cursor.point.line - lines).grid_clamp(self, Boundary::Grid);
+
+                    // feathercritty: riding the viewport into history may have pushed the oldest
+                    // rows past the scrollback limit; placements that fell off the end go with
+                    // them — the same prune a scrolling rotation runs. Not upstream.
+                    if !self.placements.is_empty() {
+                        let window = self.grid_window(&self.grid);
+                        self.placements.prune_out_of_view(
+                            window,
+                            self.active_screen(),
+                            &mut events,
+                        );
+                    }
                 }
 
                 self.selection = None;
+
+                if !events.is_empty() {
+                    self.send_image_events(events);
+                }
             },
             ansi::ClearMode::Saved if self.history_size() > 0 => {
+                // feathercritty: rows purged from history take their placements (and placeholders)
+                // with them; everything below the viewport's new top line is gone. Not upstream.
+                let purge_to = self.grid.scrolled_lines();
+                let mut events = Vec::new();
+                if !self.placements.is_empty() {
+                    self.placements.wipe_range(
+                        self.active_screen(),
+                        purge_to - (self.history_size() as i64 + 1),
+                        purge_to,
+                        &mut events,
+                    );
+                }
+
                 self.grid.clear_history();
 
                 self.vi_mode_cursor.point.line =
                     self.vi_mode_cursor.point.line.grid_clamp(self, Boundary::Cursor);
 
                 self.selection = self.selection.take().filter(|s| !s.intersects_range(..Line(0)));
+
+                if !events.is_empty() {
+                    self.send_image_events(events);
+                }
             },
             // We have no history to clear.
             ansi::ClearMode::Saved => (),
@@ -2337,6 +3589,18 @@ impl<T: EventListener> Handler for Term<T> {
         self.mode.insert(TermMode::default());
         // feathercritty: mode 2027 returns to its configured default; not upstream.
         self.reset_grapheme_cluster_mode();
+
+        // feathercritty: images, ids, placements and placeholders do not survive a full reset;
+        // every stored image reports its release exactly once (queued `resize` events first — they
+        // concern keys the reset is about to release too). Not upstream.
+        let mut graphic_events = mem::take(&mut self.pending_image_events);
+        self.placements.reset_all(&mut graphic_events);
+        self.kitty_parser = Default::default();
+        self.sixel_decoder = None;
+        self.inline_parser = Default::default();
+        for event in graphic_events {
+            self.event_proxy.send_event(event);
+        }
 
         self.event_proxy.send_event(Event::CursorBlinkingChange);
         self.mark_fully_damaged();
@@ -2424,6 +3688,11 @@ impl<T: EventListener> Handler for Term<T> {
                 self.mode.insert(TermMode::GRAPHEME_CLUSTER);
                 return;
             },
+            // feathercritty: DECSDM, sixel images at (not under) the cursor; not upstream.
+            PrivateMode::Unknown(80) => {
+                self.mode.insert(TermMode::DECSDM);
+                return;
+            },
             PrivateMode::Unknown(mode) => {
                 debug!("Ignoring unknown mode {mode} in set_private_mode");
                 return;
@@ -2490,6 +3759,11 @@ impl<T: EventListener> Handler for Term<T> {
             // feathercritty: vte has no named variant for mode 2027; not upstream.
             PrivateMode::Unknown(2027) => {
                 self.mode.remove(TermMode::GRAPHEME_CLUSTER);
+                return;
+            },
+            // feathercritty: DECSDM, sixel images at (not under) the cursor; not upstream.
+            PrivateMode::Unknown(80) => {
+                self.mode.remove(TermMode::DECSDM);
                 return;
             },
             PrivateMode::Unknown(mode) => {
@@ -2754,10 +4028,37 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn text_area_size_pixels(&mut self) {
+        // feathercritty: once the host has reported its cell size (`set_cell_pixel_size`) the
+        // answer comes straight from the grid and that size; without it the host is asked, as
+        // before. Not upstream.
+        if self.cell_size_known {
+            let (width, height) = self.text_area_pixels();
+            let text = format!("\x1b[4;{height};{width}t");
+            self.event_proxy.send_event(Event::PtyWrite(text));
+            return;
+        }
         self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
             let height = window_size.num_lines * window_size.cell_height;
             let width = window_size.num_cols * window_size.cell_width;
             format!("\x1b[4;{height};{width}t")
+        })));
+    }
+
+    /// Report the cell size in pixels (`CSI 16 t`): `\x1b[6;<height>;<width>t`.
+    ///
+    /// feathercritty: from the size `set_cell_pixel_size` set, so image programs sizing their
+    /// output by it see the same numbers placements do; until one is set the host is asked through
+    /// [`Event::TextAreaSizeRequest`], as `CSI 14 t` does. Not upstream.
+    #[inline]
+    fn cell_size_pixels(&mut self) {
+        if self.cell_size_known {
+            let (width, height) = self.placements.cell_pixel_size();
+            let text = format!("\x1b[6;{height};{width}t");
+            self.event_proxy.send_event(Event::PtyWrite(text));
+            return;
+        }
+        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+            format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
         })));
     }
 
@@ -4324,6 +5625,342 @@ mod tests {
             feed(&mut term, b"\x1b[?2027l");
             term.set_options(config);
             assert!(!on(&term));
+        }
+    }
+
+    // feathercritty: what the support reports answer (DA1, XTSMGRAPHICS, `CSI 14 t`/`16 t`) and
+    // the master switch; not upstream.
+    mod image_support {
+        use std::sync::{Arc, Mutex};
+
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        use super::*;
+        use crate::event::{Event, EventListener, ImageKey, WindowSize};
+        use crate::graphics::limits::MAX_IMAGE_SIDE;
+        use crate::vte::ansi::Processor;
+
+        /// A host that records what the terminal writes back and which images it is handed,
+        /// answering a window-size request with the size it was configured with (what a real host
+        /// does with its own font metrics).
+        #[derive(Clone, Default)]
+        struct Host(Arc<Mutex<Log>>);
+
+        struct Log {
+            /// The window size this host reports when asked; the tests set their grid's.
+            window: WindowSize,
+            writes: Vec<String>,
+            received: Vec<ImageKey>,
+            released: Vec<ImageKey>,
+            /// Times the terminal asked for the window size instead of answering itself.
+            asked: usize,
+        }
+
+        /// A host with no size set yet reports this one (no test reads it without setting one).
+        impl Default for Log {
+            fn default() -> Self {
+                Self {
+                    window: WindowSize {
+                        num_lines: 24,
+                        num_cols: 80,
+                        cell_width: 9,
+                        cell_height: 18,
+                    },
+                    writes: Vec::new(),
+                    received: Vec::new(),
+                    released: Vec::new(),
+                    asked: 0,
+                }
+            }
+        }
+
+        impl EventListener for Host {
+            fn send_event(&self, event: Event) {
+                let mut log = self.0.lock().unwrap();
+                match event {
+                    // The host formats its own window size; the answer goes to the pty.
+                    Event::TextAreaSizeRequest(format) => {
+                        let window = log.window;
+                        log.asked += 1;
+                        log.writes.push(format(window));
+                    },
+                    Event::PtyWrite(text) => log.writes.push(text),
+                    Event::ImageReceived { key, .. } => log.received.push(key),
+                    Event::ImageReleased(key) => log.released.push(key),
+                    _ => {},
+                }
+            }
+        }
+
+        impl Host {
+            fn set_window(&self, window: WindowSize) {
+                self.0.lock().unwrap().window = window;
+            }
+
+            /// Everything written back since the last drain, concatenated.
+            fn writes(&self) -> String {
+                std::mem::take(&mut self.0.lock().unwrap().writes).concat()
+            }
+
+            /// The image keys handed to the host since the last drain.
+            fn received(&self) -> Vec<ImageKey> {
+                std::mem::take(&mut self.0.lock().unwrap().received)
+            }
+
+            /// The images released since the last drain.
+            fn released(&self) -> Vec<ImageKey> {
+                std::mem::take(&mut self.0.lock().unwrap().released)
+            }
+
+            /// How many times the host was asked for its window size since the last drain.
+            fn asked(&self) -> usize {
+                std::mem::take(&mut self.0.lock().unwrap().asked)
+            }
+        }
+
+        fn new_term(columns: usize, lines: usize) -> (Term<Host>, Host) {
+            let host = Host::default();
+            let term = Term::new(Config::default(), &TermSize::new(columns, lines), host.clone());
+            (term, host)
+        }
+
+        fn feed(term: &mut Term<Host>, bytes: &[u8]) {
+            let mut parser: Processor = Processor::new();
+            parser.advance(term, bytes);
+        }
+
+        fn cursor(term: &Term<Host>) -> (i32, usize) {
+            let point = term.grid().cursor.point;
+            (point.line.0, point.column.0)
+        }
+
+        /// A one-pixel black sixel sequence (the same one the placement tests use).
+        const SIXEL: &[u8] = b"\x1bPq#0?~\x1b\\";
+
+        /// The answer every disabled kitty frame gets, for an image addressed as `i=<id>` (`id` 0
+        /// leaves the address out).
+        fn enotsupported(id: u32) -> String {
+            if id == 0 {
+                return String::from("\x1b_G;ENOTSUPPORTED:not supported by this terminal\x1b\\");
+            }
+            format!("\x1b_Gi={id};ENOTSUPPORTED:not supported by this terminal\x1b\\")
+        }
+
+        /// A complete `a=T` transmission of raw pixels, with extra control keys (`,c=2,r=2` style)
+        /// appended to the frame.
+        fn transmit(
+            id: u32,
+            format: &str,
+            size: (u32, u32),
+            pixels: &[u8],
+            extra: &str,
+        ) -> Vec<u8> {
+            let (width, height) = size;
+            let mut out =
+                format!("\x1b_Ga=T,i={id},{format},s={width},v={height}{extra}").into_bytes();
+            out.push(b';');
+            out.extend_from_slice(STANDARD.encode(pixels).as_bytes());
+            out.extend(b"\x1b\\");
+            out
+        }
+
+        /// A PNG declaring `w`×`h`: only its IHDR is read, so the chunk CRC stays zero and no image
+        /// data follows (the same shape the inline parser's own tests build).
+        fn png(w: u32, h: u32) -> Vec<u8> {
+            let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+            v.extend_from_slice(&13u32.to_be_bytes());
+            v.extend_from_slice(b"IHDR");
+            v.extend_from_slice(&w.to_be_bytes());
+            v.extend_from_slice(&h.to_be_bytes());
+            v.extend_from_slice(&[8, 6, 0, 0, 0]); // depth, color type, compression, filter, interlace
+            v.extend_from_slice(&[0, 0, 0, 0]); // CRC: never looked at
+            v
+        }
+
+        /// An OSC 1337 sequence carrying `png(w, h)` as an inline image.
+        fn inline_image(w: u32, h: u32) -> Vec<u8> {
+            let mut out = b"\x1b]1337;File=inline=1:".to_vec();
+            out.extend_from_slice(STANDARD.encode(png(w, h)).as_bytes());
+            out.extend(b"\x1b\\");
+            out
+        }
+
+        #[test]
+        fn da1_advertises_sixel_when_on() {
+            let (mut term, host) = new_term(10, 4);
+
+            feed(&mut term, b"\x1b[c");
+            assert_eq!(host.writes(), "\x1b[?62;4;22c", "sixel and ANSI colour are advertised");
+
+            // The secondary answer (the crate version) is not the switch's to change.
+            let version = version_number(env!("CARGO_PKG_VERSION"));
+            feed(&mut term, b"\x1b[>c");
+            assert_eq!(host.writes(), format!("\x1b[>0;{version};1c"));
+
+            // Off: what a terminal without graphics support says. The switch is the host's, so a
+            // full reset leaves it alone.
+            term.set_images_enabled(false);
+            feed(&mut term, b"\x1bc\x1b[c");
+            assert_eq!(host.writes(), "\x1b[?6c", "no sixel bit without image support");
+
+            // And on again.
+            term.set_images_enabled(true);
+            feed(&mut term, b"\x1b[c");
+            assert_eq!(host.writes(), "\x1b[?62;4;22c");
+        }
+
+        #[test]
+        fn xtsmgraphics_replies() {
+            let (mut term, host) = new_term(10, 4);
+            term.set_cell_pixel_size(8, 16); // a text area of 80 by 64 pixels
+
+            // Reads answer what this terminal has.
+            feed(&mut term, b"\x1b[?1;1S\x1b[?2;1S");
+            assert_eq!(host.writes(), "\x1b[?1;0;1024S\x1b[?2;0;80;64S");
+
+            // The geometry never asks for a side bigger than an image may have.
+            term.set_cell_pixel_size(4_000, 4_000);
+            feed(&mut term, b"\x1b[?2;1S");
+            let cap = u64::from(MAX_IMAGE_SIDE);
+            assert_eq!(host.writes(), format!("\x1b[?2;0;{cap};{cap}S"));
+
+            // Set and reset succeed without changing anything, so they report what stands: the
+            // registers as they are, the geometry as the grid and cell size make it.
+            term.set_cell_pixel_size(8, 16);
+            feed(&mut term, b"\x1b[?1;2S\x1b[?1;3;256S\x1b[?2;3;10;20S\x1b[?2;4S");
+            assert_eq!(
+                host.writes(),
+                "\x1b[?1;0;1024S\x1b[?1;0;1024S\x1b[?2;0;80;64S\x1b[?2;0;80;64S"
+            );
+
+            // An item this terminal does not have, and an action it does not know.
+            feed(&mut term, b"\x1b[?7;1S\x1b[?1;9S");
+            assert_eq!(host.writes(), "\x1b[?7;1S\x1b[?1;2S");
+
+            // With images off every request is an error.
+            term.set_images_enabled(false);
+            feed(&mut term, b"\x1b[?1;1S\x1b[?2;3;256S\x1b[?7;1S");
+            assert_eq!(host.writes(), "\x1b[?1;1S\x1b[?2;1S\x1b[?7;1S");
+
+            // A cell size the host never set: the geometry counts each cell as one pixel.
+            let (mut term, host) = new_term(3, 2);
+            feed(&mut term, b"\x1b[?2;1S");
+            assert_eq!(host.writes(), "\x1b[?2;0;3;2S");
+            assert_eq!(host.asked(), 0, "the geometry comes from the grid, not the host");
+        }
+
+        #[test]
+        fn pixel_size_reports_physical() {
+            let (mut term, host) = new_term(10, 4);
+            host.set_window(WindowSize {
+                num_lines: 4,
+                num_cols: 10,
+                cell_width: 9,
+                cell_height: 18,
+            });
+
+            // No cell size known yet: both reports ask the host, as they did before image support.
+            feed(&mut term, b"\x1b[14t\x1b[16t");
+            assert_eq!(host.asked(), 2, "both fall back to asking the host");
+            assert_eq!(host.writes(), "\x1b[4;72;90t\x1b[6;18;9t");
+
+            // Once the host has reported its metrics the answers come from the grid and that size.
+            term.set_cell_pixel_size(8, 16);
+            feed(&mut term, b"\x1b[14t\x1b[16t");
+            assert_eq!(host.asked(), 0, "nothing is asked any more");
+            assert_eq!(host.writes(), "\x1b[4;64;80t\x1b[6;16;8t");
+
+            // A resize moves the text area, not the cell.
+            term.resize(TermSize::new(20, 5));
+            feed(&mut term, b"\x1b[14t\x1b[16t");
+            assert_eq!(host.writes(), "\x1b[4;80;160t\x1b[6;16;8t");
+
+            // The switch does not silence the size reports: a host that shows no images still has
+            // cells of a known size.
+            term.set_images_enabled(false);
+            feed(&mut term, b"\x1b[14t\x1b[16t");
+            assert_eq!(host.writes(), "\x1b[4;80;160t\x1b[6;16;8t");
+
+            // `CSI 18 t` still answers in characters.
+            feed(&mut term, b"\x1b[18t");
+            assert_eq!(host.writes(), "\x1b[8;5;20t");
+        }
+
+        #[test]
+        fn disabled_images_are_inert() {
+            let (mut term, host) = new_term(12, 6);
+            term.set_cell_pixel_size(8, 16); // so the images below span one cell each
+            term.set_images_enabled(false);
+
+            // DA1 leaves the sixel bit out.
+            feed(&mut term, b"\x1b[c");
+            assert_eq!(host.writes(), "\x1b[?6c");
+
+            // The support query answers with the protocol's "not supported".
+            feed(&mut term, b"\x1b_Ga=q,i=7\x1b\\");
+            assert_eq!(host.writes(), enotsupported(7));
+
+            // A sixel is consumed where an image would have been placed: nothing reaches the host,
+            // nothing is placed, and the cursor stays (DECSDM off moves it below an image).
+            feed(&mut term, b"\x1b[2;3H");
+            let before = cursor(&term);
+            feed(&mut term, SIXEL);
+            assert_eq!(cursor(&term), before, "a discarded sixel does not move the cursor");
+            assert!(host.received().is_empty(), "no payload for the host");
+            assert!(host.released().is_empty());
+            assert!(term.visible_placements().is_empty(), "nothing was displayed");
+
+            // A kitty transmission with its placement, then a standalone place and a delete: each
+            // frame is answered "not supported" and leaves nothing behind.
+            feed(&mut term, &transmit(3, "f=24", (1, 1), &[0, 0, 0], ",c=1,r=1"));
+            assert!(host.received().is_empty(), "no image was stored");
+            assert!(term.visible_placements().is_empty());
+            assert_eq!(host.writes(), enotsupported(3));
+            feed(&mut term, b"\x1b_Ga=p,i=3\x1b\\");
+            assert_eq!(host.writes(), enotsupported(3));
+            feed(&mut term, b"\x1b_Ga=d,d=a\x1b\\");
+            assert_eq!(host.writes(), "", "a delete with neither id nor number answers nothing");
+
+            // A frame the parser refuses is refused as unsupported too — off, that is the only
+            // graphics answer this terminal gives. The quiet level still applies: `a=f` (animation)
+            // is refused at dispatch, after its `q` was read.
+            feed(&mut term, b"\x1b_Ga=x\x1b\\"); // an action the protocol does not define
+            assert_eq!(host.writes(), "", "and with no id or number even that answers nothing");
+            feed(&mut term, b"\x1b_Ga=f,i=8,q=2\x1b\\");
+            assert_eq!(host.writes(), "", "q=2 suppresses the answer as it always did");
+
+            // An OSC 1337 image is consumed without collecting its payload.
+            feed(&mut term, &inline_image(2, 2));
+            assert!(host.received().is_empty());
+            assert!(term.visible_placements().is_empty());
+
+            // The very same sequences do display once the host turns images back on.
+            term.set_images_enabled(true);
+            feed(&mut term, SIXEL);
+            feed(&mut term, &inline_image(2, 2));
+            feed(&mut term, &transmit(9, "f=32", (8, 8), &[0x7F; 8 * 8 * 4], ",c=1,r=1"));
+            assert_eq!(host.received().len(), 3, "sixel, inline and kitty all display");
+            assert_eq!(term.visible_placements().len(), 3);
+            assert_eq!(host.writes(), "\x1b_Gi=9;OK\x1b\\");
+            feed(&mut term, b"\x1b_Ga=q,i=9\x1b\\");
+            assert_eq!(host.writes(), "\x1b_Gi=9;OK\x1b\\", "the query is OK again");
+
+            // Switching off drops what was stored and displayed, releasing each image exactly once.
+            term.set_images_enabled(false);
+            assert_eq!(host.released().len(), 3, "every image releases once");
+            assert!(term.visible_placements().is_empty());
+            feed(&mut term, b"\x1b_Ga=p,i=9\x1b\\");
+            assert_eq!(
+                host.writes(),
+                enotsupported(9),
+                "off, every frame answers 'not supported' (and its data went with the switch)"
+            );
+            assert!(host.released().is_empty(), "nothing releases a second time");
+
+            // Switching off again, with nothing stored, changes nothing.
+            term.set_images_enabled(false);
+            assert!(host.released().is_empty());
         }
     }
 }

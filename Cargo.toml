@@ -4,7 +4,7 @@
 name = "feathercritty"
 # The alacritty_terminal release this fork is based on, plus the fork's own revision as build
 # metadata; see README.md.
-version = "0.26.0+fbterm.7"
+version = "0.26.0+fbterm.8"
 authors = ["Christian Duerr <contact@christianduerr.com>", "Joe Wilm <joe@jwilm.com>"]
 license = "Apache-2.0"
 description = "Terminal emulation library for featherbit terminal, forked from alacritty_terminal"
@@ -17,7 +17,7 @@ publish = false
 
 [features]
 default = ["serde"]
-serde = ["dep:serde", "bitflags/serde", "vte/serde"]
+serde = ["dep:serde", "bitflags/serde"]
 # Test-only hooks (not a stable API): `Grid::new_with_block_size`, so integration tests and the
 # differential test can use tiny history blocks. The crate enables it for its own tests through
 # the self dev-dependency below.
@@ -37,8 +37,15 @@ unicode-width = "0.2.0"
 # Compresses cold history blocks (src/grid/cold.rs); chosen in benches/RESULTS.md, "Compressor choice".
 # No default features: the bulk API needs none (not `legacy` formats, `arrays` or `zdict_builder`).
 zstd = { version = "0.14.3", default-features = false }
-vte = { version = "0.15.0", default-features = false, features = ["std", "ansi"] }
+# Vendored VT parser (`src/vte`): the dependencies `vte` 0.15.0 needed for its `std` + `ansi` build,
+# carried over here. `bitflags` and `log` above are shared; `serde` (optional, below) is wired through
+# this crate's own `serde` feature. Only what feathercritty uses is kept: no `arrayvec` (the parser
+# always uses `Vec`).
+cursor-icon = { version = "1", default-features = false }
+memchr = "2"
 serde = { version = "1", features = ["derive", "rc"], optional = true }
+flate2 = "1.1.11"
+imagesize = "0.15.0"
 
 [target.'cfg(unix)'.dependencies]
 rustix-openpty = "0.2.0"
@@ -71,6 +78,10 @@ rand_chacha = "0.3"
 # Checks that a match the fork returns where 0.26.0 cannot answer is a real match (the library
 # already depends on this crate).
 regex-automata = "0.4.3"
+# The sixel reference fixtures (src/graphics/sixel_tests.rs): their expected pixels are written as
+# PNG by the fixture generator and read back in the test to compare the decoder against. Dev-only;
+# nothing in the library encodes or decodes PNG through it.
+png = "0.17"
 
 # Benchmarks print their own tables (and take `--gate`), so they bring their own `main`.
 [[bench]]

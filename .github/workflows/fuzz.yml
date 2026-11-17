@@ -1,0 +1,86 @@
+# Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
+name: Fuzz
+
+# Fuzzes every parser of remote input. The short 60 s run per target is what a pull request and
+# what `cargo +nightly fuzz run` locally do; a manual run takes a duration. Seeds are valid
+# sequences under `fuzz/seeds/<target>/`, the corpus is cached between runs, and the weekly run
+# minimizes it.
+
+on:
+  pull_request:
+    paths:
+      - "src/vte/**"
+      - "src/graphics/**"
+      - "src/term/**"
+      - "src/grid/**"
+      - "fuzz/**"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    # Mondays 05:30, as in the fuzzing workflows this mirrors.
+    - cron: "30 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Seconds to fuzz each target"
+        default: "600"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - kitty
+          - sixel
+          - inline
+          - parser_strings
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz
+      - name: Install cargo-fuzz
+        run: command -v cargo-fuzz || cargo install cargo-fuzz --locked
+      - name: Restore corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      - name: Fuzz
+        env:
+          TARGET: ${{ matrix.target }}
+          DISPATCH_SECONDS: ${{ inputs.seconds }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          case "$EVENT" in
+            workflow_dispatch) FUZZ_SECONDS=$DISPATCH_SECONDS ;;
+            *) FUZZ_SECONDS=60 ;;
+          esac
+          case $FUZZ_SECONDS in ''|*[!0-9]*) echo "bad duration: $FUZZ_SECONDS"; exit 1;; esac
+          mkdir -p "fuzz/corpus/$TARGET"
+          cargo +nightly fuzz run "$TARGET" \
+            "fuzz/corpus/$TARGET" "fuzz/seeds/$TARGET" \
+            -- -max_total_time="$FUZZ_SECONDS"
+      - name: Minimize corpus
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo +nightly fuzz cmin "$TARGET" "fuzz/corpus/$TARGET"
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/

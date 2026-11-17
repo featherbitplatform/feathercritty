@@ -397,9 +397,37 @@ impl<T: HistoryCell> Grid<T> {
         T: ResetDiscriminant<D>,
         D: PartialEq,
     {
+        let noop = |_, _, _| {};
+        self.scroll_up_observed(region, positions, &mut { noop });
+    }
+
+    /// [`scroll_up`](Self::scroll_up), reporting to `observed` what moved (feathercritty; not
+    /// upstream). Resize uses this to remap the image-placement anchors its observer tracks:
+    /// `observed(positions, evicted, history_before)`, where `evicted` is how many rows left the
+    /// buffer entirely — rows pushed into a full history evict their oldest, and with a history
+    /// limit of 0 nothing rotates in at all (all `rotated` departing rows' content is lost) —
+    /// and `history_before` is the history size beforehand, which with `evicted` identifies the
+    /// evicted rows: those whose buffer index (distance from the bottom row, as upstream's reflow
+    /// loop numbers it) reached `screen_lines + history_before - evicted`. Every other row's
+    /// content survives the rotation and its index simply grows by `positions`. Only rotations
+    /// of the whole viewport (`region.start == 0`) are reported; others move nothing between
+    /// history and screen.
+    fn scroll_up_observed<D>(
+        &mut self,
+        region: &Range<Line>,
+        positions: usize,
+        observed: &mut dyn FnMut(usize, usize, usize),
+    ) where
+        T: ResetDiscriminant<D>,
+        D: PartialEq,
+    {
         // feathercritty: throughout, `self.raw` became `self.screen.raw` (or `self.screen` for
         // indexing) and `self.max_scroll_limit` became `self.history.limit()`; the other changes
         // are marked where they are.
+
+        // feathercritty: what the observer reports (see there).
+        let history_before = self.history.len();
+        let mut pushed: usize = 0;
 
         // When rotating the entire region with fixed lines at the top, just reset everything.
         if region.end - region.start <= positions && region.start != 0 {
@@ -436,7 +464,9 @@ impl<T: HistoryCell> Grid<T> {
             // upstream: if upstream changes this rotation, port it onto these pushes; the
             // differential test checks the result.
             for i in (0..rotated).map(Line::from) {
+                // feathercritty: count every push for the observer's eviction arithmetic.
                 self.history.push_newest(&self.screen[i]);
+                pushed += 1;
             }
 
             // Swap the lines fixed at the top to their target positions after rotation.
@@ -487,7 +517,16 @@ impl<T: HistoryCell> Grid<T> {
             row.reset(&self.cursor.template);
             for _ in rotated..positions {
                 self.history.push_newest(&row);
+                pushed += 1;
             }
+        }
+
+        // feathercritty: report the rotation to the observer (see `scroll_up_observed`). Only
+        // whole-viewport rotations move rows between history and screen; a reset of the whole
+        // region returns above.
+        if region.start == 0 {
+            let grew = self.history.len().saturating_sub(history_before);
+            observed(positions, pushed.saturating_sub(grew), history_before);
         }
     }
 
