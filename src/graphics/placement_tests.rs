@@ -18,6 +18,7 @@ use crate::graphics::placements::{
     GridWindow, MAX_PLACEHOLDERS, MAX_PLACEMENTS, PlacementTable, Screen,
 };
 use crate::grid::{Dimensions, Scroll};
+use crate::index::{Column, Line, Point};
 use crate::term::{Config, Term};
 use crate::vte::ansi::{Processor, Rgb};
 
@@ -302,6 +303,18 @@ fn tiny_and_oversized_spans() {
     assert_eq!((placements[0].row_in_view, placements[0].col), (9, 9));
     assert_eq!(cursor(&term), (9, 0), "the cursor wraps past the image onto its last row");
 
+    // A six-row image whose bottom lands exactly on the screen's last row: the three rows
+    // that do not fit scroll away and the anchor moves up with them — like six newlines
+    // would — so the whole image stays visible, ending on the last row.
+    feed(&mut term, b"\x1b[8;1H");
+    let seq = transmit(3, "f=24", Some((1, 6)), &[9u8; 18], "");
+    feed(&mut term, &seq);
+    recorder.received();
+    let placements = term.visible_placements();
+    let middle = placements.iter().find(|p| p.rows == 6).unwrap();
+    assert_eq!((middle.row_in_view, middle.col), (4, 0));
+    assert_eq!(cursor(&term), (9, 1), "last row of the image, one cell past its last column");
+
     // A 500x300 pixel image from the top: it scrolls as text would and is clipped below.
     feed(&mut term, b"\x1b[1;1H");
     let seq = transmit(2, "f=24", Some((500, 300)), &rgb(500, 300), "");
@@ -312,6 +325,58 @@ fn tiny_and_oversized_spans() {
     assert_eq!((big.cols, big.rows), (500, 300));
     assert_eq!(big.row_in_view, 0, "its anchor is the cursor row after scrolling");
     assert_eq!(cursor(&term), (9, 9), "the cursor clamps to the screen's last cell");
+}
+
+#[test]
+fn sixel_at_the_bottom_of_the_screen_is_fully_visible() {
+    // An image tool run from a prompt sits at the bottom of a full screen. The image's rows
+    // behave like its newlines: the screen scrolls to fit it, the anchor moves up with the
+    // content that scrolled, and — because the DECSDM-off cursor rule wants the line below
+    // the image, which does not exist when the image ends on the region's bottom row — one
+    // more line scrolls so the cursor really lands below the image, as it does mid-screen.
+    let (mut term, recorder) = term(10, 5);
+    term.set_cell_pixel_size(1, 6); // one sixel band per cell row
+    feed(&mut term, b"\x1b[5;1H"); // the screen's last row
+    feed(&mut term, b"\x1bPq#0~-~\x1b\\"); // a 1x12 px sixel: two rows tall
+
+    assert_eq!(recorder.received().len(), 1);
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!((placements[0].cols, placements[0].rows), (1, 2));
+    assert_eq!(
+        (placements[0].row_in_view, placements[0].col),
+        (2, 0),
+        "the whole image is on screen, clear of the bottom edge"
+    );
+    assert_eq!(cursor(&term), (4, 0), "the cursor sits below the image, same column");
+    assert!(recorder.released().is_empty(), "the placement still references it");
+}
+
+#[test]
+fn kitty_transmission_at_the_bottom_scrolls_its_text_up_with_it() {
+    // Five lines fill a screen; an `a=T` image taller than the space left below the cursor
+    // scrolls exactly as its own newlines would: the earlier text rides up into history,
+    // the cursor moves up with its line, and the image ends fully on screen instead of half
+    // hanging off the bottom edge.
+    let (mut term, recorder) = term(10, 5); // cell size unset: each pixel is a cell
+    feed(&mut term, b"1\r\n2\r\n3\r\n4\r\n5"); // cursor on line 4, column 1
+    feed(&mut term, &transmit(1, "f=24", Some((1, 3)), &[7u8; 9], ",q=2")); // three rows tall
+
+    let events = recorder.take();
+    assert_eq!(received_of(&events).len(), 1);
+    assert_eq!(writes_of(&events), "", "q=2 answers nothing");
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!((placements[0].row_in_view, placements[0].col), (2, 1));
+    assert_eq!((placements[0].cols, placements[0].rows), (1, 3), "the whole image is on screen");
+
+    // The text moved up with its line rather than scrolling away for nothing: the last three
+    // lines now sit at rows 0..2.
+    let grid = term.grid();
+    for (line, want) in [(0i32, '3'), (1, '4'), (2, '5')] {
+        let cell = grid.cell(Point { line: Line(line), column: Column(0) });
+        assert_eq!(cell.c, want);
+    }
 }
 
 #[test]
@@ -1097,7 +1162,9 @@ fn alternate_screen_resize_does_not_duplicate_primary_placements() {
     let key = recorder.received()[0].0;
     let placements = term.visible_placements();
     assert_eq!(placements.len(), 1);
-    assert_eq!((placements[0].row_in_view, placements[0].col), (6, 1));
+    // The image's two rows land exactly on the screen's last row, so one line scrolls to put
+    // the cursor below it (see `sixel_at_the_bottom_of_the_screen_is_fully_visible`).
+    assert_eq!((placements[0].row_in_view, placements[0].col), (5, 1));
 
     feed(&mut term, b"\x1b[?1049h"); // a full-screen program takes over; the image stays put
     term.resize(Size { columns: 9, lines: 6 });

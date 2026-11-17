@@ -1271,8 +1271,12 @@ impl<T> Term<T> {
     }
 
     /// Scroll the screen so an image of `rows` lines starting at the cursor line fits. Only a
-    /// full-screen scroll region scrolls (the cursor keeps its viewport row; its content rides up);
-    /// inside a partial region the display is clipped at the region's bottom edge instead.
+    /// full-screen scroll region scrolls; inside a partial region the display is clipped at the
+    /// region's bottom edge instead. When it does scroll, the cursor moves up with the content
+    /// that rode through the rotation (clamped to the region top): the image's rows behave like
+    /// `rows` newlines, so its anchor — taken from the cursor right after this call — lands on
+    /// the line its content ends up on instead of staying at the viewport bottom while its
+    /// earlier rows scroll into history for nothing.
     fn make_room(&mut self, rows: u32)
     where
         T: EventListener,
@@ -1283,7 +1287,43 @@ impl<T> Term<T> {
             && self.scroll_region.end.0 as usize == self.screen_lines();
         if overflow > 0 && full_region {
             self.scroll_up_relative(Line(0), overflow as usize);
+
+            // feathercritty: the cursor rides up with its line, exactly as a newline would
+            // carry it when the screen scrolls under it. Not upstream.
+            self.damage_cursor();
+            let line = cmp::max(
+                self.grid.cursor.point.line.0 - overflow as i32,
+                self.scroll_region.start.0,
+            );
+            self.grid.cursor.point.line = Line(line);
+            self.damage_cursor();
         }
+    }
+
+    /// The DECSDM-off sixel/inline rule puts the cursor on the line *below* the image. When
+    /// the image's last row is the scroll region's bottom — the usual case at a prompt, where
+    /// `make_room` scrolled to fit it — that line does not exist yet: scroll one more row, as
+    /// the newline this placement stands in for would, so the cursor really ends below the
+    /// image as it does mid-screen. The image's last row is its region bottom exactly when the
+    /// cursor (left on the image's first row by `make_room`) plus `rows` names the row one
+    /// past the region. Only a full-screen region scrolls, matching `make_room`.
+    fn scroll_for_cursor_below_image(&mut self, rows: u32)
+    where
+        T: EventListener,
+    {
+        let full_region = self.scroll_region.start == Line(0)
+            && self.scroll_region.end.0 as usize == self.screen_lines();
+        if !full_region
+            || i64::from(self.grid.cursor.point.line.0) + i64::from(rows)
+                != i64::from(self.scroll_region.end.0)
+        {
+            return;
+        }
+        self.scroll_up_relative(Line(0), 1);
+        self.damage_cursor();
+        self.grid.cursor.point.line =
+            cmp::max(self.grid.cursor.point.line - 1, self.scroll_region.start);
+        self.damage_cursor();
     }
 
     /// Move the cursor past an image placed at viewport column `col` spanning `rows` lines.
@@ -1349,6 +1389,7 @@ impl<T> Term<T> {
             Ok(events) => {
                 self.send_image_events(events);
                 if !self.mode.contains(TermMode::DECSDM) {
+                    self.scroll_for_cursor_below_image(rows);
                     self.move_cursor_below_image(col, cols, rows, false);
                 }
             },
@@ -1401,6 +1442,7 @@ impl<T> Term<T> {
             Ok(events) => {
                 self.send_image_events(events);
                 if !self.mode.contains(TermMode::DECSDM) {
+                    self.scroll_for_cursor_below_image(rows);
                     self.move_cursor_below_image(col, cols, rows, false);
                 }
             },
