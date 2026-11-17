@@ -352,6 +352,15 @@ pub struct Term<T> {
     /// sent by the next bounded operation ([`flush_image_events`](Self::flush_image_events)).
     pending_image_events: Vec<Event>,
 
+    /// Whether images are supported at all ([`set_images_enabled`](Self::set_images_enabled), on
+    /// by default). Off, no sequence stores or displays anything and the support reports say so.
+    images_enabled: bool,
+
+    /// Whether [`set_cell_pixel_size`](Self::set_cell_pixel_size) has been called: until it has,
+    /// the pixel size reports (`CSI 14 t`, `CSI 16 t`) ask the host through
+    /// [`Event::TextAreaSizeRequest`] instead of answering from the grid.
+    cell_size_known: bool,
+
     /// Config directly for the terminal.
     config: Config,
 }
@@ -521,6 +530,8 @@ impl<T> Term<T> {
             sixel_decoder: None,
             inline_parser: Default::default(),
             pending_image_events: Vec::new(),
+            images_enabled: true,
+            cell_size_known: false,
             config,
             grid,
             tabs,
@@ -904,12 +915,18 @@ impl<T> Term<T> {
     }
 
     /// Answer a sequence the kitty parser rejected, unless its quiet level suppresses it.
+    ///
+    /// With image support off the answer becomes `ENOTSUPPORTED`: off, "not supported" is the only
+    /// graphics answer this terminal gives, so a frame that would have been refused for a narrower
+    /// reason (a bad key, a file medium, a stalled upload) is refused as unsupported instead.
     fn drain_kitty_reject(&mut self)
     where
         T: EventListener,
     {
         if let Some(reject) = self.kitty_parser.take_reject() {
-            self.send_kitty_reply(reject.id, reject.number, None, Err(reject.error), reject.quiet);
+            let error =
+                if self.images_enabled { reject.error } else { kitty::KittyError::ENOTSUPPORTED };
+            self.send_kitty_reply(reject.id, reject.number, None, Err(error), reject.quiet);
         }
     }
 
@@ -931,10 +948,39 @@ impl<T> Term<T> {
     }
 
     /// Act on one completed graphics sequence: transmit, place, delete or the support query.
+    ///
+    /// With image support off ([`set_images_enabled`](Self::set_images_enabled)) nothing is stored
+    /// or displayed and every frame gets the protocol's "not supported" answer instead.
     fn handle_kitty_command(&mut self, command: kitty::KittyCommand)
     where
         T: EventListener,
     {
+        // feathercritty: off, the payload goes unused; only the answer remains (the quiet level
+        // still suppresses it). Not upstream.
+        if !self.images_enabled {
+            let (id, number, placement, quiet) = match &command {
+                kitty::KittyCommand::Transmit { id, number, quiet, .. } => {
+                    (id.unwrap_or(0), *number, None, *quiet)
+                },
+                kitty::KittyCommand::Place(place) => {
+                    (place.id.unwrap_or(0), place.number, place.placement_id, place.quiet)
+                },
+                kitty::KittyCommand::Delete(delete) => match delete.target {
+                    kitty::DeleteTarget::ImageId { image, placement } => {
+                        (image.unwrap_or(0), None, placement, delete.quiet)
+                    },
+                    kitty::DeleteTarget::Number { number, placement } => {
+                        (0, number, placement, delete.quiet)
+                    },
+                    _ => (0, None, None, delete.quiet),
+                },
+                kitty::KittyCommand::Query { id, quiet } => (*id, None, None, *quiet),
+            };
+            let error = Err(kitty::KittyError::ENOTSUPPORTED);
+            self.send_kitty_reply(id, number, placement, error, quiet);
+            return;
+        }
+
         match command {
             kitty::KittyCommand::Transmit { id, number, format, bytes, then_place, quiet } => {
                 let (width, height) = match format {
@@ -1013,8 +1059,7 @@ impl<T> Term<T> {
                     delete.quiet,
                 );
             },
-            // The support query: images are always on until a host turns them off (Task 7 wires
-            // the switch), so this answers OK.
+            // The support query: `OK` unless a host turned image support off.
             kitty::KittyCommand::Query { id, quiet } => {
                 self.send_kitty_reply(id, None, None, Ok(()), quiet);
             },
@@ -1365,13 +1410,66 @@ impl<T> Term<T> {
         }
     }
 
+    /// The text area's extent in physical pixels, `(width, height)`, from the cell size
+    /// [`set_cell_pixel_size`](Self::set_cell_pixel_size) set and the grid's current size
+    /// (feathercritty; not upstream). `u64` so a host with enormous reported metrics cannot
+    /// overflow it.
+    fn text_area_pixels(&self) -> (u64, u64) {
+        let (cell_w, cell_h) = self.placements.cell_pixel_size();
+        (
+            (self.columns() as u64) * u64::from(cell_w),
+            (self.screen_lines() as u64) * u64::from(cell_h),
+        )
+    }
+
     /// Set the physical pixel size of a text cell (feathercritty; not upstream).
     ///
     /// Placements convert pixel sizes to cell spans with this, so hosts that know their font
-    /// metrics should set it before images arrive. Each axis is clamped to at least 1.
+    /// metrics should set it before images arrive. Each axis is clamped to at least 1. It is also
+    /// what `CSI 14 t` and `CSI 16 t` report; until it is set those ask the host instead (see
+    /// [`Handler::text_area_size_pixels`](crate::vte::ansi::Handler::text_area_size_pixels)).
     #[inline]
     pub fn set_cell_pixel_size(&mut self, width: u32, height: u32) {
         self.placements.set_cell_pixel_size(width, height);
+        self.cell_size_known = true;
+    }
+
+    /// Whether image support is on (feathercritty; not upstream; on by default).
+    ///
+    /// On, the terminal behaves like one with graphics support: DA1 advertises sixel, XTSMGRAPHICS
+    /// reports the colour registers and the text area's pixel geometry, `CSI 14 t` and `CSI 16 t`
+    /// report physical pixels, and kitty, sixel and OSC 1337 sequences display images.
+    ///
+    /// Off, every image sequence is consumed and discarded: no payload reaches the embedder, no
+    /// placement is made, the kitty support query (`a=q`) answers `ENOTSUPPORTED` and every other
+    /// completed kitty frame does too (subject to its quiet level), XTSMGRAPHICS requests answer
+    /// with an error status, and DA1 leaves out the sixel bit. Switching off also drops everything
+    /// already stored or displayed — placements, virtuals, ids and images, each image released
+    /// exactly once — and abandons any transmission in progress; a decode result that arrives for
+    /// one of those keys afterwards answers nothing, as after a full reset.
+    ///
+    /// The switch is the host's setting, not the program's: neither a full reset (`RIS`) nor
+    /// [`set_options`](Self::set_options) changes it.
+    pub fn set_images_enabled(&mut self, on: bool)
+    where
+        T: EventListener,
+    {
+        if self.images_enabled == on {
+            return;
+        }
+        self.images_enabled = on;
+        if on {
+            return;
+        }
+        // Queued releases first: they name keys this is about to release too (see `reset_state`).
+        let mut events = mem::take(&mut self.pending_image_events);
+        self.placements.reset_all(&mut events);
+        self.kitty_parser = Default::default();
+        self.sixel_decoder = None;
+        self.inline_parser = Default::default();
+        for event in events {
+            self.event_proxy.send_event(event);
+        }
     }
 
     /// Whether image placements stay when they scroll into the history (feathercritty; not
@@ -2367,6 +2465,18 @@ fn inline_cells(dim: inline::Dim, cell_px: u32, terminal_px: u32) -> u32 {
     }
 }
 
+/// The XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`) items this terminal answers: `Pi=1` counts the colour
+/// registers one sixel image gets, `Pi=2` is the sixel geometry in pixels. The protocol's third
+/// item, ReGIS geometry, is not supported here (feathercritty; not upstream).
+const XTSM_ITEM_COLOUR_REGISTERS: u16 = 1;
+const XTSM_ITEM_SIXEL_GEOMETRY: u16 = 2;
+
+/// The XTSMGRAPHICS actions (`Pa`) this terminal answers — `1` read, `2` reset to the default, `3`
+/// set from `Pv`, `4` read the maximum allowed value (feathercritty; not upstream). Every item it
+/// reports is a fixed capability, so all four answer with what the attribute already is.
+const XTSM_ACTION_FIRST: u16 = 1;
+const XTSM_ACTION_LAST: u16 = 4;
+
 impl<T: EventListener> Handler for Term<T> {
     // feathercritty: graphics protocol sequences; not upstream. APC frames feed the kitty parser,
     // DCS `q` canvases the sixel decoder and OSC 1337 file transfers the inline image parser.
@@ -2397,6 +2507,11 @@ impl<T: EventListener> Handler for Term<T> {
 
     fn sixel_start(&mut self, params: &[u16]) {
         self.flush_image_events();
+        // feathercritty: with image support off the canvas is never built — `sixel_put` drops the
+        // bytes and `sixel_end` has nothing to display. Not upstream.
+        if !self.images_enabled {
+            return;
+        }
         // A black default background: the core does not know the host theme's colors, and
         // `P2=0|2` images paint their canvas anyway.
         self.sixel_decoder = Some(sixel::SixelDecoder::new(params, sixel::Rgba::new(0, 0, 0)));
@@ -2426,6 +2541,11 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn inline_image_start(&mut self, args: &[u8]) {
         self.flush_image_events();
+        // feathercritty: with image support off nothing is started, so the payload is consumed and
+        // dropped by `put` without being collected. Not upstream.
+        if !self.images_enabled {
+            return;
+        }
         self.inline_parser.start(args);
     }
 
@@ -2443,6 +2563,39 @@ impl<T: EventListener> Handler for Term<T> {
     #[inline]
     fn inline_image_abort(&mut self) {
         self.inline_parser.abort();
+    }
+
+    /// XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`): the colour registers and the sixel geometry.
+    ///
+    /// Both are fixed capabilities here — the colour-register count the sixel decoder gives each
+    /// image, and the text area in physical pixels capped at [`limits::MAX_IMAGE_SIDE`] per axis —
+    /// so read, read-maximum, set and reset all answer success with what stands. Nothing is adopted
+    /// from `Pv`, which is why the request's value goes unused; reporting a number the terminal did
+    /// not take would claim a capability it does not have. An unknown item answers status 1 (error
+    /// in `Pi`), an unknown action status 2 (error in `Pa`). With image support off
+    /// ([`Term::set_images_enabled`]) every request answers status 1, without a value.
+    fn graphics_attributes(&mut self, item: u16, action: u16, _value: Option<u16>) {
+        trace!("XTSMGRAPHICS item {item}, action {action}");
+        if !self.images_enabled {
+            self.event_proxy.send_event(Event::PtyWrite(format!("\x1b[?{item};1S")));
+            return;
+        }
+        let known_action = matches!(action, XTSM_ACTION_FIRST..=XTSM_ACTION_LAST);
+        let reply = match item {
+            // An action this terminal does not know, on an item it does: status 2 (error in `Pa`).
+            XTSM_ITEM_COLOUR_REGISTERS | XTSM_ITEM_SIXEL_GEOMETRY if !known_action => {
+                format!("\x1b[?{item};2S")
+            },
+            XTSM_ITEM_COLOUR_REGISTERS => format!("\x1b[?{item};0;{}S", sixel::REGISTERS),
+            XTSM_ITEM_SIXEL_GEOMETRY => {
+                let (width, height) = self.text_area_pixels();
+                let cap = u64::from(limits::MAX_IMAGE_SIDE);
+                format!("\x1b[?{item};0;{};{}S", width.min(cap), height.min(cap))
+            },
+            // An item this terminal does not have is status 1 (error in `Pi`), whatever it asked.
+            _ => format!("\x1b[?{item};1S"),
+        };
+        self.event_proxy.send_event(Event::PtyWrite(reply));
     }
 
     /// A character to be displayed.
@@ -2669,7 +2822,14 @@ impl<T: EventListener> Handler for Term<T> {
         match intermediate {
             None => {
                 trace!("Reporting primary device attributes");
-                let text = String::from("\x1b[?6c");
+                // feathercritty: with image support on, the answer adds the sixel graphics bit
+                // (`4`) and ANSI colour (`22`) to the VT500-class conformance level (`62`); off it
+                // is what a terminal without graphics support says. Not upstream.
+                let text = if self.images_enabled {
+                    String::from("\x1b[?62;4;22c")
+                } else {
+                    String::from("\x1b[?6c")
+                };
                 self.event_proxy.send_event(Event::PtyWrite(text));
             },
             Some('>') => {
@@ -3791,10 +3951,37 @@ impl<T: EventListener> Handler for Term<T> {
 
     #[inline]
     fn text_area_size_pixels(&mut self) {
+        // feathercritty: once the host has reported its cell size (`set_cell_pixel_size`) the
+        // answer comes straight from the grid and that size; without it the host is asked, as
+        // before. Not upstream.
+        if self.cell_size_known {
+            let (width, height) = self.text_area_pixels();
+            let text = format!("\x1b[4;{height};{width}t");
+            self.event_proxy.send_event(Event::PtyWrite(text));
+            return;
+        }
         self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
             let height = window_size.num_lines * window_size.cell_height;
             let width = window_size.num_cols * window_size.cell_width;
             format!("\x1b[4;{height};{width}t")
+        })));
+    }
+
+    /// Report the cell size in pixels (`CSI 16 t`): `\x1b[6;<height>;<width>t`.
+    ///
+    /// feathercritty: from the size `set_cell_pixel_size` set, so image programs sizing their
+    /// output by it see the same numbers placements do; until one is set the host is asked through
+    /// [`Event::TextAreaSizeRequest`], as `CSI 14 t` does. Not upstream.
+    #[inline]
+    fn cell_size_pixels(&mut self) {
+        if self.cell_size_known {
+            let (width, height) = self.placements.cell_pixel_size();
+            let text = format!("\x1b[6;{height};{width}t");
+            self.event_proxy.send_event(Event::PtyWrite(text));
+            return;
+        }
+        self.event_proxy.send_event(Event::TextAreaSizeRequest(Arc::new(move |window_size| {
+            format!("\x1b[6;{};{}t", window_size.cell_height, window_size.cell_width)
         })));
     }
 
@@ -5361,6 +5548,342 @@ mod tests {
             feed(&mut term, b"\x1b[?2027l");
             term.set_options(config);
             assert!(!on(&term));
+        }
+    }
+
+    // feathercritty: what the support reports answer (DA1, XTSMGRAPHICS, `CSI 14 t`/`16 t`) and
+    // the master switch; not upstream.
+    mod image_support {
+        use std::sync::{Arc, Mutex};
+
+        use base64::Engine;
+        use base64::engine::general_purpose::STANDARD;
+
+        use super::*;
+        use crate::event::{Event, EventListener, ImageKey, WindowSize};
+        use crate::graphics::limits::MAX_IMAGE_SIDE;
+        use crate::vte::ansi::Processor;
+
+        /// A host that records what the terminal writes back and which images it is handed,
+        /// answering a window-size request with the size it was configured with (what a real host
+        /// does with its own font metrics).
+        #[derive(Clone, Default)]
+        struct Host(Arc<Mutex<Log>>);
+
+        struct Log {
+            /// The window size this host reports when asked; the tests set their grid's.
+            window: WindowSize,
+            writes: Vec<String>,
+            received: Vec<ImageKey>,
+            released: Vec<ImageKey>,
+            /// Times the terminal asked for the window size instead of answering itself.
+            asked: usize,
+        }
+
+        /// A host with no size set yet reports this one (no test reads it without setting one).
+        impl Default for Log {
+            fn default() -> Self {
+                Self {
+                    window: WindowSize {
+                        num_lines: 24,
+                        num_cols: 80,
+                        cell_width: 9,
+                        cell_height: 18,
+                    },
+                    writes: Vec::new(),
+                    received: Vec::new(),
+                    released: Vec::new(),
+                    asked: 0,
+                }
+            }
+        }
+
+        impl EventListener for Host {
+            fn send_event(&self, event: Event) {
+                let mut log = self.0.lock().unwrap();
+                match event {
+                    // The host formats its own window size; the answer goes to the pty.
+                    Event::TextAreaSizeRequest(format) => {
+                        let window = log.window;
+                        log.asked += 1;
+                        log.writes.push(format(window));
+                    },
+                    Event::PtyWrite(text) => log.writes.push(text),
+                    Event::ImageReceived { key, .. } => log.received.push(key),
+                    Event::ImageReleased(key) => log.released.push(key),
+                    _ => {},
+                }
+            }
+        }
+
+        impl Host {
+            fn set_window(&self, window: WindowSize) {
+                self.0.lock().unwrap().window = window;
+            }
+
+            /// Everything written back since the last drain, concatenated.
+            fn writes(&self) -> String {
+                std::mem::take(&mut self.0.lock().unwrap().writes).concat()
+            }
+
+            /// The image keys handed to the host since the last drain.
+            fn received(&self) -> Vec<ImageKey> {
+                std::mem::take(&mut self.0.lock().unwrap().received)
+            }
+
+            /// The images released since the last drain.
+            fn released(&self) -> Vec<ImageKey> {
+                std::mem::take(&mut self.0.lock().unwrap().released)
+            }
+
+            /// How many times the host was asked for its window size since the last drain.
+            fn asked(&self) -> usize {
+                std::mem::take(&mut self.0.lock().unwrap().asked)
+            }
+        }
+
+        fn new_term(columns: usize, lines: usize) -> (Term<Host>, Host) {
+            let host = Host::default();
+            let term = Term::new(Config::default(), &TermSize::new(columns, lines), host.clone());
+            (term, host)
+        }
+
+        fn feed(term: &mut Term<Host>, bytes: &[u8]) {
+            let mut parser: Processor = Processor::new();
+            parser.advance(term, bytes);
+        }
+
+        fn cursor(term: &Term<Host>) -> (i32, usize) {
+            let point = term.grid().cursor.point;
+            (point.line.0, point.column.0)
+        }
+
+        /// A one-pixel black sixel sequence (the same one the placement tests use).
+        const SIXEL: &[u8] = b"\x1bPq#0?~\x1b\\";
+
+        /// The answer every disabled kitty frame gets, for an image addressed as `i=<id>` (`id` 0
+        /// leaves the address out).
+        fn enotsupported(id: u32) -> String {
+            if id == 0 {
+                return String::from("\x1b_G;ENOTSUPPORTED:not supported by this terminal\x1b\\");
+            }
+            format!("\x1b_Gi={id};ENOTSUPPORTED:not supported by this terminal\x1b\\")
+        }
+
+        /// A complete `a=T` transmission of raw pixels, with extra control keys (`,c=2,r=2` style)
+        /// appended to the frame.
+        fn transmit(
+            id: u32,
+            format: &str,
+            size: (u32, u32),
+            pixels: &[u8],
+            extra: &str,
+        ) -> Vec<u8> {
+            let (width, height) = size;
+            let mut out =
+                format!("\x1b_Ga=T,i={id},{format},s={width},v={height}{extra}").into_bytes();
+            out.push(b';');
+            out.extend_from_slice(STANDARD.encode(pixels).as_bytes());
+            out.extend(b"\x1b\\");
+            out
+        }
+
+        /// A PNG declaring `w`×`h`: only its IHDR is read, so the chunk CRC stays zero and no image
+        /// data follows (the same shape the inline parser's own tests build).
+        fn png(w: u32, h: u32) -> Vec<u8> {
+            let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+            v.extend_from_slice(&13u32.to_be_bytes());
+            v.extend_from_slice(b"IHDR");
+            v.extend_from_slice(&w.to_be_bytes());
+            v.extend_from_slice(&h.to_be_bytes());
+            v.extend_from_slice(&[8, 6, 0, 0, 0]); // depth, color type, compression, filter, interlace
+            v.extend_from_slice(&[0, 0, 0, 0]); // CRC: never looked at
+            v
+        }
+
+        /// An OSC 1337 sequence carrying `png(w, h)` as an inline image.
+        fn inline_image(w: u32, h: u32) -> Vec<u8> {
+            let mut out = b"\x1b]1337;File=inline=1:".to_vec();
+            out.extend_from_slice(STANDARD.encode(png(w, h)).as_bytes());
+            out.extend(b"\x1b\\");
+            out
+        }
+
+        #[test]
+        fn da1_advertises_sixel_when_on() {
+            let (mut term, host) = new_term(10, 4);
+
+            feed(&mut term, b"\x1b[c");
+            assert_eq!(host.writes(), "\x1b[?62;4;22c", "sixel and ANSI colour are advertised");
+
+            // The secondary answer (the crate version) is not the switch's to change.
+            let version = version_number(env!("CARGO_PKG_VERSION"));
+            feed(&mut term, b"\x1b[>c");
+            assert_eq!(host.writes(), format!("\x1b[>0;{version};1c"));
+
+            // Off: what a terminal without graphics support says. The switch is the host's, so a
+            // full reset leaves it alone.
+            term.set_images_enabled(false);
+            feed(&mut term, b"\x1bc\x1b[c");
+            assert_eq!(host.writes(), "\x1b[?6c", "no sixel bit without image support");
+
+            // And on again.
+            term.set_images_enabled(true);
+            feed(&mut term, b"\x1b[c");
+            assert_eq!(host.writes(), "\x1b[?62;4;22c");
+        }
+
+        #[test]
+        fn xtsmgraphics_replies() {
+            let (mut term, host) = new_term(10, 4);
+            term.set_cell_pixel_size(8, 16); // a text area of 80 by 64 pixels
+
+            // Reads answer what this terminal has.
+            feed(&mut term, b"\x1b[?1;1S\x1b[?2;1S");
+            assert_eq!(host.writes(), "\x1b[?1;0;1024S\x1b[?2;0;80;64S");
+
+            // The geometry never asks for a side bigger than an image may have.
+            term.set_cell_pixel_size(4_000, 4_000);
+            feed(&mut term, b"\x1b[?2;1S");
+            let cap = u64::from(MAX_IMAGE_SIDE);
+            assert_eq!(host.writes(), format!("\x1b[?2;0;{cap};{cap}S"));
+
+            // Set and reset succeed without changing anything, so they report what stands: the
+            // registers as they are, the geometry as the grid and cell size make it.
+            term.set_cell_pixel_size(8, 16);
+            feed(&mut term, b"\x1b[?1;2S\x1b[?1;3;256S\x1b[?2;3;10;20S\x1b[?2;4S");
+            assert_eq!(
+                host.writes(),
+                "\x1b[?1;0;1024S\x1b[?1;0;1024S\x1b[?2;0;80;64S\x1b[?2;0;80;64S"
+            );
+
+            // An item this terminal does not have, and an action it does not know.
+            feed(&mut term, b"\x1b[?7;1S\x1b[?1;9S");
+            assert_eq!(host.writes(), "\x1b[?7;1S\x1b[?1;2S");
+
+            // With images off every request is an error.
+            term.set_images_enabled(false);
+            feed(&mut term, b"\x1b[?1;1S\x1b[?2;3;256S\x1b[?7;1S");
+            assert_eq!(host.writes(), "\x1b[?1;1S\x1b[?2;1S\x1b[?7;1S");
+
+            // A cell size the host never set: the geometry counts each cell as one pixel.
+            let (mut term, host) = new_term(3, 2);
+            feed(&mut term, b"\x1b[?2;1S");
+            assert_eq!(host.writes(), "\x1b[?2;0;3;2S");
+            assert_eq!(host.asked(), 0, "the geometry comes from the grid, not the host");
+        }
+
+        #[test]
+        fn pixel_size_reports_physical() {
+            let (mut term, host) = new_term(10, 4);
+            host.set_window(WindowSize {
+                num_lines: 4,
+                num_cols: 10,
+                cell_width: 9,
+                cell_height: 18,
+            });
+
+            // No cell size known yet: both reports ask the host, as they did before image support.
+            feed(&mut term, b"\x1b[14t\x1b[16t");
+            assert_eq!(host.asked(), 2, "both fall back to asking the host");
+            assert_eq!(host.writes(), "\x1b[4;72;90t\x1b[6;18;9t");
+
+            // Once the host has reported its metrics the answers come from the grid and that size.
+            term.set_cell_pixel_size(8, 16);
+            feed(&mut term, b"\x1b[14t\x1b[16t");
+            assert_eq!(host.asked(), 0, "nothing is asked any more");
+            assert_eq!(host.writes(), "\x1b[4;64;80t\x1b[6;16;8t");
+
+            // A resize moves the text area, not the cell.
+            term.resize(TermSize::new(20, 5));
+            feed(&mut term, b"\x1b[14t\x1b[16t");
+            assert_eq!(host.writes(), "\x1b[4;80;160t\x1b[6;16;8t");
+
+            // The switch does not silence the size reports: a host that shows no images still has
+            // cells of a known size.
+            term.set_images_enabled(false);
+            feed(&mut term, b"\x1b[14t\x1b[16t");
+            assert_eq!(host.writes(), "\x1b[4;80;160t\x1b[6;16;8t");
+
+            // `CSI 18 t` still answers in characters.
+            feed(&mut term, b"\x1b[18t");
+            assert_eq!(host.writes(), "\x1b[8;5;20t");
+        }
+
+        #[test]
+        fn disabled_images_are_inert() {
+            let (mut term, host) = new_term(12, 6);
+            term.set_cell_pixel_size(8, 16); // so the images below span one cell each
+            term.set_images_enabled(false);
+
+            // DA1 leaves the sixel bit out.
+            feed(&mut term, b"\x1b[c");
+            assert_eq!(host.writes(), "\x1b[?6c");
+
+            // The support query answers with the protocol's "not supported".
+            feed(&mut term, b"\x1b_Ga=q,i=7\x1b\\");
+            assert_eq!(host.writes(), enotsupported(7));
+
+            // A sixel is consumed where an image would have been placed: nothing reaches the host,
+            // nothing is placed, and the cursor stays (DECSDM off moves it below an image).
+            feed(&mut term, b"\x1b[2;3H");
+            let before = cursor(&term);
+            feed(&mut term, SIXEL);
+            assert_eq!(cursor(&term), before, "a discarded sixel does not move the cursor");
+            assert!(host.received().is_empty(), "no payload for the host");
+            assert!(host.released().is_empty());
+            assert!(term.visible_placements().is_empty(), "nothing was displayed");
+
+            // A kitty transmission with its placement, then a standalone place and a delete: each
+            // frame is answered "not supported" and leaves nothing behind.
+            feed(&mut term, &transmit(3, "f=24", (1, 1), &[0, 0, 0], ",c=1,r=1"));
+            assert!(host.received().is_empty(), "no image was stored");
+            assert!(term.visible_placements().is_empty());
+            assert_eq!(host.writes(), enotsupported(3));
+            feed(&mut term, b"\x1b_Ga=p,i=3\x1b\\");
+            assert_eq!(host.writes(), enotsupported(3));
+            feed(&mut term, b"\x1b_Ga=d,d=a\x1b\\");
+            assert_eq!(host.writes(), enotsupported(0));
+
+            // A frame the parser refuses is refused as unsupported too — off, that is the only
+            // graphics answer this terminal gives. The quiet level still applies: `a=f` (animation)
+            // is refused at dispatch, after its `q` was read.
+            feed(&mut term, b"\x1b_Ga=x\x1b\\"); // an action the protocol does not define
+            assert_eq!(host.writes(), enotsupported(0));
+            feed(&mut term, b"\x1b_Ga=f,i=8,q=2\x1b\\");
+            assert_eq!(host.writes(), "", "q=2 suppresses the answer as it always did");
+
+            // An OSC 1337 image is consumed without collecting its payload.
+            feed(&mut term, &inline_image(2, 2));
+            assert!(host.received().is_empty());
+            assert!(term.visible_placements().is_empty());
+
+            // The very same sequences do display once the host turns images back on.
+            term.set_images_enabled(true);
+            feed(&mut term, SIXEL);
+            feed(&mut term, &inline_image(2, 2));
+            feed(&mut term, &transmit(9, "f=32", (8, 8), &[0x7F; 8 * 8 * 4], ",c=1,r=1"));
+            assert_eq!(host.received().len(), 3, "sixel, inline and kitty all display");
+            assert_eq!(term.visible_placements().len(), 3);
+            assert_eq!(host.writes(), "\x1b_Gi=9;OK\x1b\\");
+            feed(&mut term, b"\x1b_Ga=q,i=9\x1b\\");
+            assert_eq!(host.writes(), "\x1b_Gi=9;OK\x1b\\", "the query is OK again");
+
+            // Switching off drops what was stored and displayed, releasing each image exactly once.
+            term.set_images_enabled(false);
+            assert_eq!(host.released().len(), 3, "every image releases once");
+            assert!(term.visible_placements().is_empty());
+            feed(&mut term, b"\x1b_Ga=p,i=9\x1b\\");
+            assert_eq!(
+                host.writes(),
+                enotsupported(9),
+                "off, every frame answers 'not supported' (and its data went with the switch)"
+            );
+            assert!(host.released().is_empty(), "nothing releases a second time");
+
+            // Switching off again, with nothing stored, changes nothing.
+            term.set_images_enabled(false);
+            assert!(host.released().is_empty());
         }
     }
 }

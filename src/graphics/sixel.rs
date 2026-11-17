@@ -64,7 +64,7 @@
 use super::limits::{MAX_IMAGE_BYTES, MAX_IMAGE_SIDE};
 
 /// The colour registers one image gets, private to it (the count XTSMGRAPHICS reports).
-const REGISTERS: usize = 1_024;
+pub(crate) const REGISTERS: usize = 1_024;
 
 /// A straight (not premultiplied) 8-bit RGBA colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
