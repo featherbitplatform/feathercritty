@@ -1,1 +1,9 @@
+# Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
 /target
+
+# Fuzzing (`fuzz/`): the build, the crash artifacts a failed run leaves, and the corpus the CI job
+# caches between runs. The seed corpus under `fuzz/seeds/` is committed.
+/fuzz/target
+/fuzz/artifacts
+/fuzz/corpus

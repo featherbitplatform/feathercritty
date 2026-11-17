@@ -723,14 +723,18 @@ fn full_paint_near_cap_reallocates_logarithmically() {
     assert!(elapsed.as_millis() < 2000, "decoding took {elapsed:?}, expected well under 2 s");
 }
 
-/// The staircase shape — one more column per band (`!7000~-`, `!7001~-`, ... for 300 bands, ending
-/// at 7299×1800 within 22% of the byte cap so growth enters the cap-bound zone) — likewise stays
-/// under 40 rebuilds. A count assertion, so it pins the growth rule rather than machine speed.
+/// The staircase shape — one more column per band (`!1600~-`, `!1601~-`, ... for 1000 bands) —
+/// likewise stays under 40 rebuilds (the rule as written takes 13). Its numbers are chosen so the
+/// rule it pins is one that can fail: the needed area grows on both sides at once and ends at
+/// 2599×6000, within 7% of the byte cap, so from a few hundred bands on *every* band lands in the
+/// cap-bound zone — exactly where fitting one side exactly while giving the other all the slack
+/// (the rule this replaces) rebuilt the whole buffer, once per band: about 1000 times here. A count
+/// assertion, so it pins the growth rule rather than machine speed.
 #[test]
 fn staircase_toward_cap_reallocates_logarithmically() {
     let mut stream = b"#1".to_vec();
-    for b in 0..300u32 {
-        stream.extend_from_slice(format!("!{}~-", 7000 + b).as_bytes());
+    for b in 0..1000u32 {
+        stream.extend_from_slice(format!("!{}~-", 1600 + b).as_bytes());
     }
     let start = Instant::now();
     let mut decoder = SixelDecoder::new(&[], BG);
@@ -738,12 +742,12 @@ fn staircase_toward_cap_reallocates_logarithmically() {
     let reallocs = decoder.reallocations();
     let image = decoder.finish().expect("the staircase decodes");
     let elapsed = start.elapsed();
-    assert_eq!((image.width, image.height), (7299, 1800));
-    // The last band reaches the far corner; column 7298 was painted only there, not in band 0.
-    assert_eq!(px(&image, 7298, 1797), PAL_BLUE, "far corner of the last band");
-    assert_eq!(px(&image, 7298, 5), [BG.r, BG.g, BG.b, 255], "column 7298 not painted in band 0");
-    assert_eq!(px(&image, 6999, 3), PAL_BLUE, "band 0 reaches column 6999");
-    assert!(reallocs <= 40, "{reallocs} buffer rebuilds for the 300-band staircase");
+    assert_eq!((image.width, image.height), (2599, 6000));
+    // The last band reaches the far corner; column 2598 was painted only there, not in band 0.
+    assert_eq!(px(&image, 2598, 5997), PAL_BLUE, "far corner of the last band");
+    assert_eq!(px(&image, 2598, 5), [BG.r, BG.g, BG.b, 255], "column 2598 not painted in band 0");
+    assert_eq!(px(&image, 1599, 3), PAL_BLUE, "band 0 reaches column 1599");
+    assert!(reallocs <= 40, "{reallocs} buffer rebuilds for the 1000-band staircase");
     assert!(elapsed.as_millis() < 2000, "decoding took {elapsed:?}, expected well under 2 s");
 }
 

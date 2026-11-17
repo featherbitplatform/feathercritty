@@ -1,0 +1,48 @@
+# Modified by the featherbit authors for feathercritty; see README.md for the list of changes.
+
+[package]
+name = "feathercritty-fuzz"
+version = "0.0.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+feathercritty = { path = ".." }
+
+# A workspace of its own: the library lives in the parent directory, and `cargo` would otherwise
+# look for a `[workspace]` there (this crate's manifest is the only one the fuzz targets build with).
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "kitty"
+path = "fuzz_targets/kitty.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sixel"
+path = "fuzz_targets/sixel.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inline"
+path = "fuzz_targets/inline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parser_strings"
+path = "fuzz_targets/parser_strings.rs"
+test = false
+doc = false
+bench = false
