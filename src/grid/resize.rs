@@ -1411,9 +1411,11 @@ impl AnchorTracker {
     /// anchor indices are returned so the caller can carry them (to `buffered`). They stay
     /// pending at columns relative to the run's start until [`prepend`](Self::prepend) re-keys
     /// them to the row they land on. `carries` is false when the cut cells were discarded
-    /// (shrinking without reflow): their anchors cannot follow. `content_end` is the row's
-    /// content length before the cut: an anchor at or beyond it, and beyond the new width, sits
-    /// on no cell that moves and cannot follow either.
+    /// (shrinking without reflow): their anchors cannot follow. An anchor past the cut follows
+    /// the continuation exactly as the cursor does when its column rides past the new width —
+    /// including a cursor-like anchor at or beyond `content_end` (an image placed right after
+    /// the row's text moves with it). Only an anchor that no continuing run reaches, and that
+    /// sits beyond the new width on a row keeping its span, cannot follow.
     fn piece_pushed(
         &mut self,
         i: usize,
@@ -1439,9 +1441,15 @@ impl AnchorTracker {
         if let Some(indices) = self.rows.get(&i) {
             for &index in indices.iter() {
                 if let Some(Slot::Pending { col, .. }) = self.slots[index] {
-                    if col >= content_end && col >= self.columns {
-                        // No cell there at the new width: nothing carries it. Nearest is this
-                        // row's line, clamped to its last visible column.
+                    if carries && col >= moved_from {
+                        // At or past the cut: follows the continuation run like the cursor does
+                        // when its column crosses the new width — even an anchor beyond the row's
+                        // content (a cursor-position image after text) rides the wrapped line.
+                        self.slots[index] = Some(Slot::Pending { i, col: col - moved_from });
+                        carried.push(index);
+                    } else if col >= content_end && col >= self.columns {
+                        // No cell there at the new width and no continuing run reaches it: cannot
+                        // follow. Nearest is this row's line, clamped to its last visible column.
                         self.slots[index] = Some(Slot::Lost {
                             line: stream as i64,
                             col: self.columns - 1,
@@ -1450,9 +1458,6 @@ impl AnchorTracker {
                     } else if col < moved_from {
                         // Kept on the pushed row at its unchanged visual column.
                         self.slots[index] = Some(Slot::Placed { line: stream as i64, col });
-                    } else if carries {
-                        self.slots[index] = Some(Slot::Pending { i, col: col - moved_from });
-                        carried.push(index);
                     } else {
                         // A real tail cell, cut and discarded with reflow off.
                         self.slots[index] = Some(Slot::Lost {

@@ -959,6 +959,57 @@ fn scrollback_eviction_releases_only_when_unreferenced() {
 }
 
 #[test]
+fn cursor_position_image_follows_reflow_across_resizes() {
+    let (mut term, recorder) = term(10, 8);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, b"Hello world! This is text."); // 26 chars: rows 0..2 at width 10
+
+    // An image placed right after the text at the cursor (`C=1` leaves the cursor on its cell)
+    // must follow its anchor through reflow exactly like a cursor sitting there does.
+    feed(&mut term, &transmit(60, "f=32", Some((2, 2)), &rgba(2, 2), ",c=1,r=1,C=1"));
+    let key = recorder.received()[0].0;
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!((placements[0].row_in_view, placements[0].col), (2, 6));
+
+    // Grow merges the wrapped rows under it, then a shrink to 4 columns re-wraps everything:
+    // the anchor rides the wrap chain, so no placeholder is created at any step.
+    term.resize(Size { columns: 20, lines: 8 });
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!((placements[0].row_in_view, placements[0].col), (1, 6));
+    term.resize(Size { columns: 4, lines: 8 });
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1, "the anchor followed the reflow, no placeholder");
+    assert!(term.visible_placeholders().is_empty());
+    assert_eq!((placements[0].row_in_view, placements[0].col), (1, 2));
+    assert_eq!(placements[0].key, key);
+    assert!(recorder.released().is_empty());
+}
+
+#[test]
+fn cut_column_placeholder_sits_on_anchors_row() {
+    let (mut term, recorder) = term(10, 8);
+    feed(&mut term, b"\x1b[?1049h"); // the alternate grid's resize pass cuts without reflow
+    feed(&mut term, b"\x1b[3;8H"); // row 2, column 7 of a 10-column screen
+    feed(&mut term, &transmit(61, "f=32", Some((6, 2)), &rgba(6, 2), ",c=3,r=1"));
+    let key = recorder.received()[0].0;
+    assert_eq!(term.visible_placements().len(), 1);
+
+    // Shrinking to 4 columns cuts the anchor column: the placeholder must sit on the row the
+    // anchor cell ended up on — its own row, clamped to the last visible column — not one row
+    // above it.
+    term.resize(Size { columns: 4, lines: 8 });
+    assert!(term.visible_placements().is_empty(), "the placement itself is gone");
+    let placeholders = term.visible_placeholders();
+    assert_eq!(placeholders.len(), 1);
+    assert_eq!((placeholders[0].row_in_view, placeholders[0].col), (2, 3));
+    assert_eq!(placeholders[0].text, "[image 6×2]");
+    assert!(recorder.released().is_empty(), "the id still references the image");
+    let _ = key;
+}
+
+#[test]
 fn third_diacritic_above_a_byte_does_not_decode() {
     let mut cell = crate::term::cell::Cell {
         c: PLACEHOLDER_CHAR,
@@ -973,4 +1024,62 @@ fn third_diacritic_above_a_byte_does_not_decode() {
     // byte, so the cell must decode to `None` rather than a truncated id.
     cell.push_zerowidth(ROW_COLUMN_DIACRITICS[256]);
     assert_eq!(decode_placeholder_cell(&cell), None);
+}
+
+#[test]
+fn adjacent_placeholders_survive_a_down_shift() {
+    // Placeholders at (0, 4) and (1, 4), moved down together: ascending iteration made each move
+    // delete the target cell's not-yet-moved record, collapsing them into one. The shift must
+    // iterate in travel direction so both survive.
+    let mut table = PlacementTable::new();
+    let (a, _) = table.new_image(Some(10), None, 8, 6, None).unwrap();
+    let (b, _) = table.new_image(Some(11), None, 7, 5, None).unwrap();
+    table.place(Screen::Primary, a, 0, 4, 1, 1, None, 0, 0, 0, None).unwrap();
+    table.after_scroll_up(GridWindow { stable: 1, lines: 5, history: 1 }, Screen::Primary, 0, 5, 1);
+    table.place(Screen::Primary, b, 1, 4, 1, 1, None, 0, 0, 0, None).unwrap();
+    let events = table.after_scroll_up(
+        GridWindow { stable: 2, lines: 5, history: 2 },
+        Screen::Primary,
+        0,
+        5,
+        1,
+    );
+    assert!(events.is_empty(), "numbered images keep their data when scrolled off");
+
+    // One row down (a `scroll_down` of the full region): both records shift, neither overwrites
+    // the other.
+    table.after_scroll_down(
+        GridWindow { stable: 0, lines: 5, history: 2 },
+        Screen::Primary,
+        0,
+        5,
+        1,
+    );
+    let window = GridWindow { stable: 0, lines: 5, history: 2 };
+    let (out, _) = table.visible_placeholders_scanned(window, Screen::Primary, 0);
+    assert_eq!(out.len(), 2, "adjacent placeholders must not collapse when moved down");
+    assert_eq!((out[0].row_in_view, out[0].col), (1, 4));
+    assert_eq!(out[0].text, "[image 8×6]");
+    assert_eq!((out[1].row_in_view, out[1].col), (2, 4));
+    assert_eq!(out[1].text, "[image 7×5]");
+}
+
+#[test]
+fn placement_cap_eviction_is_indexed() {
+    let (mut term, recorder) = term(8, 5);
+    // `C=1` pins the cursor so every placement lands on one cell: at the cap each new `a=p`
+    // evicts exactly the oldest placement.
+    feed(&mut term, &transmit(1, "f=24", Some((2, 2)), &rgb(2, 2), ",c=1,r=1,C=1"));
+    recorder.take();
+
+    let start = Instant::now();
+    for _ in 0..100_000u32 {
+        feed(&mut term, b"\x1b_Ga=p,i=1,C=1\x1b\\");
+    }
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "100 000 placements at the cap must go through the age index, not a full scan"
+    );
+    assert_eq!(term.visible_placements().len(), MAX_PLACEMENTS, "the cap holds exactly");
+    assert!(recorder.released().is_empty(), "the shared image never loses its last reference");
 }
