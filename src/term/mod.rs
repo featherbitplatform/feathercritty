@@ -1574,6 +1574,13 @@ impl<T> Term<T> {
         self.placements.kitty_virtual_image(image_id, placement_id)
     }
 
+    /// Tests only: entries examined while evicting at either placement cap (see
+    /// [`PlacementTable::evict_examined`](placements::PlacementTable::evict_examined)).
+    #[cfg(test)]
+    pub fn placement_evict_examined(&self) -> usize {
+        self.placements.evict_examined()
+    }
+
     /// Report the embedder's decode result for an image (feathercritty; not upstream).
     ///
     /// Sends the kitty reply that was waiting on it (`OK`, `EBADPNG` or `ENOMEM`) and, when the

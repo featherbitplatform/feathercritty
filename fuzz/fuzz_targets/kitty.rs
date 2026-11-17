@@ -9,8 +9,9 @@
 //! frame the way `CAN` would cut it. The clock moves on by `frame.len() % 25` seconds per frame, so
 //! a chunked upload is seen stalling and the watchdog fires; every fourth frame runs `tick` first,
 //! and the input ends with a far-future `tick` plus an `end` for a frame left open. Whatever
-//! rejection waits after a frame is answered with `reply`, and what the parser holds is checked
-//! against the caps after every frame.
+//! rejection waits after a frame is answered with `reply` — which answers nothing for a command
+//! carrying neither an id nor a number — and what the parser holds is checked against the caps
+//! after every frame.
 
 #![no_main]
 
@@ -66,7 +67,11 @@ fuzz_target!(|data: &[u8]| {
 fn answer(parser: &mut KittyParser) {
     if let Some(reject) = parser.take_reject() {
         let answered = reply(reject.id, reject.number, None, Err(reject.error), reject.quiet);
-        // A failure at `q < 2` always travels; a rejection is always a failure.
-        debug_assert!(reject.quiet >= 2 || answered.is_some());
+        // A failure at `q < 2` travels when the command named an image; a rejection with
+        // neither id nor number gets no answer at all (the protocol ties acknowledgements to
+        // an id, and such clients do not read one).
+        debug_assert!(
+            reject.quiet >= 2 || (reject.id == 0 && reject.number.is_none()) || answered.is_some()
+        );
     }
 }

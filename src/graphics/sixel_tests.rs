@@ -13,12 +13,10 @@
 //! the `q` of the DCS and its terminator — what the parser streams to `put` — so each one also
 //! records the `params` and background colour the decoder must be constructed with.
 
-use std::fs;
-use std::io::Cursor;
-use std::time::Instant;
-
 use super::limits::*;
 use super::sixel::*;
+use std::fs;
+use std::io::Cursor;
 
 /// The directory of the reference fixtures (committed; produced by `write_fixtures`).
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sixel");
@@ -660,23 +658,25 @@ fn header_only_allocates_nothing_before_finish() {
 }
 
 /// Geometric growth: 1600 newlines then an 800-column band — a stream whose per-column canvas
-/// reallocation once made it take seconds — decodes in well under a second even unoptimized (the
-/// bound is generous for loaded CI), and a header-only stream allocates nothing (checked by
-/// `header_only_allocates_nothing_before_finish`).
+/// reallocation once made it take seconds. The reallocation count is the release-independent
+/// proof: doubling each side needs about eleven rebuilds (measured), while reallocating per new
+/// column or band would need thousands, and the sibling cap tests use the same bound of 40. A
+/// header-only stream allocates nothing (`header_only_allocates_nothing_before_finish`).
 #[test]
 fn wide_growth_is_fast() {
     let mut stream = b"#1".to_vec();
     stream.extend(std::iter::repeat_n(b'-', 1600));
     stream.extend(std::iter::repeat_n(b'~', 800));
-    let start = Instant::now();
-    let image = decode(&stream, &[], BG);
-    let elapsed = start.elapsed();
+    let mut decoder = SixelDecoder::new(&[], BG);
+    decoder.put(&stream);
+    let reallocs = decoder.reallocations();
+    let image = decoder.finish().expect("the stream decodes");
     assert_eq!((image.width, image.height), (800, 9606));
     for x in [0u32, 399, 799] {
         assert_eq!(px(&image, x, 9603), PAL_BLUE, "column {x} of the painted band");
         assert_eq!(px(&image, x, 0), [BG.r, BG.g, BG.b, 255], "column {x} row 0 is background");
     }
-    assert!(elapsed.as_millis() < 1000, "decoding took {elapsed:?}, expected well under a second");
+    assert!(reallocs <= 40, "{reallocs} buffer rebuilds for the wide growth stream");
 }
 
 /// A 4100×4002 image fits the byte cap with room to spare, but doubling both sides overshoots it —
@@ -704,23 +704,20 @@ fn near_cap_image_is_complete() {
 /// `!4100~-`, ~4.7 KB of input, an area within 2% of the cap — may rebuild its buffer at most 40
 /// times (doubling alone would need ~25; fitting one side exactly while giving the other all the
 /// slack once needed hundreds, each copying the whole 64 MiB buffer). The reallocation count is
-/// release-independent and exact; the time bound is a coarse debug backstop.
+/// release-independent and exact; a wall clock on the same behaviour flaked on slow CI runners.
 #[test]
 fn full_paint_near_cap_reallocates_logarithmically() {
     let mut stream = b"#1".to_vec();
     for _ in 0..667 {
         stream.extend_from_slice(b"!4100~-");
     }
-    let start = Instant::now();
     let mut decoder = SixelDecoder::new(&[], BG);
     decoder.put(&stream);
     let reallocs = decoder.reallocations();
     let image = decoder.finish().expect("a legal near-cap image decodes");
-    let elapsed = start.elapsed();
     assert_eq!((image.width, image.height), (4100, 4002));
     assert!(image.rgba.chunks(4).all(|p| p == PAL_BLUE.as_slice()), "every pixel painted",);
     assert!(reallocs <= 40, "{reallocs} buffer rebuilds for a fully painted 4100x4002 image");
-    assert!(elapsed.as_millis() < 2000, "decoding took {elapsed:?}, expected well under 2 s");
 }
 
 /// The staircase shape — one more column per band (`!1600~-`, `!1601~-`, ... for 1000 bands) —

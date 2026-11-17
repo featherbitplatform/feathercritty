@@ -4,7 +4,7 @@
 //! scrollback placeholders, ids and replies.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
@@ -821,7 +821,7 @@ fn ed1_above_with_display_offset_keeps_history_images() {
 #[test]
 fn virtual_placements_are_capped_and_added_in_constant_time() {
     let (mut term, recorder) = term(8, 5);
-    let start = Instant::now();
+    let base = term.placement_evict_examined();
 
     // One image, 20 000 virtual placements with distinct placement ids (`a=p` re-displays the
     // stored image; `U=1` records it virtually instead of placing it).
@@ -830,12 +830,17 @@ fn virtual_placements_are_capped_and_added_in_constant_time() {
         let frame = format!("\x1b_Ga=p,i=7,U=1,p={pid}\x1b\\");
         feed(&mut term, frame.as_bytes());
     }
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "20 000 virtual placements must not take quadratic time in debug"
-    );
 
     const _: () = assert!(20_000 > MAX_PLACEMENTS);
+    // Deterministic proof of indexing (the wall clock this replaces flakes on slow CI
+    // runners): every eviction at the cap goes through the age index — two examined entries
+    // per eviction, against a bound of four per placement added. Scanning the virtual map per
+    // eviction would examine thousands each and break it.
+    let examined = term.placement_evict_examined() - base;
+    assert!(
+        examined <= 4 * 20_000,
+        "{examined} entries examined evicting virtual placements down from 20 000 additions"
+    );
     assert_eq!(term.kitty_virtual_image(7, Some(1)), None, "the oldest virtual evicted");
     assert!(term.kitty_virtual_image(7, Some(20_000)).is_some(), "the newest survives");
     assert!(
@@ -1138,13 +1143,18 @@ fn placement_cap_eviction_is_indexed() {
     feed(&mut term, &transmit(1, "f=24", Some((2, 2)), &rgb(2, 2), ",c=1,r=1,C=1"));
     recorder.take();
 
-    let start = Instant::now();
+    let base = term.placement_evict_examined();
     for _ in 0..100_000u32 {
         feed(&mut term, b"\x1b_Ga=p,i=1,C=1\x1b\\");
     }
+    // Deterministic proof of indexing (the wall clock this replaces flaked on a slow CI
+    // runner): each placement at the cap evicts once through the age index. A full scan would
+    // examine MAX_PLACEMENTS records per eviction — 4096 x 100 000 — against this bound of
+    // four per eviction.
+    let examined = term.placement_evict_examined() - base;
     assert!(
-        start.elapsed() < Duration::from_secs(5),
-        "100 000 placements at the cap must go through the age index, not a full scan"
+        examined <= 4 * 100_000,
+        "{examined} entries examined evicting 100 000 placements at the cap"
     );
     assert_eq!(term.visible_placements().len(), MAX_PLACEMENTS, "the cap holds exactly");
     assert!(recorder.released().is_empty(), "the shared image never loses its last reference");

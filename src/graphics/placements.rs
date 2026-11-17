@@ -213,14 +213,22 @@ pub struct PlacementTable {
     /// Virtual placement eviction order: oldest sequence first.
     virtual_order: BTreeMap<u64, (u32, Option<u32>)>,
     virtual_seq: u64,
-    /// Placements by stable line (per screen), in insertion order within a line.
-    placements: [BTreeMap<i64, Vec<Placement>>; 2],
+    /// Placements by stable line (per screen); each line's records keyed by their insertion stamp,
+    /// so cap eviction reaches its victim by stamp instead of scanning the line ([`evict_oldest_-
+    /// placement`](Self::evict_oldest_placement)). Stamps ascend with insertion, so iteration is
+    /// still oldest-first within a line.
+    placements: [BTreeMap<i64, BTreeMap<u64, Placement>>; 2],
     /// Placement eviction order across both screens: oldest stamp first, mapped to the
     /// `(screen index, line)` holding it, so `evict_oldest_placement` is O(log n).
     placement_order: BTreeMap<u64, (usize, i64)>,
     placement_seq: u64,
     /// Live placements counted, so `place`'s cap check does not scan the maps.
     placement_total: usize,
+    /// Tests only: entries examined while evicting at either cap — age-index pops plus record or
+    /// key lookups — so a regression from direct lookup back to a scan shows up as a count, not
+    /// a wall clock that flakes on slow runners.
+    #[cfg(test)]
+    evict_examined: usize,
     placeholders: [BTreeMap<i64, Vec<Placeholder>>; 2],
     /// One entry per live placeholder: its `(line, col)` cell (the dedupe key) to its eviction
     /// stamp.
@@ -266,6 +274,8 @@ impl Default for PlacementTable {
             placement_order: BTreeMap::new(),
             placement_seq: 0,
             placement_total: 0,
+            #[cfg(test)]
+            evict_examined: 0,
             placeholders: [BTreeMap::new(), BTreeMap::new()],
             placeholder_stamp: [BTreeMap::new(), BTreeMap::new()],
             placeholder_age: BTreeMap::new(),
@@ -497,7 +507,7 @@ impl PlacementTable {
         self.placement_seq += 1;
         let placement =
             Placement { key, screen, line, col, cols, rows, src, x_off, y_off, z, pid, seq };
-        self.placements[screen.index()].entry(line).or_default().push(placement);
+        self.placements[screen.index()].entry(line).or_default().insert(seq, placement);
         self.placement_order.insert(seq, (screen.index(), line));
         self.placement_total += 1;
         self.add_ref(key);
@@ -657,7 +667,7 @@ impl PlacementTable {
         // at `window.stable` instead of walking the whole map.
         let doomed: Vec<(Placement, bool)> = self.placements[screen.index()]
             .range(..window.stable)
-            .flat_map(|(_, list)| list.iter().copied())
+            .flat_map(|(_, by_seq)| by_seq.values().copied())
             .filter_map(|p| {
                 let index = p.line - window.stable;
                 if index + i64::from(p.rows) > 0 {
@@ -700,7 +710,10 @@ impl PlacementTable {
     /// to hand a column resize (`Term::resize` collects it, runs the grid reflow, and passes the
     /// outcomes back); [`apply_reflow`](Self::apply_reflow) consumes it in order.
     pub fn anchor_list(&self, screen: Screen) -> Vec<Placement> {
-        self.placements[screen.index()].values().flat_map(|list| list.iter().copied()).collect()
+        self.placements[screen.index()]
+            .values()
+            .flat_map(|by_seq| by_seq.values().copied())
+            .collect()
     }
 
     /// Apply a column resize's per-anchor outcomes to the table. `remapped` pairs each entry of
@@ -765,7 +778,7 @@ impl PlacementTable {
     ) -> bool {
         let hits: Vec<ImageKey> = self.placements[screen.index()]
             .values()
-            .flat_map(|list| list.iter().copied())
+            .flat_map(|by_seq| by_seq.values().copied())
             .filter(|p| window.overlaps_view(p.line - window.stable, i64::from(p.rows), offset))
             .map(|p| p.key)
             .collect();
@@ -816,7 +829,7 @@ impl PlacementTable {
         };
         let hits: Vec<ImageKey> = self.placements[screen.index()]
             .range(stable.saturating_sub(MAX_SPAN_ROWS)..=stable)
-            .flat_map(|(_, list)| list.iter().copied())
+            .flat_map(|(_, by_seq)| by_seq.values().copied())
             .filter(&covers)
             .map(|p| p.key)
             .collect();
@@ -839,7 +852,7 @@ impl PlacementTable {
         let crosses = |p: &Placement| p.line <= stable && stable < p.line + i64::from(p.rows);
         let hits: Vec<ImageKey> = self.placements[screen.index()]
             .range(stable.saturating_sub(MAX_SPAN_ROWS)..=stable)
-            .flat_map(|(_, list)| list.iter().copied())
+            .flat_map(|(_, by_seq)| by_seq.values().copied())
             .filter(&crosses)
             .map(|p| p.key)
             .collect();
@@ -861,7 +874,7 @@ impl PlacementTable {
     ) -> bool {
         let hits: Vec<ImageKey> = self.placements[screen.index()]
             .values()
-            .flat_map(|list| list.iter().copied())
+            .flat_map(|by_seq| by_seq.values().copied())
             .filter(|p| p.col <= col && col < p.col + p.cols as usize)
             .map(|p| p.key)
             .collect();
@@ -887,7 +900,7 @@ impl PlacementTable {
     ) -> bool {
         let hits: Vec<ImageKey> = self.placements[screen.index()]
             .values()
-            .flat_map(|list| list.iter().copied())
+            .flat_map(|by_seq| by_seq.values().copied())
             .filter(|p| p.z == z)
             .map(|p| p.key)
             .collect();
@@ -961,8 +974,8 @@ impl PlacementTable {
     pub fn remove_screen(&mut self, screen: Screen, events: &mut Vec<Event>) {
         let taken = std::mem::take(&mut self.placements[screen.index()]);
         let mut touched: Vec<ImageKey> = Vec::new();
-        for (_, list) in taken {
-            for p in list {
+        for (_, by_seq) in taken {
+            for p in by_seq.values() {
                 self.placement_order.remove(&p.seq);
                 self.uncount_placements(1);
                 self.drop_ref(p.key);
@@ -1018,7 +1031,7 @@ impl PlacementTable {
     ) -> Option<(ImageKey, Vec<Event>)> {
         let oldest = self.placements[screen.index()]
             .values()
-            .flat_map(|list| list.iter().copied())
+            .flat_map(|by_seq| by_seq.values().copied())
             .filter(|p| p.line + i64::from(p.rows) <= window.stable) // fully above the viewport
             .min_by_key(|p| (p.key, p.line))?;
         let key = oldest.key;
@@ -1064,9 +1077,9 @@ impl PlacementTable {
         let end = window.stable + window.lines as i64 - offset as i64;
         let mut out: Vec<VisiblePlacement> = Vec::new();
         let mut scanned = 0usize;
-        for (_, list) in self.placements[screen.index()].range(start..end) {
+        for (_, by_seq) in self.placements[screen.index()].range(start..end) {
             scanned += 1;
-            for p in list {
+            for p in by_seq.values() {
                 if window.overlaps_view(p.line - window.stable, i64::from(p.rows), offset) {
                     out.push(VisiblePlacement {
                         key: p.key,
@@ -1141,7 +1154,7 @@ impl PlacementTable {
         let moved: Vec<Placement> = self.placements[screen.index()]
             .iter()
             .filter(|(line, _)| range.contains(line))
-            .flat_map(|(_, list)| list.iter().copied())
+            .flat_map(|(_, by_seq)| by_seq.values().copied())
             .collect();
         for p in moved {
             let new_line = p.line + delta;
@@ -1184,7 +1197,7 @@ impl PlacementTable {
         }
         let moved: Vec<Placement> = self.placements[screen.index()]
             .range(range.clone())
-            .flat_map(|(_, list)| list.iter().copied())
+            .flat_map(|(_, by_seq)| by_seq.values().copied())
             .collect();
         for p in moved {
             self.move_placement(p, p.line + delta, p.col);
@@ -1213,7 +1226,7 @@ impl PlacementTable {
         // one counted reference — once, not once per matching pass.
         let dead: Vec<Placement> = self.placements[idx]
             .values()
-            .flat_map(|list| list.iter().copied())
+            .flat_map(|by_seq| by_seq.values().copied())
             .filter(|p| pred(p))
             .collect();
         if dead.is_empty() {
@@ -1221,7 +1234,7 @@ impl PlacementTable {
         }
         for p in &dead {
             if let Some(list) = self.placements[idx].get_mut(&p.line) {
-                list.retain(|other| !pred(other));
+                list.retain(|_seq, other| !pred(other));
                 if list.is_empty() {
                     self.placements[idx].remove(&p.line);
                 }
@@ -1274,20 +1287,20 @@ impl PlacementTable {
 
     fn remove_placement(&mut self, p: &Placement, events: &mut Vec<Event>) {
         let key = p.key;
-        // Remove one occurrence by identity: identical twins (a `pid`-less image placed twice at
-        // the same cell) each need their own call, and this drops only the reference it removed.
+        // Remove the record by its stamp, checking it still carries `p`'s identity: identical
+        // twins (a `pid`-less image placed twice at the same cell) each come here with their own
+        // copy, and this drops only the reference the removed record held.
         let idx = p.screen.index();
         let went = {
             match self.placements[idx].get_mut(&p.line) {
-                Some(list) => match list.iter().position(|other| same_placement(other, p)) {
-                    Some(pos) => {
-                        let seq = list[pos].seq;
-                        list.swap_remove(pos);
+                Some(list) => match list.get(&p.seq) {
+                    Some(record) if same_placement(record, p) => {
+                        list.remove(&p.seq);
                         // The age index entry for the placement that actually went.
-                        self.placement_order.remove(&seq);
+                        self.placement_order.remove(&p.seq);
                         true
                     },
-                    None => false,
+                    _ => false,
                 },
                 None => false,
             }
@@ -1310,22 +1323,28 @@ impl PlacementTable {
     fn move_placement(&mut self, p: Placement, new_line: i64, new_col: usize) {
         let screen = p.screen.index();
         // feathercritty: bail before touching anything when the record is not where `p` says
-        // it is. Inserting a copy there double-counted one placement against no eviction stamp
-        // and survived every removal aimed at the original. Not upstream.
-        let Some(list) = self.placements[screen].get_mut(&p.line) else { return };
-        let Some(pos) = list.iter().position(|other| same_placement(other, &p)) else { return };
-        let seq = list[pos].seq;
-        list.swap_remove(pos);
-        if list.is_empty() {
+        // it is, under its own stamp and identity. Inserting a copy there double-counted one
+        // placement against no eviction stamp and survived every removal aimed at the original.
+        // Not upstream.
+        let removed = match self.placements[screen].get_mut(&p.line) {
+            Some(list) => match list.get(&p.seq) {
+                Some(record) if same_placement(record, &p) => list.remove(&p.seq),
+                _ => None,
+            },
+            None => None,
+        };
+        if removed.is_none() {
+            return;
+        }
+        if self.placements[screen].get(&p.line).is_some_and(|list| list.is_empty()) {
             self.placements[screen].remove(&p.line);
         }
-        self.placement_order.remove(&seq);
+        self.placement_order.remove(&p.seq);
         let mut moved = p;
         moved.line = new_line;
         moved.col = new_col;
-        moved.seq = seq;
-        self.placements[screen].entry(new_line).or_default().push(moved);
-        self.placement_order.insert(seq, (screen, new_line));
+        self.placements[screen].entry(new_line).or_default().insert(p.seq, moved);
+        self.placement_order.insert(p.seq, (screen, new_line));
     }
 
     /// Remove the placeholder record anchored at `(line, col)`, if any; `true` when one went.
@@ -1387,8 +1406,8 @@ impl PlacementTable {
     }
 
     fn has_placement_of(&self, key: ImageKey, pid: Option<u32>) -> bool {
-        self.placements.iter().flatten().any(|(_, list)| {
-            list.iter().any(|p| p.key == key && pid.is_none_or(|pid| p.pid == Some(pid)))
+        self.placements.iter().flatten().any(|(_, by_seq)| {
+            by_seq.values().any(|p| p.key == key && pid.is_none_or(|pid| p.pid == Some(pid)))
         })
     }
 
@@ -1398,6 +1417,25 @@ impl PlacementTable {
     /// pointed at it).
     fn add_ref(&mut self, key: ImageKey) {
         *self.refs.entry(key).or_insert(0) += 1;
+    }
+
+    /// Tests only: add to the eviction-examination counter (see
+    /// [`evict_examined`](Self::evict_examined)).
+    #[cfg(test)]
+    fn note_evict_examined(&mut self, examined: usize) {
+        self.evict_examined += examined;
+    }
+
+    /// Outside tests the counter does not exist and this compiles away.
+    #[cfg(not(test))]
+    #[inline]
+    fn note_evict_examined(&mut self, _examined: usize) {}
+
+    /// Tests only: entries examined while evicting at either cap (`evict_oldest_placement`,
+    /// `evict_oldest_virtual`), since construction — two per eviction attempt.
+    #[cfg(test)]
+    pub fn evict_examined(&self) -> usize {
+        self.evict_examined
     }
 
     /// Take `n` off the live-placement count for records the caller has just removed from the
@@ -1528,6 +1566,9 @@ impl PlacementTable {
         let Some((_, vk)) = self.virtual_order.pop_first() else {
             return false;
         };
+        // One age-index pop plus one keyed removal; the test that pins virtual eviction as
+        // indexed counts these against a constant-per-eviction bound.
+        self.note_evict_examined(2);
         if let Some(e) = self.virtuals.remove(&vk) {
             self.drop_ref(e.key);
             self.release_if_unreferenced(e.key, events);
@@ -1535,14 +1576,16 @@ impl PlacementTable {
         true
     }
 
-    /// Remove the oldest placement (lowest insertion stamp) to make room, in O(log n) through the
-    /// age index. `false` when the table holds none.
+    /// Remove the oldest placement (lowest insertion stamp) to make room: pop the age index and
+    /// take the record it names by stamp — one index entry and one map hit, no scan of the line
+    /// or the maps. `false` when the table holds none.
     fn evict_oldest_placement(&mut self, events: &mut Vec<Event>) -> bool {
         while let Some((seq, (screen_idx, line))) = self.placement_order.pop_first() {
+            // One age-index entry popped plus at most one record looked up by stamp; the test
+            // that pins eviction as indexed counts these against a constant-per-eviction bound.
             let hit = match self.placements[screen_idx].get_mut(&line) {
-                Some(list) => match list.iter().position(|p| p.seq == seq) {
-                    Some(pos) => {
-                        let p = list.swap_remove(pos);
+                Some(list) => match list.remove(&seq) {
+                    Some(p) => {
                         if list.is_empty() {
                             self.placements[screen_idx].remove(&line);
                         }
@@ -1553,6 +1596,7 @@ impl PlacementTable {
                 },
                 None => None,
             };
+            self.note_evict_examined(2);
             match hit {
                 // A stale index entry (its placement already went by another path) is consumed
                 // and skipped; live entries always sit at their recorded line.
