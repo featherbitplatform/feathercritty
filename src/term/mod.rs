@@ -1591,7 +1591,9 @@ impl<T> Term<T> {
     /// Run the graphics protocols' stall watchdog (feathercritty; not upstream).
     ///
     /// Drops a chunked kitty transmission that has not continued for ten seconds and answers it
-    /// with `ENOMEM`. Hosts call this periodically with the current time, or after feeding bytes.
+    /// with `ENOMEM`, and delivers image events parked by [`resize`](Self::resize) — control-only
+    /// output does not flush them, so this is what covers an idle terminal. Hosts call this
+    /// periodically with the current time, or after feeding bytes.
     pub fn tick(&mut self, now: Instant)
     where
         T: EventListener,

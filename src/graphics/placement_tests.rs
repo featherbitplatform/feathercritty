@@ -1431,3 +1431,29 @@ fn number_only_transmission_gets_an_id_it_can_place_by() {
     let resolved = term.kitty_virtual_image(1, None).expect("the number-named image places by id");
     assert_eq!(resolved.2, 1, "the virtual placement spans one cell");
 }
+
+#[test]
+fn tick_delivers_releases_queued_by_a_resize() {
+    // `resize` parks its placement events (it has no listener bound), and control-only output
+    // does not flush them: a program that answers a resize with sequences alone would otherwise
+    // hold its `ImageReleased` until the next printable character. Hosts call `tick`
+    // periodically, so `tick` delivers what is parked.
+    let (mut term, recorder) = term(10, 8);
+    feed(&mut term, b"\x1b[?1049h");
+    feed(&mut term, b"\x1b[3;8H"); // row 2, column 7 of a 10-column screen
+    feed(&mut term, SIXEL); // a one-cell sixel anchored there
+    let key = recorder.received()[0].0;
+
+    // Shrinking to 4 columns cuts the anchor column: the placement becomes a placeholder and
+    // the sixel's last reference goes — but the release sits in the queue.
+    term.resize(Size { columns: 4, lines: 8 });
+    assert!(term.visible_placements().is_empty(), "the placement itself is gone");
+
+    // Control-only output delivers nothing.
+    feed(&mut term, b"\x1b[2J");
+    assert_eq!(released_of(&recorder.take()), Vec::new(), "the release still waits");
+
+    // `tick` sends it.
+    term.tick(Instant::now());
+    assert_eq!(recorder.released(), vec![key]);
+}
