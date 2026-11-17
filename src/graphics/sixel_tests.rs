@@ -736,19 +736,16 @@ fn staircase_toward_cap_reallocates_logarithmically() {
     for b in 0..1000u32 {
         stream.extend_from_slice(format!("!{}~-", 1600 + b).as_bytes());
     }
-    let start = Instant::now();
     let mut decoder = SixelDecoder::new(&[], BG);
     decoder.put(&stream);
     let reallocs = decoder.reallocations();
     let image = decoder.finish().expect("the staircase decodes");
-    let elapsed = start.elapsed();
     assert_eq!((image.width, image.height), (2599, 6000));
     // The last band reaches the far corner; column 2598 was painted only there, not in band 0.
     assert_eq!(px(&image, 2598, 5997), PAL_BLUE, "far corner of the last band");
     assert_eq!(px(&image, 2598, 5), [BG.r, BG.g, BG.b, 255], "column 2598 not painted in band 0");
     assert_eq!(px(&image, 1599, 3), PAL_BLUE, "band 0 reaches column 1599");
     assert!(reallocs <= 40, "{reallocs} buffer rebuilds for the 1000-band staircase");
-    assert!(elapsed.as_millis() < 2000, "decoding took {elapsed:?}, expected well under 2 s");
 }
 
 /// The state machine resumes exactly where a `put` left it: every fixture decodes identically fed

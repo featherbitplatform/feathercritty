@@ -40,8 +40,8 @@ const KEYS: usize = 32;
 /// A window size for `Term::new` and `Term::resize`, from two bytes of the input.
 ///
 /// Columns start at 2: shrinking to a single column while a wide character sits where the cut
-/// lands loops forever in the reflow — upstream 0.26.0 does the same (see the task report), so it
-/// is left to its own change rather than fuzzed away here.
+/// lands loops forever in the reflow — upstream 0.26.0 does the same — so it is left to its own
+/// change rather than fuzzed away here. The README's Fuzzing section says the same.
 fn size(cols: u8, lines: u8) -> Size {
     Size { cols: 2 + cols as usize % 119, lines: 1 + lines as usize % 40 }
 }
