@@ -821,7 +821,6 @@ fn ed1_above_with_display_offset_keeps_history_images() {
 #[test]
 fn virtual_placements_are_capped_and_added_in_constant_time() {
     let (mut term, recorder) = term(8, 5);
-    let base = term.placement_evict_examined();
 
     // One image, 20 000 virtual placements with distinct placement ids (`a=p` re-displays the
     // stored image; `U=1` records it virtually instead of placing it).
@@ -832,15 +831,10 @@ fn virtual_placements_are_capped_and_added_in_constant_time() {
     }
 
     const _: () = assert!(20_000 > MAX_PLACEMENTS);
-    // Deterministic proof of indexing (the wall clock this replaces flakes on slow CI
-    // runners): every eviction at the cap goes through the age index — two examined entries
-    // per eviction, against a bound of four per placement added. Scanning the virtual map per
-    // eviction would examine thousands each and break it.
-    let examined = term.placement_evict_examined() - base;
-    assert!(
-        examined <= 4 * 20_000,
-        "{examined} entries examined evicting virtual placements down from 20 000 additions"
-    );
+    // Indexing is guaranteed by the structure — an age index ordered by insertion stamp plus a
+    // keyed virtual map, so eviction is one pop and one removal — not measured here; these
+    // assertions pin what the cap does (the timing assertion this shape had flaked on slow CI
+    // runners, and a counter of fixed per-eviction work would have measured nothing).
     assert_eq!(term.kitty_virtual_image(7, Some(1)), None, "the oldest virtual evicted");
     assert!(term.kitty_virtual_image(7, Some(20_000)).is_some(), "the newest survives");
     assert!(
@@ -1143,19 +1137,14 @@ fn placement_cap_eviction_is_indexed() {
     feed(&mut term, &transmit(1, "f=24", Some((2, 2)), &rgb(2, 2), ",c=1,r=1,C=1"));
     recorder.take();
 
-    let base = term.placement_evict_examined();
     for _ in 0..100_000u32 {
         feed(&mut term, b"\x1b_Ga=p,i=1,C=1\x1b\\");
     }
-    // Deterministic proof of indexing (the wall clock this replaces flaked on a slow CI
-    // runner): each placement at the cap evicts once through the age index. A full scan would
-    // examine MAX_PLACEMENTS records per eviction — 4096 x 100 000 — against this bound of
-    // four per eviction.
-    let examined = term.placement_evict_examined() - base;
-    assert!(
-        examined <= 4 * 100_000,
-        "{examined} entries examined evicting 100 000 placements at the cap"
-    );
+    // Indexing is guaranteed by the structure — an age index ordered by insertion stamp plus
+    // per-line maps keyed by that stamp, so each eviction is one pop and one map hit — not
+    // measured here; these assertions pin what the cap does (the timing assertion this shape
+    // had flaked on slow CI runners, and a counter of fixed per-eviction work would have
+    // measured nothing).
     assert_eq!(term.visible_placements().len(), MAX_PLACEMENTS, "the cap holds exactly");
     assert!(recorder.released().is_empty(), "the shared image never loses its last reference");
 }

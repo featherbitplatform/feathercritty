@@ -224,11 +224,6 @@ pub struct PlacementTable {
     placement_seq: u64,
     /// Live placements counted, so `place`'s cap check does not scan the maps.
     placement_total: usize,
-    /// Tests only: entries examined while evicting at either cap — age-index pops plus record or
-    /// key lookups — so a regression from direct lookup back to a scan shows up as a count, not
-    /// a wall clock that flakes on slow runners.
-    #[cfg(test)]
-    evict_examined: usize,
     placeholders: [BTreeMap<i64, Vec<Placeholder>>; 2],
     /// One entry per live placeholder: its `(line, col)` cell (the dedupe key) to its eviction
     /// stamp.
@@ -274,8 +269,6 @@ impl Default for PlacementTable {
             placement_order: BTreeMap::new(),
             placement_seq: 0,
             placement_total: 0,
-            #[cfg(test)]
-            evict_examined: 0,
             placeholders: [BTreeMap::new(), BTreeMap::new()],
             placeholder_stamp: [BTreeMap::new(), BTreeMap::new()],
             placeholder_age: BTreeMap::new(),
@@ -1419,25 +1412,6 @@ impl PlacementTable {
         *self.refs.entry(key).or_insert(0) += 1;
     }
 
-    /// Tests only: add to the eviction-examination counter (see
-    /// [`evict_examined`](Self::evict_examined)).
-    #[cfg(test)]
-    fn note_evict_examined(&mut self, examined: usize) {
-        self.evict_examined += examined;
-    }
-
-    /// Outside tests the counter does not exist and this compiles away.
-    #[cfg(not(test))]
-    #[inline]
-    fn note_evict_examined(&mut self, _examined: usize) {}
-
-    /// Tests only: entries examined while evicting at either cap (`evict_oldest_placement`,
-    /// `evict_oldest_virtual`), since construction — two per eviction attempt.
-    #[cfg(test)]
-    pub fn evict_examined(&self) -> usize {
-        self.evict_examined
-    }
-
     /// Take `n` off the live-placement count for records the caller has just removed from the
     /// maps. A desync must leak at worst, never panic in release: debug builds assert, release
     /// saturates at zero (as [`drop_ref`](Self::drop_ref) does — a wrapped count would make
@@ -1566,9 +1540,6 @@ impl PlacementTable {
         let Some((_, vk)) = self.virtual_order.pop_first() else {
             return false;
         };
-        // One age-index pop plus one keyed removal; the test that pins virtual eviction as
-        // indexed counts these against a constant-per-eviction bound.
-        self.note_evict_examined(2);
         if let Some(e) = self.virtuals.remove(&vk) {
             self.drop_ref(e.key);
             self.release_if_unreferenced(e.key, events);
@@ -1581,8 +1552,7 @@ impl PlacementTable {
     /// or the maps. `false` when the table holds none.
     fn evict_oldest_placement(&mut self, events: &mut Vec<Event>) -> bool {
         while let Some((seq, (screen_idx, line))) = self.placement_order.pop_first() {
-            // One age-index entry popped plus at most one record looked up by stamp; the test
-            // that pins eviction as indexed counts these against a constant-per-eviction bound.
+            // The record sits under its own stamp: one map hit, no scan of the line.
             let hit = match self.placements[screen_idx].get_mut(&line) {
                 Some(list) => match list.remove(&seq) {
                     Some(p) => {
@@ -1596,7 +1566,6 @@ impl PlacementTable {
                 },
                 None => None,
             };
-            self.note_evict_examined(2);
             match hit {
                 // A stale index entry (its placement already went by another path) is consumed
                 // and skipped; live entries always sit at their recorded line.
