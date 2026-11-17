@@ -13,7 +13,8 @@
 //! listener kept, runs [`Term::tick`] on a clock that moves forward, resizes, switches to the
 //! alternate screen and back, toggles scrollback images and evicts one. Afterwards it reads the view
 //! back through [`Term::visible_placements`], [`Term::visible_placeholders`] and
-//! [`kitty_diacritics::decode_placeholder_cell`], which is what an embedder draws with.
+//! [`kitty_diacritics::decode_placeholder_cell`], which is what an embedder draws with, and ends
+//! with `RIS`: every image key the listener was handed must have come back as exactly one release.
 
 #![no_main]
 
@@ -66,14 +67,19 @@ impl Dimensions for Size {
     }
 }
 
-/// Images whose decode result the terminal has not been given yet.
+/// Images whose decode result the terminal has not been given yet, and the release ledger: every
+/// key handed to the host and every key returned to it, so the target can end with a reset and
+/// check that what was received comes back released exactly once.
 #[derive(Default)]
 struct Pending {
     keys: Vec<ImageKey>,
+    received: Vec<ImageKey>,
+    released: Vec<ImageKey>,
 }
 
 /// Drops every event, keeping only what an embedder needs to act on it: the image keys it is asked
-/// to decode. Shared with the target, which moved its own copy into the terminal.
+/// to decode, and the received/released ledger above. Shared with the target, which moved its own
+/// copy into the terminal.
 struct Listener {
     pending: Rc<RefCell<Pending>>,
 }
@@ -86,10 +92,13 @@ impl EventListener for Listener {
                 if pending.keys.len() < KEYS {
                     pending.keys.push(key);
                 }
+                pending.received.push(key);
             },
             Event::ImageReleased(key) => {
                 // Released keys are never answered: the embedder has nothing left to decode.
-                self.pending.borrow_mut().keys.retain(|held| *held != key);
+                let mut pending = self.pending.borrow_mut();
+                pending.keys.retain(|held| *held != key);
+                pending.released.push(key);
             },
             _ => {},
         }
@@ -172,6 +181,29 @@ fuzz_target!(|data: &[u8]| {
     now = later(now, 30);
     term.tick(now);
     answer(&mut term, &shared);
+
+    // The release contract: a full reset releases everything the table still holds, so after it
+    // every key the listener was handed must have come back exactly once — no leaks (a placement
+    // that outlives the wipe) and no double releases (a record two removals both counted).
+    parser.advance(&mut term, b"\x1bc");
+    term.tick(now);
+    let ledger = shared.borrow();
+    let mut received = ledger.received.clone();
+    received.sort_unstable();
+    assert_eq!(
+        received.len(),
+        ledger.received.len(),
+        "a key was handed to the host twice"
+    );
+    let mut released = ledger.released.clone();
+    released.sort_unstable();
+    let deduped = {
+        let mut once = released.clone();
+        once.dedup();
+        once
+    };
+    assert_eq!(deduped.len(), released.len(), "a key was released more than once");
+    assert_eq!(released, received, "received and released keys do not match up");
 
     let placements = term.visible_placements();
     assert!(placements.len() <= MAX_PLACEMENTS, "{} placements in view", placements.len());
