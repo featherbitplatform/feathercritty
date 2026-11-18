@@ -1221,6 +1221,10 @@ impl<T> Term<T> {
             }
             return Err(kitty::KittyError::ENOENT);
         };
+        // feathercritty: whether the frame fixed the span, read off `c`/`r` as they arrived — a
+        // request can name exactly the span the image's pixels round up to, and the protocol still
+        // asks for the picture scaled to those cells. Not upstream.
+        let sized = place.cols != 0 || place.rows != 0;
         let (cols, rows) = self.placements.span_for(width_px, height_px, place.cols, place.rows);
         let col = self.grid.cursor.point.column.0;
         self.make_room(rows);
@@ -1238,6 +1242,7 @@ impl<T> Term<T> {
             place.z,
             place.placement_id,
             false, // kitty keeps the aspect ratio: `c` with `r` letterboxes, never stretches
+            sized, // true for any nonzero `c`/`r`, whatever span they come to
             None,  // the span is what the protocol asked for; no separate pixel box
         ) {
             Ok(events) => {
@@ -1402,6 +1407,7 @@ impl<T> Term<T> {
             0,
             None,
             false, // the span is the sixel's own pixels at the cell size; nothing asks to stretch
+            false, // and nothing fixes that span: a host may draw these 1:1
             None,  // the span is the sixel's own pixels at the cell size; no separate pixel box
         ) {
             Ok(events) => {
@@ -1426,7 +1432,8 @@ impl<T> Term<T> {
     /// of letterboxing into it. When an axis was given in pixels or percent, the span is the
     /// rounded-up room the image occupies (which the cursor also counts), while
     /// `Placement::box_px` carries the exact pixel box the protocol asked for, so a host can draw
-    /// the image at its requested size inside that room.
+    /// the image at its requested size inside that room. `Placement::sized` reports whether any of
+    /// those arguments fixed an axis of the span, as opposed to its coming from the image's pixels.
     fn place_inline(&mut self, image: inline::InlineImage)
     where
         T: EventListener,
@@ -1463,6 +1470,11 @@ impl<T> Term<T> {
         // "compute" — that axis comes from the ratio anyway, so there is nothing to fill and the
         // host letterboxes as it would with the ratio kept. Not upstream.
         let stretch = !image.preserve_aspect && cols_req != 0 && rows_req != 0;
+        // feathercritty: whether the arguments fixed an axis of the span, read off `width`/`height`
+        // rather than out of the span they came to — `width=5` naming exactly the span the pixels
+        // round up to is a request all the same, and the host must scale for it. A zero count asks
+        // `span_for` to compute, so it fixes nothing. Not upstream.
+        let sized = inline_sized(image.width) || inline_sized(image.height);
         let col = self.grid.cursor.point.column.0;
         self.make_room(rows);
         let anchor = self.grid_window(&self.grid).stable + i64::from(self.grid.cursor.point.line.0);
@@ -1479,6 +1491,7 @@ impl<T> Term<T> {
             0,
             None,
             stretch, // true only for `preserveAspectRatio=0` with both axes given
+            sized,   // true when either axis was a cell count (nonzero), `Npx` or `N%`
             box_px,
         ) {
             Ok(events) => {
@@ -1573,7 +1586,9 @@ impl<T> Term<T> {
     ///
     /// `row_in_view` counts from the top of the view (the scrollback offset is applied), negative
     /// when the placement starts above it. Draw in the returned order, filling a span or
-    /// letterboxing into it as its `stretch` says (see `Placement::stretch`).
+    /// letterboxing into it as its `stretch` says (see `Placement::stretch`), and drawing an entry
+    /// 1:1 — unscaled — only where its `sized` is false and its span is what the image's pixels
+    /// come to (see `Placement::sized`).
     pub fn visible_placements(&self) -> Vec<placements::VisiblePlacement> {
         let window = self.grid_window(&self.grid);
         self.placements.visible_placements(window, self.active_screen(), self.grid.display_offset())
@@ -2568,6 +2583,19 @@ fn inline_cells(dim: inline::Dim, cell_px: u32, terminal_px: u32) -> u32 {
                 .checked_div(u64::from(cell_px))
                 .map_or(0, |cells| if cells == 0 { 0 } else { cap(cells) })
         },
+    }
+}
+
+/// Whether one inline image `width`/`height` argument fixes its axis of the span (feathercritty;
+/// not upstream): a cell count, `Npx` or `N%` all say how wide or tall to draw. `auto`, an absent
+/// argument and a zero count leave the axis to the image's pixels (`span_for` computes it), so they
+/// fix nothing — which is what lets a host draw such a placement 1:1 (see [`Placement::sized`]).
+///
+/// [`Placement::sized`]: crate::graphics::placements::Placement::sized
+fn inline_sized(dim: inline::Dim) -> bool {
+    match dim {
+        inline::Dim::Auto | inline::Dim::Cells(0) => false,
+        inline::Dim::Cells(_) | inline::Dim::Pixels(_) | inline::Dim::Percent(_) => true,
     }
 }
 

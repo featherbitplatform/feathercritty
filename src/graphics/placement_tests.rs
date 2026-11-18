@@ -313,6 +313,58 @@ fn span_from_pixels_rounds_up() {
     assert_eq!((second.cols, second.rows), (2, 1));
 }
 
+#[test]
+fn kitty_sized_follows_c_and_r() {
+    // A 40x32 image in 8x16 cells rounds up to a 5x2 span, so `c=5,r=2` happens to ask for exactly
+    // that span. The protocol still wants the picture scaled to those cells, so the placement has
+    // to say the program fixed the span and not let a host read the natural size back out of it.
+    let placed = |id: u32, extra: &str| {
+        let (mut term, recorder) = term(20, 20);
+        term.set_cell_pixel_size(8, 16);
+        feed(&mut term, b"\x1b[1;1H");
+        feed(&mut term, &transmit(id, "f=32", Some((40, 32)), &rgba(40, 32), extra));
+        recorder.received();
+        let placements = term.visible_placements();
+        assert_eq!(placements.len(), 1, "{extra} displays one image");
+        placements[0].clone()
+    };
+
+    // No `c`/`r`: the span is ceil(40/8) x ceil(32/16), and nothing asked for it.
+    let natural = placed(1, "");
+    assert_eq!((natural.cols, natural.rows), (5, 2));
+    assert!(!natural.sized, "no `c` or `r`: the span comes from the image's pixels");
+
+    // The same span, this time requested: `sized`, and the span unchanged.
+    let exact = placed(2, ",c=5,r=2");
+    assert_eq!((exact.cols, exact.rows), (5, 2), "the request names the natural span");
+    assert!(exact.sized, "`c` with `r`: scale the picture to those cells");
+
+    // One axis fixed is enough; the other comes from the ratio.
+    let wide = placed(3, ",c=5");
+    assert_eq!((wide.cols, wide.rows), (5, 2));
+    assert!(wide.sized, "`c` alone fixes the width");
+    // `r=2` fixes the height; the width follows the ratio (26 px wide at 8 px cells is 4 columns).
+    let tall = placed(4, ",r=2");
+    assert_eq!((tall.cols, tall.rows), (4, 2));
+    assert!(tall.sized, "`r` alone fixes the height");
+}
+
+#[test]
+fn sixel_is_never_sized() {
+    // A 3x12 px sixel in 2x6 cells: ceil(3/2) x ceil(12/6) cells. Its span is its own pixels at the
+    // cell size, which is what a host draws 1:1 from; nothing in the format fixes a span, so it is
+    // never `sized`.
+    let (mut term, recorder) = term(10, 10);
+    term.set_cell_pixel_size(2, 6);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, b"\x1bPq#0~~~-~\x1b\\");
+    recorder.received();
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!((placements[0].cols, placements[0].rows), (2, 2));
+    assert!(!placements[0].sized, "a sixel's span is its own pixels");
+}
+
 /// Feeds one OSC 1337 inline image (`args` as its `File=` arguments, a `w`×`h` PNG payload) into a
 /// fresh 20x8 terminal whose cells are 8x16 pixels, and returns the only placement it made.
 fn inline_placement(args: &str, w: u32, h: u32) -> VisiblePlacement {
@@ -352,6 +404,34 @@ fn inline_stretch_follows_preserve_aspect_ratio() {
     for args in ["height=2", "width=10;height=auto", "width=0;height=2"] {
         let placed = inline_placement(&format!("{args};preserveAspectRatio=0"), 4, 4);
         assert!(!placed.stretch, "{args} derives one axis from the ratio");
+    }
+}
+
+#[test]
+fn inline_sized_follows_width_and_height() {
+    // A 40x32 PNG in 8x16 cells rounds up to a 5x2 span, so `width=5` happens to name exactly the
+    // span the pixels come to. The request fixed it all the same, and a host must scale the picture
+    // instead of drawing it 1:1 on the coincidence.
+    for args in ["", "width=auto;height=auto", "width=0"] {
+        let placed = inline_placement(args, 40, 32);
+        assert_eq!((placed.cols, placed.rows), (5, 2), "{args} computes the span");
+        assert!(!placed.sized, "{args} leaves both axes to the image's pixels");
+    }
+
+    // A cell count fixes its axis even when it lands on the natural span.
+    let exact = inline_placement("width=5", 40, 32);
+    assert_eq!((exact.cols, exact.rows), (5, 2), "the same span, this time requested");
+    assert!(exact.sized, "`width=5` fixes the width");
+    // `height=2` fixes the height; the width follows the ratio: two rows are 32 px tall, a 40x32
+    // picture at that height is 26 px wide, and 26 px is 4 columns of 8.
+    let tall = inline_placement("height=2", 40, 32);
+    assert_eq!((tall.cols, tall.rows), (4, 2));
+    assert!(tall.sized, "`height=2` fixes the height");
+
+    // Pixels and percents are sizes too.
+    for args in ["width=100px", "width=50%", "height=32px", "width=auto;height=12%"] {
+        let placed = inline_placement(args, 40, 32);
+        assert!(placed.sized, "{args} is a size request");
     }
 }
 
@@ -507,6 +587,37 @@ fn visible_placements_carry_the_box() {
     assert_eq!(placements[0].box_cell_px, (9, 18));
     // A later view of the same placement carries it through too.
     assert_eq!(term.visible_placements()[0].box_px, Some((100, 50)));
+}
+
+#[test]
+fn visible_placements_carry_sized() {
+    // Two placements with the same span, told apart only by whether the program asked for it: a
+    // kitty `a=T` with `c=5,r=2` and the same image without them, both 40x32 px in 8x16 cells.
+    let (mut term, recorder) = term(20, 8);
+    term.set_cell_pixel_size(8, 16);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &transmit(1, "f=32", Some((40, 32)), &rgba(40, 32), ",c=5,r=2"));
+    feed(&mut term, b"\x1b[4;1H");
+    feed(&mut term, &transmit(2, "f=32", Some((40, 32)), &rgba(40, 32), ""));
+    let received = recorder.received();
+    assert_eq!(received.len(), 2);
+
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 2);
+    assert_eq!((placements[0].key, placements[1].key), (received[0].0, received[1].0));
+    for p in &placements {
+        assert_eq!((p.cols, p.rows), (5, 2), "the spans match; the request is what differs");
+    }
+    assert!(placements[0].sized, "the requested span says so");
+    assert!(!placements[1].sized, "the computed one does not");
+
+    // A later view copies it through: scrolled up one row, the pairing survives.
+    feed(&mut term, b"\x1b[8;1H\n");
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 2);
+    assert_eq!((placements[0].row_in_view, placements[1].row_in_view), (-1, 2));
+    assert!(placements[0].sized);
+    assert!(!placements[1].sized);
 }
 
 #[test]
@@ -1096,9 +1207,11 @@ fn placeholder_cap_and_visible_range_scans() {
     let (key, events) = table.new_image(Some(1), None, 8, 8, None).unwrap();
     assert!(events.is_empty());
     for line in [-50_000i64, -20_000, -12_000] {
-        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
+        table
+            .place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false, false, None)
+            .unwrap();
     }
-    table.place(Screen::Primary, key, 3, 0, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
+    table.place(Screen::Primary, key, 3, 0, 1, 1, None, 0, 0, 0, None, false, false, None).unwrap();
     let window = GridWindow { stable: 0, lines: 5, history: 60_000 };
     let (out, scanned) = table.visible_placements_scanned(window, Screen::Primary, 0);
     assert_eq!(out.len(), 1, "only the in-view placement is returned");
@@ -1123,7 +1236,9 @@ fn placeholder_cap_and_visible_range_scans() {
     let (key, _) = table.new_image(Some(2), None, 8, 8, None).unwrap();
     table.add_virtual(2, key, Some(1), 0, 0);
     for line in 0..(MAX_PLACEHOLDERS + 5) as i64 {
-        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
+        table
+            .place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false, false, None)
+            .unwrap();
         let events = table.after_scroll_up(
             GridWindow { stable: line + 1, lines: 1, history: (line + 1) as usize },
             Screen::Primary,
@@ -1320,9 +1435,9 @@ fn adjacent_placeholders_survive_a_down_shift() {
     let mut table = PlacementTable::new();
     let (a, _) = table.new_image(Some(10), None, 8, 6, None).unwrap();
     let (b, _) = table.new_image(Some(11), None, 7, 5, None).unwrap();
-    table.place(Screen::Primary, a, 0, 4, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
+    table.place(Screen::Primary, a, 0, 4, 1, 1, None, 0, 0, 0, None, false, false, None).unwrap();
     table.after_scroll_up(GridWindow { stable: 1, lines: 5, history: 1 }, Screen::Primary, 0, 5, 1);
-    table.place(Screen::Primary, b, 1, 4, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
+    table.place(Screen::Primary, b, 1, 4, 1, 1, None, 0, 0, 0, None, false, false, None).unwrap();
     let events = table.after_scroll_up(
         GridWindow { stable: 2, lines: 5, history: 2 },
         Screen::Primary,

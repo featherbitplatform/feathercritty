@@ -120,7 +120,8 @@ impl GridWindow {
 /// and `z` orders overlapping images for drawing (negative draws under text). `pid` is the kitty
 /// placement id if it has one: re-placing with the same `(key, pid)` replaces the old placement.
 /// `stretch` says whether the rectangle is one the host fills or letterboxes into (see
-/// [`Placement::stretch`]).
+/// [`Placement::stretch`]); `sized` says whether a request fixed that rectangle's span or it came
+/// from the image's pixels (see [`Placement::sized`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
     pub key: ImageKey,
@@ -149,6 +150,24 @@ pub struct Placement {
     /// The rectangle this fills or letterboxes into is [`Placement::box_px`] when it is set, the
     /// whole span when it is `None`.
     pub stretch: bool,
+    /// Whether a protocol request fixed at least one axis of this span, instead of its coming from
+    /// the image's own pixels (feathercritty; not upstream).
+    ///
+    /// A host that draws an image 1:1 — its own pixels, unscaled — when its span is exactly what
+    /// those pixels round up to ([`PlacementTable::span_for`] with no request) must not do that
+    /// for a `sized` placement: it fits or fills the picture into its span (or into
+    /// [`Placement::box_px`] when that is set) as it would for any sized request. A program can
+    /// ask for `c` columns and `r` rows — or an OSC 1337 cell count — that happen to equal the
+    /// natural span, and the protocol then asks for the picture scaled to those cells; drawing it
+    /// at its own size stops up to one cell short of the span on each axis. Only a placement with
+    /// this false may be drawn 1:1.
+    ///
+    /// True when kitty (`a=p`, `a=T`) gives a nonzero `c` or `r`, and when OSC 1337 gives `width`
+    /// or `height` as a cell count (nonzero), `Npx` or `N%`. A zero cell count asks the table to
+    /// compute, so it fixes nothing: kitty without `c`/`r`, every sixel, and OSC 1337 with both
+    /// axes `auto` or absent are false, their spans being what the image's pixels come to. False
+    /// is also what [`PlacementTable::place`] gives any caller that does not say otherwise.
+    pub sized: bool,
     /// The drawing box the protocol asked for, in pixels at the cell size the placement was made
     /// at, inside the cell span and anchored at the span's top-left; `None` means the box is the
     /// whole span (feathercritty; not upstream).
@@ -195,6 +214,10 @@ pub struct VisiblePlacement {
     /// Whether to stretch the image to fill its drawing box instead of letterboxing it into the
     /// box (see [`Placement::stretch`]).
     pub stretch: bool,
+    /// Whether a request fixed this span or it came to the numbers from the image's pixels (see
+    /// [`Placement::sized`]): only a placement where this is false may be drawn 1:1
+    /// (feathercritty; not upstream).
+    pub sized: bool,
     /// The drawing box the protocol asked for (see [`Placement::box_px`]): `None` means the whole
     /// span (feathercritty; not upstream).
     pub box_px: Option<(u32, u32)>,
@@ -513,7 +536,10 @@ impl PlacementTable {
     /// A placement with the same `(key, pid)` (when `pid` is set) replaces the existing one. At
     /// [`MAX_PLACEMENTS`] the oldest placement is evicted first. `stretch` says whether the host
     /// fills the drawing box or letterboxes into it (see [`Placement::stretch`]); only
-    /// [`crate::term::Term`]'s OSC 1337 path ever passes true, kitty and sixel pass false.
+    /// [`crate::term::Term`]'s OSC 1337 path ever passes true, kitty and sixel pass false. `sized`
+    /// says whether the request fixed `cols`×`rows` or the caller computed it from the image's
+    /// pixels (see [`Placement::sized`]): kitty passes what its `c`/`r` asked for, the OSC 1337
+    /// path what its `width`/`height` did, sixel false.
     /// `box_px` is the drawing box the protocol asked for, in pixels at the table's current cell
     /// size, inside the span and anchored at its top-left (`None` means the whole span; see
     /// [`Placement::box_px`]) — the table records its own cell size in
@@ -536,6 +562,7 @@ impl PlacementTable {
         z: i32,
         pid: Option<u32>,
         stretch: bool,
+        sized: bool,
         box_px: Option<(u32, u32)>,
     ) -> Result<Vec<Event>, PlaceError> {
         if !self.images.contains_key(&key) {
@@ -563,6 +590,7 @@ impl PlacementTable {
             z,
             pid,
             stretch,
+            sized,
             box_px,
             box_cell_px: self.cell_px,
             seq,
@@ -1154,6 +1182,7 @@ impl PlacementTable {
                         y_off: p.y_off,
                         z: p.z,
                         stretch: p.stretch,
+                        sized: p.sized,
                         box_px: p.box_px,
                         box_cell_px: p.box_cell_px,
                     });

@@ -148,7 +148,7 @@ dependencies = [
 
 [[package]]
 name = "feathercritty"
-version = "0.26.0+fbterm.9"
+version = "0.26.0+fbterm.10"
 dependencies = [
  "alacritty_terminal",
  "base64",
