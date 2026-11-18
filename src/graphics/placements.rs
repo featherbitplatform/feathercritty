@@ -154,8 +154,9 @@ pub struct Placement {
     /// whole span (feathercritty; not upstream).
     ///
     /// Only OSC 1337 inline images ever set it, and only when an axis was given in pixels or
-    /// percent — the units that say something in pixels. With an axis that is neither, cells-only
-    /// and auto requests, the span is the only size that matters and this is `None`; kitty
+    /// percent: `Cells(n)` and `auto` carry no pixels of their own, so cells-only and auto
+    /// requests keep today's behaviour (this is `None`, the span is the only size that matters)
+    /// and a `Cells(n)` axis counts as a length only when the other axis is `Npx` or `N%`. Kitty
     /// (`a=p`, `a=T`) and sixel placements are `None` too, their spans already meaning what they
     /// say.
     pub box_px: Option<(u32, u32)>,

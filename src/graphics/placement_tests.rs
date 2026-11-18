@@ -373,7 +373,7 @@ fn inline_pixel_width_gives_an_exact_box() {
 
 #[test]
 fn inline_percent_gives_an_exact_box() {
-    // 50% of an 80-column terminal at 9 px cells is 360 px wide — less than the 40 cells (360 px)
+    // 50% of an 80-column terminal at 9 px cells is 360 px wide — exactly the 40 cells (360 px)
     // the span takes — and the height follows the 2:1 ratio.
     let (mut term, _recorder) = term(80, 8);
     term.set_cell_pixel_size(9, 18);
@@ -401,10 +401,9 @@ fn inline_mixed_cells_and_pixels() {
 
 #[test]
 fn inline_cells_and_auto_have_no_box() {
-    // `None` means nothing but cells and auto: cells-only and auto requests keep today's
-    // behaviour (the span is the only size that matters). An axis given in cells still sets the
-    // box, with the other side from the ratio.
-    for args in ["", "width=auto;height=auto"] {
+    // `None` when neither axis is in pixels or percent: cells-only and auto requests keep today's
+    // behaviour exactly (the span is the only size that matters).
+    for args in ["", "width=auto;height=auto", "width=10", "width=10;height=5"] {
         let (mut term, _recorder) = term(20, 8);
         term.set_cell_pixel_size(8, 16);
         feed(&mut term, b"\x1b[1;1H");
@@ -414,15 +413,27 @@ fn inline_cells_and_auto_have_no_box() {
         assert_eq!(placements[0].box_px, None, "{args} has no pixel box");
         assert_eq!(placements[0].box_cell_px, (8, 16));
     }
-    // `width=10` names a cell count: the box is 10 cells wide (80 px), the height from the 2:1
-    // ratio is 40 px.
-    let (mut term, _recorder) = term(20, 8);
-    term.set_cell_pixel_size(8, 16);
-    feed(&mut term, b"\x1b[1;1H");
-    feed(&mut term, &inline_seq("width=10", 200, 100));
-    let placements = term.visible_placements();
+}
+
+#[test]
+fn inline_box_is_none_until_the_cell_size_is_set() {
+    // The box is expressed in the cell size, so a pixel-sized request has no box until the host
+    // has told the terminal what a cell is.
+    let (mut t1, _recorder) = term(20, 8);
+    feed(&mut t1, b"\x1b[1;1H");
+    feed(&mut t1, &inline_seq("width=100px;height=auto", 200, 100));
+    let placements = t1.visible_placements();
     assert_eq!(placements.len(), 1);
-    assert_eq!(placements[0].box_px, Some((80, 40)), "the cell axis and the ratio");
+    assert_eq!(placements[0].box_px, None, "no cell size yet, no box");
+
+    // Once the host sets the cell size the same request has its box.
+    let (mut t2, _recorder) = term(20, 8);
+    t2.set_cell_pixel_size(9, 18);
+    feed(&mut t2, b"\x1b[1;1H");
+    feed(&mut t2, &inline_seq("width=100px;height=auto", 200, 100));
+    let placements = t2.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].box_px, Some((100, 50)), "the box follows the cell size");
 }
 
 #[test]
@@ -452,12 +463,9 @@ fn kitty_and_sixel_have_no_box() {
 
 #[test]
 fn inline_box_never_exceeds_the_span() {
-    // A request whose span clamps (a `MAX_IMAGE_SIDE`-sized one and a huge `Npx`) still gives a
-    // box no larger than the span in pixels, with each side at least 1.
-    for args in [
-        &format!("width={MAX_IMAGE_SIDE};height={MAX_IMAGE_SIDE}"),
-        "width=4294967295px;height=4294967295px",
-    ] {
+    // A request whose span clamps (a huge `Npx`, and a cell count beside a pixel count) still
+    // gives a box no larger than the span in pixels, with each side at least 1.
+    for args in ["width=10000;height=99999999px", "width=4294967295px;height=4294967295px"] {
         let (mut term, _recorder) = term(20, 8);
         term.set_cell_pixel_size(8, 16);
         feed(&mut term, b"\x1b[1;1H");
