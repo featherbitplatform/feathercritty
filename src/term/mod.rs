@@ -1237,6 +1237,7 @@ impl<T> Term<T> {
             place.y_off,
             place.z,
             place.placement_id,
+            false, // kitty keeps the aspect ratio: `c` with `r` letterboxes, never stretches
         ) {
             Ok(events) => {
                 self.send_image_events(events);
@@ -1399,6 +1400,7 @@ impl<T> Term<T> {
             0,
             0,
             None,
+            false, // the span is the sixel's own pixels at the cell size; nothing asks to stretch
         ) {
             Ok(events) => {
                 self.send_image_events(events);
@@ -1417,7 +1419,9 @@ impl<T> Term<T> {
 
     /// Display an OSC 1337 inline image at the cursor, sized by its `width`/`height` arguments
     /// (cells, pixels or a percent of the terminal; `auto` is the image's own pixels divided by the
-    /// cell size) and the DECSDM-off cursor rule.
+    /// cell size) and the DECSDM-off cursor rule. `preserveAspectRatio=0` reaches the host as
+    /// `Placement::stretch` when both axes were given as sizes, so it fills the span instead of
+    /// letterboxing into it.
     fn place_inline(&mut self, image: inline::InlineImage)
     where
         T: EventListener,
@@ -1437,6 +1441,12 @@ impl<T> Term<T> {
         // `auto` asks for 0 here, which `span_for` computes from the pixels (keeping the ratio
         // when only one axis was given); a failed placement releases the unused image.
         let (cols, rows) = self.placements.span_for(width, height, cols_req, rows_req);
+        // feathercritty: OSC 1337's `preserveAspectRatio=0` asks for the image to fill the span
+        // without its inherent ratio, which means something only when both axes are fixed by the
+        // sender. With one axis `auto` — or a zero count, which `inline_cells` also turns into
+        // "compute" — that axis comes from the ratio anyway, so there is nothing to fill and the
+        // host letterboxes as it would with the ratio kept. Not upstream.
+        let stretch = !image.preserve_aspect && cols_req != 0 && rows_req != 0;
         let col = self.grid.cursor.point.column.0;
         self.make_room(rows);
         let anchor = self.grid_window(&self.grid).stable + i64::from(self.grid.cursor.point.line.0);
@@ -1452,6 +1462,7 @@ impl<T> Term<T> {
             0,
             0,
             None,
+            stretch, // true only for `preserveAspectRatio=0` with both axes given
         ) {
             Ok(events) => {
                 self.send_image_events(events);
@@ -1544,7 +1555,8 @@ impl<T> Term<T> {
     /// The image placements intersecting the current view (feathercritty; not upstream).
     ///
     /// `row_in_view` counts from the top of the view (the scrollback offset is applied), negative
-    /// when the placement starts above it. Draw in the returned order.
+    /// when the placement starts above it. Draw in the returned order, filling a span or
+    /// letterboxing into it as its `stretch` says (see `Placement::stretch`).
     pub fn visible_placements(&self) -> Vec<placements::VisiblePlacement> {
         let window = self.grid_window(&self.grid);
         self.placements.visible_placements(window, self.active_screen(), self.grid.display_offset())

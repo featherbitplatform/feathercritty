@@ -15,7 +15,7 @@ use crate::graphics::kitty_diacritics::{
 };
 use crate::graphics::limits::MAX_IMAGE_SIDE;
 use crate::graphics::placements::{
-    GridWindow, MAX_PLACEHOLDERS, MAX_PLACEMENTS, PlacementTable, Screen,
+    GridWindow, MAX_PLACEHOLDERS, MAX_PLACEMENTS, PlacementTable, Screen, VisiblePlacement,
 };
 use crate::grid::{Dimensions, Scroll};
 use crate::index::{Column, Line, Point};
@@ -178,6 +178,28 @@ const PNG_1X1: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
+/// A PNG declaring `w`×`h`: only its IHDR is read, so the chunk CRC stays zero and no image data
+/// follows (the same shape the inline parser's own tests build).
+fn png(w: u32, h: u32) -> Vec<u8> {
+    let mut v = b"\x89PNG\r\n\x1a\n".to_vec();
+    v.extend_from_slice(&13u32.to_be_bytes());
+    v.extend_from_slice(b"IHDR");
+    v.extend_from_slice(&w.to_be_bytes());
+    v.extend_from_slice(&h.to_be_bytes());
+    // Bit depth, colour type, compression, filter and interlace.
+    v.extend_from_slice(&[8, 6, 0, 0, 0]);
+    v.extend_from_slice(&[0, 0, 0, 0]); // CRC: the header reader never looks at it
+    v
+}
+
+/// An OSC 1337 sequence displaying `png(w, h)` with `args` as its `File=` arguments.
+fn inline_seq(args: &str, w: u32, h: u32) -> Vec<u8> {
+    let mut out = format!("\x1b]1337;File=inline=1;{args}:").into_bytes();
+    out.extend_from_slice(STANDARD.encode(png(w, h)).as_bytes());
+    out.extend(b"\x1b\\");
+    out
+}
+
 /// The viewport row and column of the terminal's cursor.
 fn cursor(term: &Term<Recorder>) -> (i32, usize) {
     let point = term.renderable_content().cursor.point;
@@ -206,6 +228,7 @@ fn sixel_places_at_cursor_and_moves_cursor() {
     assert_eq!((placements[0].row_in_view, placements[0].col), (2, 3));
     assert_eq!(placements[0].cols, width); // cell size is unset: each cell counts as one pixel
     assert_eq!(placements[0].rows, height);
+    assert!(!placements[0].stretch, "a sixel never asks to be stretched");
 
     // DECSDM off (the default): the cursor lands below the image, same column.
     assert_eq!(cursor(&term), (2 + height as i32, 3));
@@ -245,6 +268,7 @@ fn kitty_place_with_cells() {
     assert_eq!(placements[0].key, key);
     assert_eq!((placements[0].row_in_view, placements[0].col), (3, 2));
     assert_eq!((placements[0].cols, placements[0].rows), (5, 2));
+    assert!(!placements[0].stretch, "kitty keeps the aspect ratio: `c` with `r` letterboxes");
     // `C=0`: last row of the image, one cell past its last column.
     assert_eq!(cursor(&term), (4, 7));
 
@@ -256,6 +280,7 @@ fn kitty_place_with_cells() {
     assert_eq!(placements.len(), 2, "the same pid replaces its placement");
     assert!(placements.iter().any(|p| p.row_in_view == 5 && p.col == 0 && p.cols == 3));
     assert!(placements.iter().any(|p| p.row_in_view == 3 && p.col == 2), "the original survives");
+    assert!(placements.iter().all(|p| !p.stretch), "a re-placed `c`+`r` letterboxes too");
 
     // `C=1` places without moving the cursor.
     feed(&mut term, b"\x1b[2;2H\x1b_Ga=p,i=1,C=1\x1b\\");
@@ -286,6 +311,48 @@ fn span_from_pixels_rounds_up() {
     assert_eq!(placements.len(), 2);
     let second = placements.iter().find(|p| p.row_in_view == 4).unwrap();
     assert_eq!((second.cols, second.rows), (2, 1));
+}
+
+/// Feeds one OSC 1337 inline image (`args` as its `File=` arguments, a `w`×`h` PNG payload) into a
+/// fresh 20x8 terminal whose cells are 8x16 pixels, and returns the only placement it made.
+fn inline_placement(args: &str, w: u32, h: u32) -> VisiblePlacement {
+    let (mut term, _recorder) = term(20, 8);
+    term.set_cell_pixel_size(8, 16);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &inline_seq(args, w, h));
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1, "{args} displays one image");
+    placements[0].clone()
+}
+
+#[test]
+fn inline_stretch_follows_preserve_aspect_ratio() {
+    // A 4x4 PNG asked for a 10x2 span: filling that distorts it, so what the sender said about the
+    // aspect ratio is the whole difference between these placements.
+    let stretched = inline_placement("width=10;height=2;preserveAspectRatio=0", 4, 4);
+    assert_eq!((stretched.cols, stretched.rows), (10, 2));
+    assert!(stretched.stretch, "`preserveAspectRatio=0` asks the host to fill the span");
+
+    // The default (the argument absent) and an explicit `=1`: the same span, letterboxed into it.
+    for args in ["width=10;height=2", "width=10;height=2;preserveAspectRatio=1"] {
+        let placed = inline_placement(args, 4, 4);
+        assert_eq!((placed.cols, placed.rows), (10, 2));
+        assert!(!placed.stretch, "{args} keeps the aspect ratio");
+    }
+
+    // Pixels and percents are sizes as well: both axes fixed still asks for a fill.
+    for args in ["width=80px;height=32px", "width=50%;height=25%"] {
+        let placed = inline_placement(&format!("{args};preserveAspectRatio=0"), 4, 4);
+        assert_eq!((placed.cols, placed.rows), (10, 2));
+        assert!(placed.stretch, "{args} fixes both axes");
+    }
+
+    // One axis `auto` — or `0`, which the span computation reads the same way: that axis comes from
+    // the ratio anyway, so stretching into the span would change nothing and the flag stays false.
+    for args in ["height=2", "width=10;height=auto", "width=0;height=2"] {
+        let placed = inline_placement(&format!("{args};preserveAspectRatio=0"), 4, 4);
+        assert!(!placed.stretch, "{args} derives one axis from the ratio");
+    }
 }
 
 #[test]
@@ -875,9 +942,9 @@ fn placeholder_cap_and_visible_range_scans() {
     let (key, events) = table.new_image(Some(1), None, 8, 8, None).unwrap();
     assert!(events.is_empty());
     for line in [-50_000i64, -20_000, -12_000] {
-        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None).unwrap();
+        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false).unwrap();
     }
-    table.place(Screen::Primary, key, 3, 0, 1, 1, None, 0, 0, 0, None).unwrap();
+    table.place(Screen::Primary, key, 3, 0, 1, 1, None, 0, 0, 0, None, false).unwrap();
     let window = GridWindow { stable: 0, lines: 5, history: 60_000 };
     let (out, scanned) = table.visible_placements_scanned(window, Screen::Primary, 0);
     assert_eq!(out.len(), 1, "only the in-view placement is returned");
@@ -902,7 +969,7 @@ fn placeholder_cap_and_visible_range_scans() {
     let (key, _) = table.new_image(Some(2), None, 8, 8, None).unwrap();
     table.add_virtual(2, key, Some(1), 0, 0);
     for line in 0..(MAX_PLACEHOLDERS + 5) as i64 {
-        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None).unwrap();
+        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false).unwrap();
         let events = table.after_scroll_up(
             GridWindow { stable: line + 1, lines: 1, history: (line + 1) as usize },
             Screen::Primary,
@@ -1099,9 +1166,9 @@ fn adjacent_placeholders_survive_a_down_shift() {
     let mut table = PlacementTable::new();
     let (a, _) = table.new_image(Some(10), None, 8, 6, None).unwrap();
     let (b, _) = table.new_image(Some(11), None, 7, 5, None).unwrap();
-    table.place(Screen::Primary, a, 0, 4, 1, 1, None, 0, 0, 0, None).unwrap();
+    table.place(Screen::Primary, a, 0, 4, 1, 1, None, 0, 0, 0, None, false).unwrap();
     table.after_scroll_up(GridWindow { stable: 1, lines: 5, history: 1 }, Screen::Primary, 0, 5, 1);
-    table.place(Screen::Primary, b, 1, 4, 1, 1, None, 0, 0, 0, None).unwrap();
+    table.place(Screen::Primary, b, 1, 4, 1, 1, None, 0, 0, 0, None, false).unwrap();
     let events = table.after_scroll_up(
         GridWindow { stable: 2, lines: 5, history: 2 },
         Screen::Primary,
