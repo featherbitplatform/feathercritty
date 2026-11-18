@@ -119,6 +119,8 @@ impl GridWindow {
 /// pixels (`None` is the whole image), `x_off`/`y_off` offset the display within the anchor cell,
 /// and `z` orders overlapping images for drawing (negative draws under text). `pid` is the kitty
 /// placement id if it has one: re-placing with the same `(key, pid)` replaces the old placement.
+/// `stretch` says whether the rectangle is one the host fills or letterboxes into (see
+/// [`Placement::stretch`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Placement {
     pub key: ImageKey,
@@ -132,6 +134,18 @@ pub struct Placement {
     pub y_off: u32,
     pub z: i32,
     pub pid: Option<u32>,
+    /// Whether the protocol asked for the image to fill `cols`×`rows` without keeping its inherent
+    /// aspect ratio: the host stretches to fill when this is true and letterboxes (fits it inside,
+    /// keeping the ratio) when it is false (feathercritty; not upstream).
+    ///
+    /// The only protocol here that asks for it is OSC 1337 inline images with
+    /// `preserveAspectRatio=0`, and only when its `width` and `height` are both given as sizes:
+    /// with one axis `auto` (or a zero count, which the span computation reads the same way) that
+    /// axis comes from the ratio anyway, so there is nothing to fill and this stays false. Kitty
+    /// graphics has no stretch — `c` with `r` letterboxes, and Unicode placeholders keep the ratio
+    /// — so kitty (`a=p`, `a=T`, `U=1`) and sixel placements always report false. False is also
+    /// what [`PlacementTable::place`] gives any caller that does not say otherwise.
+    pub stretch: bool,
     /// Insertion stamp, the eviction order key (see `PlacementTable::placement_order`).
     pub seq: u64,
 }
@@ -159,6 +173,9 @@ pub struct VisiblePlacement {
     pub x_off: u32,
     pub y_off: u32,
     pub z: i32,
+    /// Whether to stretch the image to fill `cols`×`rows` instead of letterboxing it into them
+    /// (see [`Placement::stretch`]).
+    pub stretch: bool,
 }
 
 /// A placeholder as [`PlacementTable::visible_placeholders`] reports it.
@@ -469,8 +486,10 @@ impl PlacementTable {
     /// Display `key` with its top-left cell at stable line `line`, column `col`.
     ///
     /// A placement with the same `(key, pid)` (when `pid` is set) replaces the existing one. At
-    /// [`MAX_PLACEMENTS`] the oldest placement is evicted first. Returns the events to send
-    /// (`ImageReleased` for images that stopped being referenced).
+    /// [`MAX_PLACEMENTS`] the oldest placement is evicted first. `stretch` says whether the host
+    /// fills the span or letterboxes into it (see [`Placement::stretch`]); only
+    /// [`crate::term::Term`]'s OSC 1337 path ever passes true, kitty and sixel pass false. Returns
+    /// the events to send (`ImageReleased` for images that stopped being referenced).
     #[allow(clippy::too_many_arguments)]
     pub fn place(
         &mut self,
@@ -485,6 +504,7 @@ impl PlacementTable {
         y_off: u32,
         z: i32,
         pid: Option<u32>,
+        stretch: bool,
     ) -> Result<Vec<Event>, PlaceError> {
         if !self.images.contains_key(&key) {
             return Err(PlaceError::NotFound);
@@ -498,8 +518,21 @@ impl PlacementTable {
         }
         let seq = self.placement_seq;
         self.placement_seq += 1;
-        let placement =
-            Placement { key, screen, line, col, cols, rows, src, x_off, y_off, z, pid, seq };
+        let placement = Placement {
+            key,
+            screen,
+            line,
+            col,
+            cols,
+            rows,
+            src,
+            x_off,
+            y_off,
+            z,
+            pid,
+            stretch,
+            seq,
+        };
         self.placements[screen.index()].entry(line).or_default().insert(seq, placement);
         self.placement_order.insert(seq, (screen.index(), line));
         self.placement_total += 1;
@@ -557,6 +590,8 @@ impl PlacementTable {
     /// Resolve a placeholder cell's reference to `(key, cols, rows)`: the virtual placement of
     /// image `image_id` with placement id `pid`, or — when `pid` is absent or zero, where the
     /// protocol lets the terminal choose any — the first (oldest) virtual placement of the image.
+    /// Virtual placements are kitty's (`U=1`) and kitty keeps the aspect ratio, so a host
+    /// letterboxes into this span: there is no [`Placement::stretch`] to report for them.
     pub fn kitty_virtual_image(
         &self,
         image_id: u32,
@@ -1084,6 +1119,7 @@ impl PlacementTable {
                         x_off: p.x_off,
                         y_off: p.y_off,
                         z: p.z,
+                        stretch: p.stretch,
                     });
                 }
             }
