@@ -356,6 +356,152 @@ fn inline_stretch_follows_preserve_aspect_ratio() {
 }
 
 #[test]
+fn inline_pixel_width_gives_an_exact_box() {
+    // The span rounds 100 px up to 12 cells (6 cells wide at 9 px is 108), but the protocol asked
+    // for exactly 100 px: the box carries that, and the height follows the image's 2:1 ratio.
+    let (mut term, _recorder) = term(20, 8);
+    term.set_cell_pixel_size(9, 18);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &inline_seq("width=100px;height=auto", 200, 100));
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    // The span is the rounded-up room, exactly as `span_for` gives it.
+    assert_eq!((placements[0].cols, placements[0].rows), (12, 3), "the span is unchanged");
+    assert_eq!(placements[0].box_px, Some((100, 50)), "the box is the exact request");
+    assert_eq!(placements[0].box_cell_px, (9, 18), "expressed in the cell size it was made at");
+}
+
+#[test]
+fn inline_percent_gives_an_exact_box() {
+    // 50% of an 80-column terminal at 9 px cells is 360 px wide — less than the 40 cells (360 px)
+    // the span takes — and the height follows the 2:1 ratio.
+    let (mut term, _recorder) = term(80, 8);
+    term.set_cell_pixel_size(9, 18);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &inline_seq("width=50%;height=auto", 200, 100));
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].box_px, Some((360, 180)), "the box is the exact request");
+    assert_eq!(placements[0].cols * 9, 360, "the span just covers the box");
+}
+
+#[test]
+fn inline_mixed_cells_and_pixels() {
+    // A cell count on one axis and pixels on the other: the box is the cell axis at the cell size
+    // and the pixel axis at its own value.
+    let (mut term, _recorder) = term(20, 8);
+    term.set_cell_pixel_size(8, 16);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &inline_seq("width=10;height=40px", 200, 100));
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].box_px, Some((10 * 8, 40)));
+    assert_eq!(placements[0].box_cell_px, (8, 16));
+}
+
+#[test]
+fn inline_cells_and_auto_have_no_box() {
+    // `None` means nothing but cells and auto: cells-only and auto requests keep today's
+    // behaviour (the span is the only size that matters). An axis given in cells still sets the
+    // box, with the other side from the ratio.
+    for args in ["", "width=auto;height=auto"] {
+        let (mut term, _recorder) = term(20, 8);
+        term.set_cell_pixel_size(8, 16);
+        feed(&mut term, b"\x1b[1;1H");
+        feed(&mut term, &inline_seq(args, 200, 100));
+        let placements = term.visible_placements();
+        assert_eq!(placements.len(), 1, "{args} displays one image");
+        assert_eq!(placements[0].box_px, None, "{args} has no pixel box");
+        assert_eq!(placements[0].box_cell_px, (8, 16));
+    }
+    // `width=10` names a cell count: the box is 10 cells wide (80 px), the height from the 2:1
+    // ratio is 40 px.
+    let (mut term, _recorder) = term(20, 8);
+    term.set_cell_pixel_size(8, 16);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &inline_seq("width=10", 200, 100));
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].box_px, Some((80, 40)), "the cell axis and the ratio");
+}
+
+#[test]
+fn kitty_and_sixel_have_no_box() {
+    let (mut term, recorder) = term(20, 8);
+    term.set_cell_pixel_size(9, 18);
+    feed(&mut term, b"\x1b[1;1H");
+
+    // A kitty `a=T` placement: its span is what the protocol asked for, no separate pixel box.
+    let seq = transmit(1, "f=32", Some((40, 32)), &rgba(40, 32), ",c=5,r=2");
+    feed(&mut term, &seq);
+    recorder.received();
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].box_px, None, "kitty has no pixel box");
+    assert_eq!(placements[0].box_cell_px, (9, 18), "the table's cell size at placement time");
+
+    // A sixel: the span is its own pixels at the cell size, no box either.
+    feed(&mut term, b"\x1b[4;1H");
+    feed(&mut term, SIXEL);
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 2);
+    let sixel = placements.iter().find(|p| p.cols == 1).expect("the sixel");
+    assert_eq!(sixel.box_px, None, "a sixel has no pixel box");
+    assert_eq!(sixel.box_cell_px, (9, 18), "the table's cell size at placement time");
+}
+
+#[test]
+fn inline_box_never_exceeds_the_span() {
+    // A request whose span clamps (a `MAX_IMAGE_SIDE`-sized one and a huge `Npx`) still gives a
+    // box no larger than the span in pixels, with each side at least 1.
+    for args in [
+        &format!("width={MAX_IMAGE_SIDE};height={MAX_IMAGE_SIDE}"),
+        "width=4294967295px;height=4294967295px",
+    ] {
+        let (mut term, _recorder) = term(20, 8);
+        term.set_cell_pixel_size(8, 16);
+        feed(&mut term, b"\x1b[1;1H");
+        feed(&mut term, &inline_seq(args, 200, 100));
+        let placements = term.visible_placements();
+        assert_eq!(placements.len(), 1, "{args} displays one image");
+        let Some((w, h)) = placements[0].box_px else {
+            panic!("{args} has a pixel box");
+        };
+        let (span_w, span_h) = (placements[0].cols * 8, placements[0].rows * 16);
+        assert!((1..=span_w).contains(&w), "{args}: the box fits its span's width");
+        assert!((1..=span_h).contains(&h), "{args}: the box fits its span's height");
+    }
+}
+
+#[test]
+fn inline_box_with_stretch() {
+    // `preserveAspectRatio=0` with a pixel box: the host fills the box, not the span.
+    let (mut term, _recorder) = term(20, 8);
+    term.set_cell_pixel_size(9, 18);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &inline_seq("preserveAspectRatio=0;width=100px;height=30px", 200, 100));
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert!(placements[0].stretch, "both axes fixed asks for a fill");
+    assert_eq!(placements[0].box_px, Some((100, 30)));
+}
+
+#[test]
+fn visible_placements_carry_the_box() {
+    // The box and its cell size ride through `visible_placements` unchanged.
+    let (mut term, _recorder) = term(20, 8);
+    term.set_cell_pixel_size(9, 18);
+    feed(&mut term, b"\x1b[1;1H");
+    feed(&mut term, &inline_seq("width=100px;height=auto", 200, 100));
+    let placements = term.visible_placements();
+    assert_eq!(placements.len(), 1);
+    assert_eq!(placements[0].box_px, Some((100, 50)));
+    assert_eq!(placements[0].box_cell_px, (9, 18));
+    // A later view of the same placement carries it through too.
+    assert_eq!(term.visible_placements()[0].box_px, Some((100, 50)));
+}
+
+#[test]
 fn tiny_and_oversized_spans() {
     let (mut term, recorder) = term(10, 10);
 
@@ -942,9 +1088,9 @@ fn placeholder_cap_and_visible_range_scans() {
     let (key, events) = table.new_image(Some(1), None, 8, 8, None).unwrap();
     assert!(events.is_empty());
     for line in [-50_000i64, -20_000, -12_000] {
-        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false).unwrap();
+        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
     }
-    table.place(Screen::Primary, key, 3, 0, 1, 1, None, 0, 0, 0, None, false).unwrap();
+    table.place(Screen::Primary, key, 3, 0, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
     let window = GridWindow { stable: 0, lines: 5, history: 60_000 };
     let (out, scanned) = table.visible_placements_scanned(window, Screen::Primary, 0);
     assert_eq!(out.len(), 1, "only the in-view placement is returned");
@@ -969,7 +1115,7 @@ fn placeholder_cap_and_visible_range_scans() {
     let (key, _) = table.new_image(Some(2), None, 8, 8, None).unwrap();
     table.add_virtual(2, key, Some(1), 0, 0);
     for line in 0..(MAX_PLACEHOLDERS + 5) as i64 {
-        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false).unwrap();
+        table.place(Screen::Primary, key, line, 0, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
         let events = table.after_scroll_up(
             GridWindow { stable: line + 1, lines: 1, history: (line + 1) as usize },
             Screen::Primary,
@@ -1166,9 +1312,9 @@ fn adjacent_placeholders_survive_a_down_shift() {
     let mut table = PlacementTable::new();
     let (a, _) = table.new_image(Some(10), None, 8, 6, None).unwrap();
     let (b, _) = table.new_image(Some(11), None, 7, 5, None).unwrap();
-    table.place(Screen::Primary, a, 0, 4, 1, 1, None, 0, 0, 0, None, false).unwrap();
+    table.place(Screen::Primary, a, 0, 4, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
     table.after_scroll_up(GridWindow { stable: 1, lines: 5, history: 1 }, Screen::Primary, 0, 5, 1);
-    table.place(Screen::Primary, b, 1, 4, 1, 1, None, 0, 0, 0, None, false).unwrap();
+    table.place(Screen::Primary, b, 1, 4, 1, 1, None, 0, 0, 0, None, false, None).unwrap();
     let events = table.after_scroll_up(
         GridWindow { stable: 2, lines: 5, history: 2 },
         Screen::Primary,

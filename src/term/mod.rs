@@ -1238,6 +1238,7 @@ impl<T> Term<T> {
             place.z,
             place.placement_id,
             false, // kitty keeps the aspect ratio: `c` with `r` letterboxes, never stretches
+            None,  // the span is what the protocol asked for; no separate pixel box
         ) {
             Ok(events) => {
                 self.send_image_events(events);
@@ -1401,6 +1402,7 @@ impl<T> Term<T> {
             0,
             None,
             false, // the span is the sixel's own pixels at the cell size; nothing asks to stretch
+            None,  // the span is the sixel's own pixels at the cell size; no separate pixel box
         ) {
             Ok(events) => {
                 self.send_image_events(events);
@@ -1420,8 +1422,11 @@ impl<T> Term<T> {
     /// Display an OSC 1337 inline image at the cursor, sized by its `width`/`height` arguments
     /// (cells, pixels or a percent of the terminal; `auto` is the image's own pixels divided by the
     /// cell size) and the DECSDM-off cursor rule. `preserveAspectRatio=0` reaches the host as
-    /// `Placement::stretch` when both axes were given as sizes, so it fills the span instead of
-    /// letterboxing into it.
+    /// `Placement::stretch` when both axes were given as sizes, so it fills the drawing box instead
+    /// of letterboxing into it. When an axis was given in pixels or percent, the span is the
+    /// rounded-up room the image occupies (which the cursor also counts), while
+    /// `Placement::box_px` carries the exact pixel box the protocol asked for, so a host can draw
+    /// the image at its requested size inside that room.
     fn place_inline(&mut self, image: inline::InlineImage)
     where
         T: EventListener,
@@ -1436,14 +1441,22 @@ impl<T> Term<T> {
             return;
         };
         self.send_image_events(events);
-        let data = ImageData::Encoded { format, bytes: image.bytes, width, height };
-        self.event_proxy.send_event(Event::ImageReceived { key, data });
         // `auto` asks for 0 here, which `span_for` computes from the pixels (keeping the ratio
         // when only one axis was given); a failed placement releases the unused image.
         let (cols, rows) = self.placements.span_for(width, height, cols_req, rows_req);
-        // feathercritty: OSC 1337's `preserveAspectRatio=0` asks for the image to fill the span
-        // without its inherent ratio, which means something only when both axes are fixed by the
-        // sender. With one axis `auto` — or a zero count, which `inline_cells` also turns into
+        // feathercritty: the span rounds pixel and percent sizes up to whole cells, which is the
+        // room the image occupies (and where the cursor lands) but not necessarily the size the
+        // protocol asked for — `width=100px` in 18-pixel cells takes 6 cells and is drawn 108 px
+        // wide if the host fills the span. The exact requested pixel box travels as `box_px`
+        // instead, so a host can draw it at the requested size inside the room. Not upstream.
+        let box_px = (cw > 0 && ch > 0)
+            .then(|| inline_box_px(self, &image, width, height, (cw, ch), (cols, rows)))
+            .flatten();
+        let data = ImageData::Encoded { format, bytes: image.bytes, width, height };
+        self.event_proxy.send_event(Event::ImageReceived { key, data });
+        // feathercritty: OSC 1337's `preserveAspectRatio=0` asks for the image to fill the drawing
+        // box without its inherent ratio, which means something only when both axes are fixed by
+        // the sender. With one axis `auto` — or a zero count, which `inline_cells` also turns into
         // "compute" — that axis comes from the ratio anyway, so there is nothing to fill and the
         // host letterboxes as it would with the ratio kept. Not upstream.
         let stretch = !image.preserve_aspect && cols_req != 0 && rows_req != 0;
@@ -1463,6 +1476,7 @@ impl<T> Term<T> {
             0,
             None,
             stretch, // true only for `preserveAspectRatio=0` with both axes given
+            box_px,
         ) {
             Ok(events) => {
                 self.send_image_events(events);
@@ -2552,6 +2566,75 @@ fn inline_cells(dim: inline::Dim, cell_px: u32, terminal_px: u32) -> u32 {
                 .map_or(0, |cells| if cells == 0 { 0 } else { cap(cells) })
         },
     }
+}
+
+/// The exact pixel box an inline image's `width`/`height` asked for (feathercritty; not
+/// upstream), or `None` when *both* axes are in cells or auto only.
+///
+/// `(cw, ch)` is the cell pixel size, `(image_w, image_h)` the image's own pixels and
+/// `(cols, rows)` the span the request takes (as computed by
+/// [`PlacementTable::span_for`](crate::graphics::placements::PlacementTable::span_for)). Each
+/// axis that was given as a size — `Cells(n)` with n > 0, `Pixels(p)` or `Percent(q)` — has an
+/// exact pixel length: `n * cw` (or `n * ch`), `p`, and `terminal_px * min(q, 100) / 100`
+/// respectively, the same integer arithmetic `inline_cells` uses now. An axis left `auto` (or
+/// `0`) comes from the image's ratio instead, rounded to the nearest and at least 1. Each side is
+/// then clamped to at least 1 and to the span's pixels, so the box never spills out of the room
+/// the image occupies. A request that named a size on only one axis still sets the box — the
+/// other side is the ratio — so `None` means nothing but cells and auto.
+fn inline_box_px<T>(
+    term: &Term<T>,
+    image: &inline::InlineImage,
+    image_w: u32,
+    image_h: u32,
+    (cw, ch): (u32, u32),
+    (cols, rows): (u32, u32),
+) -> Option<(u32, u32)> {
+    // The exact pixel lengths `inline_cells` rounds up to cells, one per axis: cells count the
+    // cell size, pixels stand on their own, and percent takes its share of the terminal's pixels
+    // on that axis (`min(q, 100)`, as there).
+    fn pixel_len(dim: inline::Dim, cell_px: u32, terminal_px: u64) -> Option<u64> {
+        match dim {
+            inline::Dim::Auto | inline::Dim::Cells(0) => None,
+            inline::Dim::Cells(n) => Some(u64::from(n) * u64::from(cell_px)),
+            inline::Dim::Pixels(p) => Some(u64::from(p)),
+            inline::Dim::Percent(percent) => Some(terminal_px * u64::from(percent.min(100)) / 100),
+        }
+    }
+    let (terminal_w, terminal_h) = (
+        (term.columns() as u64 * cw as u64) as u32,
+        (term.screen_lines() as u64 * ch as u64) as u32,
+    );
+    let (w, h) = (
+        pixel_len(image.width, cw, u64::from(terminal_w)),
+        pixel_len(image.height, ch, u64::from(terminal_h)),
+    );
+    // Both axes in cells or auto only: the span is the only size that matters and the box is the
+    // whole span. A request that named a size on one axis still sets the box — the other side is
+    // the ratio, as below.
+    if w.is_none() && h.is_none() {
+        return None;
+    }
+    // An axis left unset comes from the image's ratio in pixels, rounded to the nearest and at
+    // least 1; the image's own pixels guard the divide.
+    let (w, h) = match (w, h) {
+        (Some(w), Some(h)) => (w, h),
+        (Some(w), None) => {
+            let h = (w * u64::from(image_h.max(1)) + u64::from(image_w) / 2)
+                / u64::from(image_w.max(1));
+            (w, h.max(1))
+        },
+        (None, Some(h)) => {
+            let w = (h * u64::from(image_w.max(1)) + u64::from(image_h) / 2)
+                / u64::from(image_h.max(1));
+            (w.max(1), h)
+        },
+        (None, None) => unreachable!("checked above"),
+    };
+    // The box sits inside the room the image occupies: neither side spills past the span, and
+    // each keeps at least one pixel.
+    let (w, h) =
+        (w.clamp(1, u64::from(cols) * u64::from(cw)), h.clamp(1, u64::from(rows) * u64::from(ch)));
+    Some((w as u32, h as u32))
 }
 
 /// The XTSMGRAPHICS (`CSI ? Pi ; Pa ; Pv S`) items this terminal answers: `Pi=1` counts the colour

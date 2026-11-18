@@ -145,7 +145,25 @@ pub struct Placement {
     /// graphics has no stretch — `c` with `r` letterboxes, and Unicode placeholders keep the ratio
     /// — so kitty (`a=p`, `a=T`, `U=1`) and sixel placements always report false. False is also
     /// what [`PlacementTable::place`] gives any caller that does not say otherwise.
+    ///
+    /// The rectangle this fills or letterboxes into is [`Placement::box_px`] when it is set, the
+    /// whole span when it is `None`.
     pub stretch: bool,
+    /// The drawing box the protocol asked for, in pixels at the cell size the placement was made
+    /// at, inside the cell span and anchored at the span's top-left; `None` means the box is the
+    /// whole span (feathercritty; not upstream).
+    ///
+    /// Only OSC 1337 inline images ever set it, and only when an axis was given in pixels or
+    /// percent — the units that say something in pixels. With an axis that is neither, cells-only
+    /// and auto requests, the span is the only size that matters and this is `None`; kitty
+    /// (`a=p`, `a=T`) and sixel placements are `None` too, their spans already meaning what they
+    /// say.
+    pub box_px: Option<(u32, u32)>,
+    /// [`PlacementTable::cell_pixel_size`] at the moment this placement was made: the cell size
+    /// [`Placement::box_px`] is expressed in (feathercritty; not upstream). Hosts scale
+    /// `box_px` by the current cell size over this, per axis, when the cell size has changed
+    /// since.
+    pub box_cell_px: (u32, u32),
     /// Insertion stamp, the eviction order key (see `PlacementTable::placement_order`).
     pub seq: u64,
 }
@@ -173,9 +191,15 @@ pub struct VisiblePlacement {
     pub x_off: u32,
     pub y_off: u32,
     pub z: i32,
-    /// Whether to stretch the image to fill `cols`×`rows` instead of letterboxing it into them
-    /// (see [`Placement::stretch`]).
+    /// Whether to stretch the image to fill its drawing box instead of letterboxing it into the
+    /// box (see [`Placement::stretch`]).
     pub stretch: bool,
+    /// The drawing box the protocol asked for (see [`Placement::box_px`]): `None` means the whole
+    /// span (feathercritty; not upstream).
+    pub box_px: Option<(u32, u32)>,
+    /// The cell size `box_px` is expressed in (see [`Placement::box_cell_px`]) (feathercritty;
+    /// not upstream).
+    pub box_cell_px: (u32, u32),
 }
 
 /// A placeholder as [`PlacementTable::visible_placeholders`] reports it.
@@ -487,9 +511,15 @@ impl PlacementTable {
     ///
     /// A placement with the same `(key, pid)` (when `pid` is set) replaces the existing one. At
     /// [`MAX_PLACEMENTS`] the oldest placement is evicted first. `stretch` says whether the host
-    /// fills the span or letterboxes into it (see [`Placement::stretch`]); only
-    /// [`crate::term::Term`]'s OSC 1337 path ever passes true, kitty and sixel pass false. Returns
-    /// the events to send (`ImageReleased` for images that stopped being referenced).
+    /// fills the drawing box or letterboxes into it (see [`Placement::stretch`]); only
+    /// [`crate::term::Term`]'s OSC 1337 path ever passes true, kitty and sixel pass false.
+    /// `box_px` is the drawing box the protocol asked for, in pixels at the table's current cell
+    /// size, inside the span and anchored at its top-left (`None` means the whole span; see
+    /// [`Placement::box_px`]) — the table records its own cell size in
+    /// [`Placement::box_cell_px`] at placement time, so a host that draws later with a different
+    /// cell size scales the box by the ratio. Kitty and sixel pass `None`, their spans already
+    /// meaning what they say. Returns the events to send (`ImageReleased` for images that stopped
+    /// being referenced).
     #[allow(clippy::too_many_arguments)]
     pub fn place(
         &mut self,
@@ -505,6 +535,7 @@ impl PlacementTable {
         z: i32,
         pid: Option<u32>,
         stretch: bool,
+        box_px: Option<(u32, u32)>,
     ) -> Result<Vec<Event>, PlaceError> {
         if !self.images.contains_key(&key) {
             return Err(PlaceError::NotFound);
@@ -531,6 +562,8 @@ impl PlacementTable {
             z,
             pid,
             stretch,
+            box_px,
+            box_cell_px: self.cell_px,
             seq,
         };
         self.placements[screen.index()].entry(line).or_default().insert(seq, placement);
@@ -1120,6 +1153,8 @@ impl PlacementTable {
                         y_off: p.y_off,
                         z: p.z,
                         stretch: p.stretch,
+                        box_px: p.box_px,
+                        box_cell_px: p.box_cell_px,
                     });
                 }
             }
